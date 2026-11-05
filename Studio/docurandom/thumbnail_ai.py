@@ -278,7 +278,8 @@ def thumbnail_canvas_repair_remaining_seconds(state: dict[str, object]) -> int |
         return None
     detail = str(state.get('detail') or '').split('\nĐọc lại hội thoại:', 1)[0].casefold()
     if (state.get('status') != 'terminal_no_image' or state.get('submitted') is not False
-            or state.get('generation_wire_version', 1) not in {1, 2} or _automatic_retry_count(state) < 1
+            or state.get('generation_wire_version', 1) not in {1, 2}
+            or (_automatic_retry_count(state) < 1 and int((state.get('recovery_chat') or {}).get('count', 0)) < 1)
             or (state.get('generation_wire_version', 1) == 1 and not any(s in detail
                 for s in ('thiếu ảnh nguồn', 'yêu cầu ảnh nguồn', 'missing source image', 'no usable image target')))
             or state.get('canvas_repair') or not state.get('thread_id')

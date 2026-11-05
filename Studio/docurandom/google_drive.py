@@ -55,7 +55,10 @@ class GoogleDriveInput:
             self.runner.client.cdp_command(self.runner.profile_id,'Browser.setWindowBounds',{'windowId':window['windowId'],'bounds':{'windowState':'normal'}})
         from .youtube_upload import _CdpSession
         with _CdpSession(target['webSocketDebuggerUrl'])as cdp:
-            self.cdp=cdp;self.check();yield self
+            self.cdp=cdp;self.check()
+            cdp.command('Target.activateTarget',{'targetId':target['id']})
+            cdp.command('Emulation.setFocusEmulationEnabled',{'enabled':True})
+            yield self
 
     def submit(self,image,filename,before_input):
         if Path(filename).name!=filename or not filename.lower().endswith('.png'):
@@ -66,7 +69,7 @@ class GoogleDriveInput:
         try:
             new=controller.find(controller.nodes(),role='button',names=('New','Mới','新規'))
             if new is None:raise GoogleTaskPending('Drive chưa hiện nút tạo/tải tệp')
-            controller.press(new)
+            controller.click_dom(new)
             menu=None
             for _ in range(30):
                 self.check()
@@ -74,7 +77,7 @@ class GoogleDriveInput:
                 if menu is not None:break
                 if self.runner.cancel.wait(.2):self.runner.check()
             if menu is None:raise GoogleTaskPending('Drive chưa hiện mục Tải tệp lên')
-            controller.press(menu)
+            controller.click_dom(menu)
             node=None
             for _ in range(30):
                 self.check();doc=self.cdp.command('DOM.getDocument',{'depth':0})['root']['nodeId']

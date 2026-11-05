@@ -3567,19 +3567,32 @@ class _SemanticCdpController:
         )
 
     def set_file(self, path: Path, accept_hint: str) -> None:
-        node = self.find_file_input(self.dom_nodes(), accept_hint)
-        if node is None or not node.get("backendNodeId"):
-            raise YouTubeUploadError(
-                f"Không tìm thấy ô chọn file {accept_hint} đúng loại trên YouTube Studio. "
-                "Tool từ chối đoán để tránh gắn video nhầm chỗ."
-            )
-        self.cdp.command(
-            "DOM.setFileInputFiles",
-            {
-                "files": [str(path.resolve())],
-                "backendNodeId": int(node["backendNodeId"]),
-            },
-        )
+        chooser_intercepted = False
+        try:
+            if accept_hint == 'image':
+                # The current custom-thumbnail editor arms its picker from
+                # the visible Upload button. A hidden legacy input alone can
+                # accept bytes without notifying that active editor.
+                upload = self.find_dom(self.dom_nodes(), node_names=('BUTTON',),
+                    attributes={'id':'select-button'}, ancestor_ids=('custom-still-editor-wrapper',),
+                    require_laid_out=True)
+                if upload is not None:
+                    self.cdp.command('Page.setInterceptFileChooserDialog',{'enabled':True})
+                    chooser_intercepted = True
+                    self.click_dom(upload)
+            node = self.find_file_input(self.dom_nodes(), accept_hint)
+            if node is None or not node.get("backendNodeId"):
+                raise YouTubeUploadError(
+                    f"Không tìm thấy ô chọn file {accept_hint} đúng loại trên YouTube Studio. "
+                    "Tool từ chối đoán để tránh gắn video nhầm chỗ."
+                )
+            self.cdp.command("DOM.setFileInputFiles", {
+                "files": [str(path.resolve())], "backendNodeId": int(node["backendNodeId"]),
+            })
+        finally:
+            if chooser_intercepted:
+                try:self.cdp.command('Page.setInterceptFileChooserDialog',{'enabled':False})
+                except YouTubeUploadError:pass
 
     def custom_thumbnail_ready(self) -> bool:
         """Return whether Studio exposes a live custom-thumbnail preview."""

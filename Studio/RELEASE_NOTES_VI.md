@@ -1,3 +1,16 @@
+## 2.4.342
+
+- Drive đưa đúng tab tác vụ vào trạng thái nhận input và nhấp nút upload thực;
+  đã nghiệm thu tải PNG thành công trên DaiTa4 bằng file input native.
+- YouTube mở đúng bộ chọn thumbnail trước khi gắn ảnh vào input của editor;
+  đường gắn video không thay đổi. Cổng kiểm preview/lưu server vẫn được giữ.
+- Sửa điều kiện phục hồi lỗi thiếu ảnh nguồn: lượt chat phục hồi đã kết thúc
+  được tính đúng, không cần sửa giả bộ đếm retry. Khung trống vẫn chỉ được dự trữ
+  một lần sau bằng chứng kết thúc đúng lượt; quota/chính sách vẫn dừng.
+- Thêm lệnh local dừng/nhường lượt Google, giữ kế hoạch và biên nhận.
+- 297 kiểm thử và 28 subtest PASS cho Google, điều phối, thumbnail, cổng Public
+  và upload YouTube. Không cộng trùng với các nhóm kiểm thử bản trước.
+
 ## 2.4.341
 
 - Sheets chốt ô bằng Tab; trước khi đọc bản xuất, chỉ chốt bộ đệm đang sửa khi

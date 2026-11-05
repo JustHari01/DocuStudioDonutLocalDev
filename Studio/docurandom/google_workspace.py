@@ -500,6 +500,9 @@ class GoogleService:
         if command=='google_run':
             self.run_now(workspace)
             return 'Đã xếp đúng một lượt Google cho '+workspace.name
+        if command=='google_cancel':
+            self.cancel_workspace(workspace.workspace_id)
+            return 'Đã dừng/nhường lượt Google; giữ kế hoạch và biên nhận của '+workspace.name
         if command=='google_preview':
             return json.dumps(preview(workspace),ensure_ascii=False)
         if command=='google_diagnostics':
