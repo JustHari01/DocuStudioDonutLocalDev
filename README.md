@@ -34,6 +34,8 @@ docs/source-import/  Nguồn gốc, manifest hash và tài liệu cũ
 
 ## Bắt đầu làm việc
 
+GitHub Actions đang tắt ở lần nhập đầu tiên để các workflow kế thừa không tự build/phát hành trước khi được rà lại cho monorepo. Source workflow vẫn được giữ; có thể cấu hình rồi bật lại trong Settings → Actions. Lần đưa source lên này chưa chạy lại bộ build/kiểm thử ứng dụng.
+
 ```powershell
 git clone https://github.com/JustHari01/DocuStudioDonutLocalDev.git
 cd DocuStudioDonutLocalDev
