@@ -1,0 +1,2285 @@
+use crate::browser::ProxySettings;
+use crate::cloud_auth::CLOUD_AUTH;
+use crate::downloaded_browsers_registry::DownloadedBrowsersRegistry;
+use crate::events;
+use crate::log_redaction::ShortId;
+use crate::profile::{BrowserProfile, ProfileManager};
+use crate::proxy_manager::PROXY_MANAGER;
+use crate::wayfern_manager::{WayfernConfig, WayfernManager};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static PROFILE_LAUNCH_LOCKS: LazyLock<
+  tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+/// Wakes the app's running-state check (`lib.rs`) when a browser starts. While
+/// nothing runs, that check sleeps on a long interval, and a browser that
+/// exits before it wakes would keep its Stop button, its proxy worker and its
+/// exit cleanup until then.
+pub static BROWSER_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// How long a remote navigation waits for the page to settle.
+///
+/// A relayed round trip crosses two networks and the page load itself happens
+/// on hardware in another country, so this is deliberately the same budget the
+/// automation tools give a navigation rather than a loopback-sized one.
+const REMOTE_NAVIGATE_TIMEOUT_SECS: u64 = 30;
+
+async fn profile_launch_lock(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+  let mut locks = PROFILE_LAUNCH_LOCKS.lock().await;
+  locks
+    .entry(profile_id.to_string())
+    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+    .clone()
+}
+
+async fn lock_profile_launch(profile_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+  profile_launch_lock(profile_id).await.lock_owned().await
+}
+
+pub(crate) async fn try_lock_profile_launch(
+  profile_id: &str,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+  profile_launch_lock(profile_id).await.try_lock_owned().ok()
+}
+
+fn emit_launch_stage(profile: &BrowserProfile, stage: &str, error: Option<&str>) {
+  let _ = events::emit(
+    "profile-launch-stage",
+    serde_json::json!({
+      "id": profile.id.to_string(),
+      "stage": stage,
+      "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+      "error": error,
+    }),
+  );
+}
+
+/// An error for the log: the profile's name taken out (several launch errors
+/// quote it), then URLs, credentials and addresses redacted.
+fn log_err(err: &str, profile: &BrowserProfile) -> String {
+  let name = profile.name.trim();
+  let without_name = if name.is_empty() {
+    err.to_string()
+  } else {
+    err.replace(name, "<profile>")
+  };
+  crate::log_redaction::text(&without_name)
+}
+
+/// Outcomes the person meets as a dialog or a notice, not a fault.
+const LAUNCH_BLOCK_CODES: [&str; 12] = [
+  "FINGERPRINT_EXIT_MISMATCH",
+  "LAUNCH_CONSENT_EXPIRED",
+  "PROFILE_RUNNING",
+  "PROFILE_RUNNING_REMOTELY",
+  "PROFILE_REMOTE_SYNC_PENDING",
+  "PROFILE_DATA_NOT_DOWNLOADED",
+  "PROFILE_LOCKED_BY_MEMBER",
+  "PROFILE_LOCKED_ELSEWHERE",
+  "PROFILE_ROUTE_REQUIRED",
+  "PROFILE_ROUTE_UNAVAILABLE",
+  "WAYFERN_CROSS_OS_REQUIRES_PLAN",
+  "WAYFERN_CROSS_OS_PRIMARY_DEVICE",
+];
+
+/// One line per failed launch. A coded error logs its code and detail only:
+/// the mismatch block carries the exit IP, timezone and language in its params.
+fn log_launch_failure(profile: &BrowserProfile, err: &str, started: std::time::Instant) {
+  let elapsed_ms = started.elapsed().as_millis();
+  let coded = serde_json::from_str::<serde_json::Value>(err)
+    .ok()
+    .and_then(|value| {
+      let code = value.get("code")?.as_str()?.to_string();
+      let params = value.get("params").cloned().unwrap_or_default();
+      Some((code, params))
+    });
+  let Some((code, params)) = coded else {
+    log::error!(
+      "Browser launch failed profile={} elapsed_ms={elapsed_ms} err=\"{}\"",
+      profile.id,
+      log_err(err, profile)
+    );
+    return;
+  };
+  let detail = params
+    .get("detail")
+    .and_then(|d| d.as_str())
+    .map(|d| format!(" detail=\"{}\"", log_err(d, profile)))
+    .unwrap_or_default();
+  if LAUNCH_BLOCK_CODES.contains(&code.as_str()) {
+    let mismatches = params
+      .get("mismatches")
+      .and_then(|m| m.as_str())
+      .filter(|m| !m.is_empty())
+      .map(|m| format!(" mismatches={m}"))
+      .unwrap_or_default();
+    log::info!(
+      "Browser launch blocked profile={} code={code}{mismatches}{detail} elapsed_ms={elapsed_ms}",
+      profile.id
+    );
+    return;
+  }
+  log::error!(
+    "Browser launch failed profile={} code={code}{detail} elapsed_ms={elapsed_ms}",
+    profile.id
+  );
+}
+
+/// Why this machine refuses to launch the profile locally, or `None` when it
+/// may. A Wayfern profile is never refused for the OS that created it.
+fn local_os_refusal(profile: &BrowserProfile) -> Option<String> {
+  profile.is_cross_os().then(|| {
+    format!(
+      "this profile was created on {} and cannot be launched on a different operating system",
+      profile.host_os.as_deref().unwrap_or("another OS"),
+    )
+  })
+}
+
+pub struct BrowserRunner {
+  pub profile_manager: &'static ProfileManager,
+  pub downloaded_browsers_registry: &'static DownloadedBrowsersRegistry,
+  auto_updater: &'static crate::auto_updater::AutoUpdater,
+  wayfern_manager: &'static WayfernManager,
+}
+
+impl BrowserRunner {
+  fn new() -> Self {
+    Self {
+      profile_manager: ProfileManager::instance(),
+      downloaded_browsers_registry: DownloadedBrowsersRegistry::instance(),
+      auto_updater: crate::auto_updater::AutoUpdater::instance(),
+      wayfern_manager: WayfernManager::instance(),
+    }
+  }
+
+  pub fn instance() -> &'static BrowserRunner {
+    &BROWSER_RUNNER
+  }
+
+  pub fn get_binaries_dir(&self) -> PathBuf {
+    crate::app_dirs::binaries_dir()
+  }
+
+  /// Resolve the DNS blocklist level to a cached file path plus whether that
+  /// file should be treated as an allowlist. If a level is set but the cache
+  /// is missing, fetches/compiles on demand (blocks until done).
+  async fn resolve_blocklist_file(
+    profile: &crate::profile::BrowserProfile,
+  ) -> Result<(Option<String>, bool), String> {
+    let Some(ref level_str) = profile.dns_blocklist else {
+      return Ok((None, false));
+    };
+    let Some(level) = crate::dns_blocklist::BlocklistLevel::parse_level(level_str) else {
+      return Ok((None, false));
+    };
+    if level == crate::dns_blocklist::BlocklistLevel::None {
+      return Ok((None, false));
+    }
+    // Only the user's custom list can be an allowlist; the Hagezi tiers are
+    // always block lists.
+    let allowlist_mode = level == crate::dns_blocklist::BlocklistLevel::Custom
+      && crate::dns_blocklist::CustomDnsConfig::load().allowlist_mode;
+    let path = crate::dns_blocklist::BlocklistManager::ensure_cached(level)
+      .await
+      .map_err(|e| format!("Failed to fetch DNS blocklist: {e}"))?;
+    Ok((Some(path.to_string_lossy().to_string()), allowlist_mode))
+  }
+
+  /// Refresh cloud proxy credentials if the profile uses a cloud or cloud-derived proxy,
+  /// then resolve the proxy settings with profile-specific sid for sticky sessions.
+  async fn resolve_proxy_with_refresh(
+    &self,
+    proxy_id: Option<&String>,
+    profile_id: Option<&str>,
+  ) -> Result<Option<ProxySettings>, String> {
+    let proxy_id = match proxy_id {
+      Some(id) => id,
+      None => return Ok(None),
+    };
+
+    if PROXY_MANAGER.is_cloud_or_derived(proxy_id) {
+      log::debug!("Refreshing cloud proxy credentials proxy={proxy_id}");
+      CLOUD_AUTH.sync_cloud_proxy().await;
+    }
+    // For cloud-derived proxies, inject profile-specific sid for sticky sessions
+    if let Some(pid) = profile_id {
+      if PROXY_MANAGER.is_cloud_or_derived(proxy_id) {
+        return Ok(PROXY_MANAGER.resolve_proxy_for_profile(proxy_id, pid));
+      }
+    }
+    Ok(PROXY_MANAGER.get_proxy_settings_by_id(proxy_id))
+  }
+
+  /// Whether this launch may keep a list of the sites it reaches. Never for a
+  /// password-protected or ephemeral profile: their data is sealed or held in
+  /// RAM, and a plaintext list of where they went would undo that. For the
+  /// rest, the "Record visited sites" setting decides.
+  fn records_site_history(profile: &BrowserProfile) -> bool {
+    !profile.password_protected
+      && !profile.ephemeral
+      && crate::settings_manager::SettingsManager::instance()
+        .load_settings()
+        .map(|settings| settings.record_traffic_domains)
+        .unwrap_or(true)
+  }
+
+  fn fire_launch_hook(profile: &BrowserProfile) {
+    let Some(raw_url) = profile.launch_hook.as_deref() else {
+      return;
+    };
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+      return;
+    }
+
+    let parsed = match url::Url::parse(trimmed) {
+      Ok(u) => u,
+      Err(e) => {
+        log::warn!(
+          "Launch hook skipped, invalid URL profile={} err=\"{e}\"",
+          profile.id
+        );
+        return;
+      }
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+      log::warn!(
+        "Launch hook skipped, URL is not http(s) profile={}",
+        profile.id
+      );
+      return;
+    }
+
+    let url = parsed.to_string();
+    let profile_id = profile.id;
+
+    tokio::spawn(async move {
+      let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+      {
+        Ok(c) => c,
+        Err(e) => {
+          log::warn!(
+            "Launch hook client build failed profile={profile_id} err=\"{}\"",
+            crate::log_redaction::text(&e.to_string())
+          );
+          return;
+        }
+      };
+
+      match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+          log::debug!(
+            "Launch hook answered profile={profile_id} status={}",
+            resp.status().as_u16()
+          );
+        }
+        Ok(resp) => {
+          log::warn!(
+            "Launch hook answered with an error profile={profile_id} status={}",
+            resp.status().as_u16()
+          );
+        }
+        Err(e) => {
+          log::warn!(
+            "Launch hook failed profile={profile_id} err=\"{}\"",
+            crate::log_redaction::text(&e.to_string())
+          );
+        }
+      }
+    });
+  }
+
+  /// Resolve the upstream a launch will use.
+  ///
+  /// Deliberately does NOT fire the launch hook: that moved below the gate, so
+  /// a launch the user blocks and then retries calls the user's webhook once
+  /// rather than once per attempt.
+  async fn resolve_launch_proxy(
+    &self,
+    profile: &BrowserProfile,
+  ) -> Result<Option<ProxySettings>, String> {
+    self
+      .resolve_proxy_with_refresh(profile.proxy_id.as_ref(), Some(&profile.id.to_string()))
+      .await
+  }
+
+  /// Get the executable path for a browser profile
+  /// This is a common helper to eliminate code duplication across the codebase
+  pub fn get_browser_executable_path(
+    &self,
+    profile: &BrowserProfile,
+  ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    // Create browser instance to get executable path
+    let browser_type = crate::browser::BrowserType::from_str(&profile.browser)
+      .map_err(|e| format!("Invalid browser type: {e}"))?;
+    let browser = crate::browser::create_browser(browser_type);
+
+    // Construct browser directory path: binaries/<browser>/<version>/
+    let mut browser_dir = self.get_binaries_dir();
+    browser_dir.push(&profile.browser);
+    browser_dir.push(&profile.version);
+
+    // Get platform-specific executable path
+    browser
+      .get_executable_path(&browser_dir)
+      .map_err(|e| format!("Failed to get executable path for {}: {e}", profile.browser).into())
+  }
+
+  /// One argument per thing a launch decides, and they are all independent:
+  /// grouping them into a struct would only move the same list one level out,
+  /// and the one caller shape that repeats already has `LaunchOptions`.
+  #[allow(clippy::too_many_arguments)]
+  async fn launch_browser_internal(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    url: Option<String>,
+    remote_debugging_port: Option<u16>,
+    headless: bool,
+    kind: crate::wayfern_manager::LaunchKind,
+    gate: &crate::launch_gate::FingerprintGate,
+  ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
+    // Handle Wayfern profiles using WayfernManager
+    if profile.browser == "wayfern" {
+      let launch_started = std::time::Instant::now();
+      let _launch_in_progress = crate::wayfern_identity_storage::yield_to_launch().await;
+      let converted;
+      let mut launch_only = false;
+      let profile = if crate::wayfern_identity_storage::needs_conversion(profile) {
+        converted = crate::wayfern_identity_storage::convert_for_launch(profile)
+          .await
+          .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        launch_only = crate::wayfern_identity_storage::is_launch_only(&converted);
+        &converted
+      } else {
+        profile
+      };
+      // Get or create wayfern config
+      let mut wayfern_config = profile.wayfern_config.clone().unwrap_or_else(|| {
+        log::debug!("No wayfern config, using default profile={}", profile.id);
+        WayfernConfig::default()
+      });
+
+      emit_launch_stage(profile, "network", None);
+      // Checked before any worker starts. A setting the worker cannot use would
+      // otherwise fail the launch late, as an untranslated worker error.
+      let dns_server = crate::profile_dns::normalize_dns_server(profile.dns_server.clone())
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+      // Always start a local proxy for Wayfern (for traffic monitoring and geoip support)
+      let mut upstream_proxy = self
+        .resolve_launch_proxy(profile)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+      let geo_proxy_signature_settings = upstream_proxy.clone();
+
+      struct XrayLaunchGuard {
+        worker_id: Option<String>,
+      }
+      impl Drop for XrayLaunchGuard {
+        fn drop(&mut self) {
+          let Some(worker_id) = self.worker_id.take() else {
+            return;
+          };
+          if let Err(error) = crate::xray_worker_runner::stop_xray_worker_now(&worker_id) {
+            log::warn!(
+              "Xray worker stop after failed launch failed id={worker_id} err=\"{error}\""
+            );
+          }
+        }
+      }
+      let mut xray_launch_guard = XrayLaunchGuard { worker_id: None };
+
+      if upstream_proxy
+        .as_ref()
+        .is_some_and(|proxy| crate::xray::is_xray_proxy_type(&proxy.proxy_type))
+      {
+        let vless_uri = upstream_proxy
+          .as_ref()
+          .and_then(|proxy| proxy.vless_uri.as_deref())
+          .ok_or_else(|| crate::backend_error("VLESS_CONFIG_INVALID"))?;
+        let worker =
+          crate::xray_worker_runner::start_xray_worker(Some(&profile.id.to_string()), vless_uri)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+              error.to_string().into()
+            })?;
+        xray_launch_guard.worker_id = Some(worker.id.clone());
+        upstream_proxy = Some(worker.local_proxy_settings());
+      }
+
+      /// Stops a VPN worker this launch started, if the launch then fails.
+      ///
+      /// `created` is the whole point: `start_vpn_worker` reuses a live worker
+      /// for the same VPN, so an unconditional stop would sever the tunnel a
+      /// *different* profile is browsing through the moment this one is
+      /// cancelled. The in-use check is a second belt for a worker adopted by a
+      /// browser that started between the two points.
+      struct VpnLaunchGuard {
+        worker_id: Option<String>,
+        vpn_id: String,
+        created: bool,
+        /// This launch's own hold on the worker, kept until the guard goes out
+        /// of scope so a sibling launch cannot stop the worker while this one
+        /// is still between adoption and publishing its browser PID.
+        claim: Option<crate::vpn_worker_runner::VpnLaunchClaim>,
+      }
+      impl Drop for VpnLaunchGuard {
+        fn drop(&mut self) {
+          // Released before anything reads the claims, or this launch would
+          // count itself as a reason to keep the worker it just failed to use.
+          drop(self.claim.take());
+          let Some(worker_id) = self.worker_id.take() else {
+            return;
+          };
+          if !self.created {
+            return;
+          }
+          let vpn_id = self.vpn_id.clone();
+          tauri::async_runtime::spawn(async move {
+            // Serialize against worker startup for the whole check-then-stop.
+            // Without it another launch can adopt this worker between the
+            // in-use check and the kill, and lose its tunnel a moment later.
+            let _adopt_guard = crate::vpn_worker_runner::lock_vpn_starts().await;
+            if crate::vpn_worker_runner::vpn_id_in_use_by_running_browser(&vpn_id) {
+              log::debug!("VPN worker kept, another browser uses it vpn={vpn_id} id={worker_id}");
+              return;
+            }
+            if let Err(error) = crate::vpn_worker_runner::stop_vpn_worker(&worker_id).await {
+              log::warn!(
+                "VPN worker stop after failed launch failed id={worker_id} err=\"{error}\""
+              );
+            }
+          });
+        }
+      }
+      let mut vpn_launch_guard: Option<VpnLaunchGuard> = None;
+      let mut vpn_worker_id: Option<String> = None;
+
+      // If profile has a VPN instead of proxy, start VPN worker and use it as upstream
+      if upstream_proxy.is_none() {
+        if let Some(ref vpn_id) = profile.vpn_id {
+          match crate::vpn_worker_runner::start_vpn_worker_tracked(vpn_id).await {
+            Ok(started) => {
+              vpn_worker_id = Some(started.config.id.clone());
+              vpn_launch_guard = Some(VpnLaunchGuard {
+                worker_id: Some(started.config.id.clone()),
+                vpn_id: vpn_id.clone(),
+                created: started.created,
+                claim: Some(started.claim),
+              });
+              if let Some(port) = started.config.local_port {
+                upstream_proxy = Some(ProxySettings {
+                  proxy_type: "socks5".to_string(),
+                  host: "127.0.0.1".to_string(),
+                  port,
+                  username: None,
+                  password: None,
+                  vless_uri: None,
+                });
+              }
+            }
+            Err(e) => {
+              return Err(crate::backend_error_with_detail("VPN_WORKER_START_FAILED", e).into());
+            }
+          }
+        }
+      }
+
+      // The gate sits exactly here on purpose. By this line the upstream is
+      // fully normalized across all three transports — VLESS and VPN are
+      // authenticated loopback workers, a stored proxy is its resolved
+      // settings — so one probe covers every profile. And it is still ahead of
+      // the local proxy worker, the decrypted profile copy, the extension
+      // unpack, and the browser process, so a blocked launch has nothing to
+      // undo beyond the two workers whose guards are already armed above.
+      //
+      // The group's bookmarks are written before the gate rather than inside
+      // it: the gate returns early for several kinds of profile and answers a
+      // question ("may this launch proceed"), while this is a preparation step
+      // every spawn needs, including a profile with no route to check.
+      crate::launch_gate::enforce_route_required(profile, upstream_proxy.is_some())
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+      crate::group_bookmarks::sync_for_launch(profile);
+
+      // Run concurrently with the blocklist compile so the added wall clock is
+      // max(), not sum().
+      let (blocklist, gate_result) = tokio::join!(
+        Self::resolve_blocklist_file(profile),
+        crate::launch_gate::enforce_fingerprint_gate(profile, upstream_proxy.as_ref(), gate),
+      );
+      gate_result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+      let (blocklist_file, dns_allowlist_mode) = blocklist?;
+
+      // Past the gate: this launch is really happening, so tell the user's
+      // webhook exactly once.
+      Self::fire_launch_hook(profile);
+
+      // Start the proxy and get local proxy settings
+      // If proxy startup fails, DO NOT launch Wayfern - it requires local proxy
+      let profile_id_str = profile.id.to_string();
+      // Unique per-launch key: a shared constant here would let concurrent
+      // launches overwrite each other's active_proxies entry, ending with one
+      // browser's worker tracked under another browser's PID.
+      let launch_placeholder_pid = crate::proxy_manager::next_launch_placeholder_pid();
+      let local_proxy = PROXY_MANAGER
+        .start_proxy(
+          app_handle.clone(),
+          upstream_proxy.as_ref(),
+          launch_placeholder_pid,
+          Some(&profile_id_str),
+          profile.proxy_bypass_rules.clone(),
+          blocklist_file,
+          dns_allowlist_mode,
+          dns_server.as_deref(),
+          Self::records_site_history(profile),
+          // Wayfern (Chromium) uses a local SOCKS5 proxy so QUIC and WebRTC
+          // UDP can be routed through it (via SOCKS5 UDP ASSOCIATE) without
+          // leaking the real IP, rather than being forced direct as they
+          // would be over an HTTP CONNECT proxy.
+          "socks5",
+        )
+        .await
+        .map_err(|e| crate::wrap_backend_error(e, "Failed to start local proxy for Wayfern"))?;
+
+      // If any step below fails before the browser is up, the detached worker
+      // must be stopped here: its config never gets a browser_pid, so neither
+      // the GUI sweeps nor the worker's own watchdog would ever reap it — it
+      // would survive until machine reboot.
+      struct ProxyLaunchGuard {
+        app_handle: tauri::AppHandle,
+        routing_pid: u32,
+        armed: bool,
+      }
+      impl Drop for ProxyLaunchGuard {
+        fn drop(&mut self) {
+          if self.armed {
+            let app_handle = self.app_handle.clone();
+            let pid = self.routing_pid;
+            tauri::async_runtime::spawn(async move {
+              if let Err(e) = PROXY_MANAGER.stop_proxy(app_handle, pid).await {
+                log::warn!(
+                  "Proxy worker stop after failed launch failed browser_pid={pid} err=\"{e}\""
+                );
+              }
+            });
+          }
+        }
+      }
+      let mut proxy_launch_guard = ProxyLaunchGuard {
+        app_handle: app_handle.clone(),
+        routing_pid: launch_placeholder_pid,
+        armed: true,
+      };
+
+      // Format proxy URL for wayfern - use SOCKS5 for the local proxy so
+      // Chromium proxies UDP (QUIC/WebRTC), not just TCP.
+      let proxy_url = format!("socks5://{}:{}", local_proxy.host, local_proxy.port);
+
+      // Set proxy in wayfern config
+      wayfern_config.proxy = Some(proxy_url);
+
+      let mut updated_profile = profile.clone();
+      let randomize_requested = wayfern_config.randomize_fingerprint_on_launch == Some(true);
+      let needs_device = crate::wayfern_identity_storage::stored_shape(&wayfern_config)
+        == crate::wayfern_identity_storage::StoredShape::Empty;
+      let fingerprint_generated = randomize_requested || needs_device;
+      if fingerprint_generated {
+        // Create a config copy without the existing fingerprint to force generation of a new one
+        let mut config_for_generation = wayfern_config.clone();
+        config_for_generation.fingerprint = None;
+
+        // A failed generation fails the launch on purpose: continuing would
+        // start the browser on whatever device it drew for itself, unmanaged
+        // and unrecorded, while the UI still reports a successful launch. For
+        // an anti-detect product a silently wrong device is worse than no
+        // launch at all, because nothing tells the user to stop using it.
+        //
+        // Structured rather than prose, because the most common failure is the
+        // browser refusing a generation outright. That has to reach the user as
+        // an explanation; a raw CDP string is not one, and the frontend only
+        // translates a coded error.
+        let generated = self
+          .wayfern_manager
+          .generate_fingerprint_config(&app_handle, profile, &config_for_generation)
+          .await
+          .map_err(|e| {
+            crate::wayfern_manager::wayfern_failure(
+              &e.to_string(),
+              "WAYFERN_FINGERPRINT_GENERATION_FAILED",
+              config_for_generation.os.as_deref(),
+            )
+          })?;
+
+        let geolocation_applied = generated.geolocation_applied;
+
+        // Update the config with the new device for launching. An identity
+        // stores the id and the location only; a legacy browser stores the
+        // whole payload.
+        let is_identity = generated.identity_id.is_some();
+        wayfern_config.identity_id = generated.identity_id.clone();
+        wayfern_config.location = generated.location.clone();
+        wayfern_config.identity_baseline = None;
+        wayfern_config.fingerprint = if is_identity {
+          None
+        } else {
+          Some(generated.fingerprint.clone())
+        };
+
+        // Save the updated device to the profile so it persists.
+        let mut updated_wayfern_config = updated_profile.wayfern_config.clone().unwrap_or_default();
+        updated_wayfern_config.identity_id = generated.identity_id;
+        updated_wayfern_config.location = generated.location;
+        updated_wayfern_config.identity_baseline = None;
+        updated_wayfern_config.fingerprint = if is_identity {
+          None
+        } else {
+          Some(generated.fingerprint)
+        };
+        // Preserve the randomize flag so it persists across launches
+        updated_wayfern_config.randomize_fingerprint_on_launch =
+          wayfern_config.randomize_fingerprint_on_launch;
+        // Preserve the OS setting so it's used for future fingerprint generation
+        if wayfern_config.os.is_some() {
+          updated_wayfern_config.os = wayfern_config.os.clone();
+        }
+        // Record which routing this fresh fingerprint's geolocation was built
+        // for (provenance only — nothing rewrites the fingerprint from it).
+        // Only when geolocation actually applied; otherwise leave it unset so a
+        // later on-demand match can tell the location was never resolved.
+        updated_wayfern_config.geo_proxy_signature = if geolocation_applied {
+          Some(crate::wayfern_manager::WayfernManager::geo_signature(
+            geo_proxy_signature_settings.as_ref(),
+            profile.vpn_id.as_deref(),
+            wayfern_config.geoip.as_ref(),
+          ))
+        } else {
+          None
+        };
+        updated_profile.wayfern_config = Some(updated_wayfern_config);
+      }
+      // A non-randomize profile keeps its configured fingerprint verbatim, even
+      // when its proxy/VPN routing has changed since the fingerprint was built.
+      // We deliberately do NOT silently rewrite its timezone/language to match
+      // the new exit: that hid every real fingerprint-vs-exit mismatch (a US
+      // fingerprint behind a German exit would be quietly relabelled German
+      // before the launch-time consistency check could see it). The check now
+      // surfaces the mismatch, and the user re-matches on demand via
+      // `match_profile_fingerprint_to_exit`.
+
+      // Create ephemeral dir for ephemeral or password-protected profiles
+      let decrypted_copy = if profile.password_protected {
+        let protected = profile.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+          crate::profile::password::prepare_for_launch(&protected)
+        })
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        Some(prepared)
+      } else {
+        if profile.ephemeral {
+          // Can mount a RAM disk or start the RAM volume's host and wait for it.
+          let id = profile.id.to_string();
+          tokio::task::spawn_blocking(move || crate::ephemeral_dirs::create_ephemeral_dir(&id))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        }
+        None
+      };
+
+      // Get profile path for Wayfern. A protected profile runs only on its
+      // decrypted copy, never on the sealed directory.
+      let profiles_dir = self.profile_manager.get_profiles_dir();
+      let profile_data_path = decrypted_copy.unwrap_or_else(|| {
+        crate::ephemeral_dirs::get_effective_profile_path(&updated_profile, &profiles_dir)
+      });
+
+      // Profiles imported by builds before the layout fix have their content at
+      // the user-data-dir root instead of under `Default/`, so the browser has
+      // never seen a byte of it. Move it into place now, while the profile is
+      // provably not running. Secrets stay unreadable — the source key was
+      // never captured and cannot be recovered after the fact — but history,
+      // bookmarks, extensions and site data come back.
+      match crate::profile_import::repair_legacy_layout(&profile_data_path) {
+        Ok(true) => log::info!(
+          "Repaired legacy import layout profile={}",
+          updated_profile.id
+        ),
+        Ok(false) => {}
+        Err(e) => log::warn!(
+          "Legacy import layout repair failed profile={} err=\"{e}\"",
+          updated_profile.id
+        ),
+      }
+
+      let profile_path_str = profile_data_path.to_string_lossy().to_string();
+
+      // Install extensions if an extension group is assigned
+      emit_launch_stage(profile, "extensions", None);
+      let mut extension_paths = Vec::new();
+      if updated_profile.extension_group_id.is_some() {
+        let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+        match mgr.install_extensions_for_profile(&updated_profile, &profile_data_path) {
+          Ok(paths) => {
+            extension_paths = paths;
+          }
+          Err(e) => {
+            log::warn!(
+              "Extension install failed, launching without them profile={} err=\"{e}\"",
+              updated_profile.id
+            );
+          }
+        }
+      }
+
+      // Get proxy URL from config
+      let proxy_url = wayfern_config.proxy.as_deref();
+
+      emit_launch_stage(profile, "starting", None);
+      let mut launched = self
+        .wayfern_manager
+        .launch_wayfern(
+          &app_handle,
+          &updated_profile,
+          &profile_path_str,
+          &wayfern_config,
+          url.as_deref(),
+          proxy_url,
+          profile.ephemeral,
+          &extension_paths,
+          remote_debugging_port,
+          headless,
+          kind,
+        )
+        .await;
+      // The server drops a token on a plan change and after a day, and the
+      // engine then reads a paid account as one without a plan. One new token,
+      // one more try.
+      let refused_for_plan = launched
+        .as_ref()
+        .is_err_and(|e| e.to_string().contains("\"WAYFERN_CROSS_OS_REQUIRES_PLAN\""));
+      if refused_for_plan
+        && crate::cloud_auth::CLOUD_AUTH
+          .wayfern_token_after_refusal(None)
+          .await
+          .is_some()
+      {
+        log::info!(
+          "Browser launch retried with a new Wayfern token profile={}",
+          profile.id
+        );
+        launched = self
+          .wayfern_manager
+          .launch_wayfern(
+            &app_handle,
+            &updated_profile,
+            &profile_path_str,
+            &wayfern_config,
+            url.as_deref(),
+            proxy_url,
+            profile.ephemeral,
+            &extension_paths,
+            remote_debugging_port,
+            headless,
+            kind,
+          )
+          .await;
+      }
+      let wayfern_result = launched.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        // A refused apply reports itself as a structured error so the dialog
+        // can name the cause. Prefixing it would put English in front of the
+        // JSON the frontend parses, and the whole thing would reach the user
+        // as raw machine output.
+        crate::wrap_backend_error(
+          crate::wayfern_manager::explain_cross_os_refusal(e.to_string()),
+          "Failed to launch Wayfern",
+        )
+        .into()
+      })?;
+
+      // Get the process ID from launch result
+      let Some(process_id) = wayfern_result.processId.filter(|pid| *pid != 0) else {
+        if let Err(error) = self.wayfern_manager.stop_wayfern(&wayfern_result.id).await {
+          log::warn!(
+            "Browser stop after launch error failed profile={} step=no_pid err=\"{error}\"",
+            profile.id
+          );
+        }
+        return Err(
+          crate::backend_error_with_detail(
+            "INTERNAL_ERROR",
+            "Wayfern did not report a process identifier",
+          )
+          .into(),
+        );
+      };
+      if let Err(error) = PROXY_MANAGER.update_proxy_pid(launch_placeholder_pid, process_id) {
+        if let Err(stop_error) = self.wayfern_manager.stop_wayfern(&wayfern_result.id).await {
+          log::warn!(
+            "Browser stop after launch error failed profile={} step=proxy_pid err=\"{stop_error}\"",
+            profile.id
+          );
+        }
+        return Err(crate::backend_error_with_detail("INTERNAL_ERROR", error).into());
+      }
+      proxy_launch_guard.routing_pid = process_id;
+      if !PROXY_MANAGER.set_browser_pid_for_profile(&updated_profile.id.to_string(), process_id) {
+        if let Err(error) = self.wayfern_manager.stop_wayfern(&wayfern_result.id).await {
+          log::warn!(
+            "Browser stop after launch error failed profile={} step=proxy_owner err=\"{error}\"",
+            profile.id
+          );
+        }
+        return Err(crate::backend_error("INTERNAL_ERROR").into());
+      }
+      if let Some(worker_id) = xray_launch_guard.worker_id.as_deref() {
+        if !crate::xray_worker_runner::set_browser_pid(worker_id, process_id) {
+          if let Err(error) = self.wayfern_manager.stop_wayfern(&wayfern_result.id).await {
+            log::warn!(
+              "Browser stop after launch error failed profile={} step=xray_owner err=\"{error}\"",
+              profile.id
+            );
+          }
+          return Err(crate::backend_error("XRAY_START_FAILED").into());
+        }
+      }
+
+      // The browser and every detached routing worker now share one verified
+      // process identity, so later profile-persistence failures must not tear
+      // down a live route.
+      proxy_launch_guard.armed = false;
+      let xray_worker_id = xray_launch_guard.worker_id.take();
+      if let Some(guard) = vpn_launch_guard.as_mut() {
+        guard.worker_id = None;
+      }
+
+      let mut launched = format!(
+        "Browser launched profile={} pid={process_id} browser=wayfern version={} proxy={} vpn={} proxy_worker={}",
+        updated_profile.id,
+        crate::log_redaction::Plain(&updated_profile.version),
+        profile.proxy_id.as_deref().unwrap_or("none"),
+        profile.vpn_id.as_deref().unwrap_or("none"),
+        PROXY_MANAGER
+          .resolve_proxy_id_for_profile(&profile_id_str)
+          .as_deref()
+          .unwrap_or("none"),
+      );
+      if let Some(id) = vpn_worker_id.as_deref() {
+        launched.push_str(&format!(" vpn_worker={id}"));
+      }
+      if let Some(id) = xray_worker_id.as_deref() {
+        launched.push_str(&format!(" xray_worker={id}"));
+      }
+      if let Some(port) = wayfern_result.cdp_port {
+        launched.push_str(&format!(" cdp_port={port}"));
+      }
+      if headless {
+        launched.push_str(" headless=true");
+      }
+      if kind == crate::wayfern_manager::LaunchKind::Automation {
+        launched.push_str(" kind=automation");
+      }
+      if fingerprint_generated {
+        launched.push_str(" fingerprint=generated");
+      }
+      if !extension_paths.is_empty() {
+        launched.push_str(&format!(" extensions={}", extension_paths.len()));
+      }
+      log::info!(
+        "{launched} elapsed_ms={}",
+        launch_started.elapsed().as_millis()
+      );
+
+      // The browser returned a config to store, and it is on disk already.
+      if let Some(stored) = wayfern_result.stored_profile.as_ref() {
+        updated_profile.wayfern_config = stored.wayfern_config.clone();
+        updated_profile.host_os = stored.host_os.clone();
+      }
+
+      // Update profile with the process info
+      updated_profile.process_id = Some(process_id);
+      updated_profile.last_launch = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+
+      // Save the updated profile
+      if launch_only {
+        let mut persisted = updated_profile.clone();
+        if let Some(disk) = crate::wayfern_identity_storage::read_profile(&updated_profile.id) {
+          persisted.wayfern_config = disk.wayfern_config;
+          persisted.host_os = disk.host_os;
+        }
+        self.save_process_info(&persisted)?;
+      } else {
+        self.save_process_info(&updated_profile)?;
+      }
+      BROWSER_STARTED.notify_one();
+      let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
+        let _ = tm.rebuild_from_profiles(&self.profile_manager.list_profiles().unwrap_or_default());
+      });
+
+      // Emit profiles-changed to trigger frontend to reload profiles from disk
+      if let Err(e) = events::emit_empty("profiles-changed") {
+        log::warn!("Event emit failed event=profiles-changed err=\"{e}\"");
+      }
+
+      // Emit profile update event to frontend
+      if let Err(e) = events::emit("profile-updated", &updated_profile) {
+        log::warn!("Event emit failed event=profile-updated err=\"{e}\"");
+      }
+
+      // Emit minimal running changed event to frontend
+      #[derive(Serialize)]
+      struct RunningChangedPayload {
+        id: String,
+        is_running: bool,
+      }
+
+      let payload = RunningChangedPayload {
+        id: updated_profile.id.to_string(),
+        is_running: updated_profile.process_id.is_some(),
+      };
+
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
+        log::warn!("Event emit failed event=profile-running-changed err=\"{e}\"");
+      }
+
+      return Ok(updated_profile);
+    }
+
+    Err(format!("Unsupported browser type: {}", profile.browser).into())
+  }
+
+  pub async fn open_url_in_existing_browser(
+    &self,
+    _app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    url: &str,
+    _internal_proxy_settings: Option<&ProxySettings>,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Handle Wayfern profiles using WayfernManager
+    if profile.browser == "wayfern" {
+      let profiles_dir = self.profile_manager.get_profiles_dir();
+      let profile_data_path =
+        crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
+      let profile_path_str = profile_data_path.to_string_lossy();
+
+      // Check if the process is running
+      match self
+        .wayfern_manager
+        .find_wayfern_by_profile(&profile_path_str)
+        .await
+      {
+        Some(_wayfern_process) => {
+          // Use CDP to open URL in a new tab
+          self
+            .wayfern_manager
+            .open_url_in_tab(&profile_path_str, url)
+            .await?;
+          return Ok(());
+        }
+        None => {
+          return Err("Wayfern browser is not running".into());
+        }
+      }
+    }
+
+    Err(format!("Unsupported browser type: {}", profile.browser).into())
+  }
+
+  pub async fn launch_browser_with_debugging(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    url: Option<String>,
+    remote_debugging_port: Option<u16>,
+    headless: bool,
+    gate: &crate::launch_gate::FingerprintGate,
+  ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
+    // Wayfern starts (and PID-reconciles) its own local proxy
+    // inside `launch_browser_internal`, so we hand it None here rather than
+    // staging a second, orphaned proxy worker.
+    self
+      .launch_browser_internal(
+        app_handle,
+        profile,
+        url,
+        remote_debugging_port,
+        headless,
+        crate::wayfern_manager::LaunchKind::Automation,
+        gate,
+      )
+      .await
+  }
+
+  pub async fn launch_or_open_url(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    url: Option<String>,
+    internal_proxy_settings: Option<&ProxySettings>,
+    gate: &crate::launch_gate::FingerprintGate,
+  ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
+    // Get the most up-to-date profile data
+    let profiles = self
+      .profile_manager
+      .list_profiles()
+      .map_err(|e| format!("Failed to list profiles in launch_or_open_url: {e}"))?;
+    let updated_profile = profiles
+      .into_iter()
+      .find(|p| p.id == profile.id)
+      .unwrap_or_else(|| profile.clone());
+
+    // Check if browser is already running
+    let is_running = self
+      .check_browser_status(app_handle.clone(), &updated_profile)
+      .await
+      .map_err(|e| format!("Failed to check browser status: {e}"))?;
+
+    // Get the updated profile again after status check (PID might have been updated)
+    let profiles = self
+      .profile_manager
+      .list_profiles()
+      .map_err(|e| format!("Failed to list profiles after status check: {e}"))?;
+    let final_profile = profiles
+      .into_iter()
+      .find(|p| p.id == profile.id)
+      .unwrap_or_else(|| updated_profile.clone());
+
+    if is_running {
+      if let Some(url_ref) = url.as_ref() {
+        match self
+          .open_url_in_existing_browser(
+            app_handle.clone(),
+            &final_profile,
+            url_ref,
+            internal_proxy_settings,
+          )
+          .await
+        {
+          Ok(()) => {
+            log::debug!(
+              "Opened URL in running browser profile={} pid={:?} url={}",
+              final_profile.id,
+              final_profile.process_id,
+              crate::log_redaction::url_label(url_ref)
+            );
+            Ok(final_profile)
+          }
+          // The caller logs the failure once, as a launch failure.
+          Err(e) => Err(e),
+        }
+      } else {
+        log::debug!(
+          "Browser already running, nothing to open profile={}",
+          final_profile.id
+        );
+        Ok(final_profile)
+      }
+    } else {
+      self
+        .launch_browser_internal(
+          app_handle.clone(),
+          &final_profile,
+          url,
+          None,
+          false,
+          crate::wayfern_manager::LaunchKind::Interactive,
+          gate,
+        )
+        .await
+    }
+  }
+
+  fn save_process_info(
+    &self,
+    profile: &BrowserProfile,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Use the regular save_profile method which handles the UUID structure
+    self.profile_manager.save_profile(profile).map_err(|e| {
+      let error_string = e.to_string();
+      Box::new(std::io::Error::other(error_string)) as Box<dyn std::error::Error + Send + Sync>
+    })
+  }
+
+  pub async fn check_browser_status(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+  ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    self
+      .profile_manager
+      .check_browser_status(app_handle, profile)
+      .await
+  }
+
+  pub async fn kill_browser_process(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    log::info!(
+      "Profile stop requested profile={} recorded_pid={:?}",
+      profile.id,
+      profile.process_id
+    );
+    let _profile_launch_guard = lock_profile_launch(&profile.id.to_string()).await;
+
+    // "Stop this profile" has to mean the browser that is actually running, and
+    // for a profile on the leased fleet that browser is not on this machine.
+    // Without this, stopping reported success, killed nothing, and left the
+    // session running to its maximum duration — spending the user's allowance
+    // and holding their profile lock the whole time.
+    if self.stop_remote_session_for(&app_handle, profile).await? {
+      return Ok(());
+    }
+
+    self
+      .kill_browser_process_unlocked(app_handle, profile)
+      .await
+  }
+
+  /// Stop this profile's fleet session, if it has one. Returns whether it did.
+  ///
+  /// Guarded on there being no local process so a locally running profile never
+  /// pays for the lookup, exactly as the open-URL path is: the profile lock
+  /// makes a local and a remote browser mutually exclusive.
+  async fn stop_remote_session_for(
+    &self,
+    app_handle: &tauri::AppHandle,
+    profile: &BrowserProfile,
+  ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if profile.process_id.is_some() {
+      return Ok(false);
+    }
+    let profile_id = profile.id.to_string();
+    let Some(session_id) = crate::remote_handoff::running_session_for_profile(&profile_id) else {
+      return Ok(false);
+    };
+
+    crate::remote_session::end_remote_session(&session_id)
+      .await
+      .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        // Surfaced rather than swallowed. A failure here means the browser is
+        // STILL RUNNING; reporting success would tell the user their profile is
+        // free when a remote host is still writing to it.
+        log::warn!(
+          "Remote session stop failed profile={profile_id} session={} err=\"{e}\"",
+          ShortId(&session_id)
+        );
+        e.to_error_json().into()
+      })?;
+    log::info!(
+      "Remote session stopped profile={profile_id} session={}",
+      ShortId(&session_id)
+    );
+
+    // The session is down and its work is in cloud storage. This is what puts
+    // the profile into "pending sync" and starts the pull, so the user is not
+    // handed back a profile directory that predates the session they just ran.
+    //
+    // The session's own profile lock is released by the server; nothing is
+    // released from here, because this client never held it.
+    crate::remote_session::note_session_stopped(app_handle, &session_id);
+    Ok(true)
+  }
+
+  async fn kill_browser_process_unlocked(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Handle Wayfern profiles using WayfernManager
+    if profile.browser == "wayfern" {
+      let profiles_dir = self.profile_manager.get_profiles_dir();
+      let profile_data_path =
+        crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
+      let profile_path_str = profile_data_path.to_string_lossy();
+
+      // Stop the proxy associated with this profile first
+      let profile_id_str = profile.id.to_string();
+      if let Err(e) = PROXY_MANAGER
+        .stop_proxy_by_profile_id(app_handle.clone(), &profile_id_str)
+        .await
+      {
+        log::warn!("Proxy worker stop failed profile={profile_id_str} err=\"{e}\"");
+      }
+      if let Err(error) =
+        crate::xray_worker_runner::stop_xray_worker_by_profile_id(&profile_id_str).await
+      {
+        log::warn!("Xray worker stop failed profile={profile_id_str} err=\"{error}\"");
+      }
+
+      let mut process_actually_stopped = false;
+      match self
+        .wayfern_manager
+        .find_wayfern_by_profile(&profile_path_str)
+        .await
+      {
+        Some(wayfern_process) => {
+          match self.wayfern_manager.stop_wayfern(&wayfern_process.id).await {
+            Ok(_) => {
+              if let Some(pid) = wayfern_process.processId {
+                // Verify the process actually died by checking after a short delay
+                use tokio::time::{sleep, Duration};
+                sleep(Duration::from_millis(500)).await;
+
+                process_actually_stopped = !crate::proxy_storage::is_process_running(pid);
+
+                if !process_actually_stopped {
+                  log::warn!(
+                    "Browser still running after stop, force killing profile={} pid={pid}",
+                    profile.id
+                  );
+                  // Force kill the process
+                  #[cfg(target_os = "macos")]
+                  {
+                    use crate::platform_browser;
+                    if let Err(e) = platform_browser::macos::kill_browser_process_impl(
+                      pid,
+                      Some(&profile_path_str),
+                    )
+                    .await
+                    {
+                      log::error!(
+                        "Browser force kill failed profile={} pid={pid} err=\"{e}\"",
+                        profile.id
+                      );
+                    } else {
+                      sleep(Duration::from_millis(500)).await;
+                      process_actually_stopped = !crate::proxy_storage::is_process_running(pid);
+                      if process_actually_stopped {
+                        log::info!("Browser force killed profile={} pid={pid}", profile.id);
+                      }
+                    }
+                  }
+                  #[cfg(target_os = "linux")]
+                  {
+                    use crate::platform_browser;
+                    if let Err(e) = platform_browser::linux::kill_browser_process_impl(
+                      pid,
+                      Some(&profile_path_str),
+                    )
+                    .await
+                    {
+                      log::error!(
+                        "Browser force kill failed profile={} pid={pid} err=\"{e}\"",
+                        profile.id
+                      );
+                    } else {
+                      sleep(Duration::from_millis(500)).await;
+                      process_actually_stopped = !crate::proxy_storage::is_process_running(pid);
+                      if process_actually_stopped {
+                        log::info!("Browser force killed profile={} pid={pid}", profile.id);
+                      }
+                    }
+                  }
+                  #[cfg(target_os = "windows")]
+                  {
+                    use crate::platform_browser;
+                    if let Err(e) = platform_browser::windows::kill_browser_process_impl(pid).await
+                    {
+                      log::error!(
+                        "Browser force kill failed profile={} pid={pid} err=\"{e}\"",
+                        profile.id
+                      );
+                    } else {
+                      sleep(Duration::from_millis(500)).await;
+                      process_actually_stopped = !crate::proxy_storage::is_process_running(pid);
+                      if process_actually_stopped {
+                        log::info!("Browser force killed profile={} pid={pid}", profile.id);
+                      }
+                    }
+                  }
+                }
+              } else {
+                process_actually_stopped = true;
+              }
+            }
+            Err(e) => {
+              log::warn!(
+                "Browser stop failed, force killing profile={} pid={:?} err=\"{e}\"",
+                profile.id,
+                wayfern_process.processId
+              );
+              // Try to force kill if we have a PID
+              if let Some(pid) = wayfern_process.processId {
+                #[cfg(target_os = "macos")]
+                {
+                  use crate::platform_browser;
+                  if let Err(kill_err) =
+                    platform_browser::macos::kill_browser_process_impl(pid, Some(&profile_path_str))
+                      .await
+                  {
+                    log::error!(
+                      "Browser force kill failed profile={} pid={pid} err=\"{kill_err}\"",
+                      profile.id
+                    );
+                  } else {
+                    use tokio::time::{sleep, Duration};
+                    sleep(Duration::from_millis(500)).await;
+                    process_actually_stopped = !crate::proxy_storage::is_process_running(pid);
+                  }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                  use crate::platform_browser;
+                  if let Err(kill_err) =
+                    platform_browser::linux::kill_browser_process_impl(pid, Some(&profile_path_str))
+                      .await
+                  {
+                    log::error!(
+                      "Browser force kill failed profile={} pid={pid} err=\"{kill_err}\"",
+                      profile.id
+                    );
+                  } else {
+                    use tokio::time::{sleep, Duration};
+                    sleep(Duration::from_millis(500)).await;
+                    process_actually_stopped = !crate::proxy_storage::is_process_running(pid);
+                  }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                  use crate::platform_browser;
+                  if let Err(kill_err) =
+                    platform_browser::windows::kill_browser_process_impl(pid).await
+                  {
+                    log::error!(
+                      "Browser force kill failed profile={} pid={pid} err=\"{kill_err}\"",
+                      profile.id
+                    );
+                  } else {
+                    use tokio::time::{sleep, Duration};
+                    sleep(Duration::from_millis(500)).await;
+                    process_actually_stopped = !crate::proxy_storage::is_process_running(pid);
+                  }
+                }
+              }
+            }
+          }
+        }
+        None => {
+          log::debug!("No running browser to stop profile={}", profile.id);
+          process_actually_stopped = true;
+        }
+      }
+
+      // If process wasn't confirmed stopped, return an error
+      if !process_actually_stopped {
+        log::warn!(
+          "Browser stop failed, process still alive profile={} pid={:?}",
+          profile.id,
+          profile.process_id
+        );
+        return Err(
+          format!(
+            "Failed to stop Wayfern process for profile {} - process may still be running",
+            profile.name
+          )
+          .into(),
+        );
+      }
+
+      // Clear the process ID from the profile and save immediately so that
+      // subsequent calls to update_profile_version (which re-reads from disk)
+      // see the cleared process_id.
+      let mut updated_profile = profile.clone();
+      updated_profile.process_id = None;
+      self
+        .save_process_info(&updated_profile)
+        .map_err(|e| format!("Failed to update profile: {e}"))?;
+      if let Some(pid) = profile.process_id {
+        PROXY_MANAGER.stop_worker_of_exited_browser(pid).await;
+      }
+
+      // Check for pending updates and apply them
+      if let Ok(Some(pending_update)) = self
+        .auto_updater
+        .get_pending_update(&profile.browser, &profile.version)
+      {
+        match self.profile_manager.update_profile_version(
+          &app_handle,
+          &profile.id.to_string(),
+          &pending_update.new_version,
+        ) {
+          Ok(updated_profile_after_update) => {
+            log::info!(
+              "Pending browser update applied profile={} from={} to={}",
+              profile.id,
+              profile.version,
+              pending_update.new_version
+            );
+            updated_profile = updated_profile_after_update;
+
+            if let Err(e) = self
+              .auto_updater
+              .dismiss_update_notification(&pending_update.id)
+            {
+              log::warn!("Update notification dismiss failed err=\"{e}\"");
+            }
+          }
+          Err(e) => {
+            log::warn!(
+              "Pending browser update failed profile={} to={} err=\"{e}\"",
+              profile.id,
+              pending_update.new_version
+            );
+          }
+        }
+      }
+
+      // If no pending update was applied, check if a newer installed version exists
+      if updated_profile.version == profile.version {
+        if let Some(p) = self
+          .auto_updater
+          .update_profile_to_latest_installed(&app_handle, &updated_profile)
+        {
+          updated_profile = p;
+        }
+      }
+      crate::wayfern_identity_storage::request_conversion_pass();
+
+      // Emit profile update event to frontend
+      if let Err(e) = events::emit("profile-updated", &updated_profile) {
+        log::warn!("Event emit failed event=profile-updated err=\"{e}\"");
+      }
+
+      // Emit minimal running changed event
+      #[derive(Serialize)]
+      struct RunningChangedPayload {
+        id: String,
+        is_running: bool,
+      }
+      let payload = RunningChangedPayload {
+        id: updated_profile.id.to_string(),
+        is_running: false,
+      };
+
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
+        log::warn!("Event emit failed event=profile-running-changed err=\"{e}\"");
+      }
+
+      if profile.password_protected {
+        // Await the re-encryption so the queued sync (released later by
+        // `mark_profile_stopped` in `kill_browser`) sees fresh ciphertext on
+        // disk instead of the previous snapshot.
+        crate::profile::password::complete_after_quit_and_wait(profile).await;
+      } else if profile.ephemeral {
+        let id = profile.id.to_string();
+        crate::ephemeral_dirs::remove_ephemeral_dir(&id);
+        // The per-domain traffic tracker writes to the cache dir on real disk
+        // regardless of where the profile itself lives, so an "in memory only"
+        // session still left a full record of everywhere it connected.
+        crate::traffic_stats::delete_traffic_stats(&id);
+      } else if profile.clear_on_close {
+        // Awaited for the same reason as re-encryption above: a queued sync
+        // must see the cleared dir, not the pre-clear snapshot.
+        crate::profile::clear_on_close::clear_profile_browsing_data(profile).await;
+      }
+
+      // The browser held these open for the life of the process; nothing reads
+      // them once it has exited, and they are plaintext extension code sitting
+      // on real disk even for an ephemeral profile.
+      crate::extension_manager::ExtensionManager::cleanup_unpacked_for_profile(
+        &profile.id.to_string(),
+      );
+      crate::agent_uploads::remove_for_profile(&profile.id.to_string());
+      crate::network_capture::stop(&profile.id.to_string());
+
+      // A temporary profile exists for one automation run, so the run ending
+      // is what ends it. Destroyed rather than trashed: nothing here is worth
+      // restoring, and a trash full of automation leftovers is its own bug.
+      if profile.temporary {
+        match self
+          .profile_manager
+          .delete_profile_permanently(&app_handle, &profile.id.to_string())
+        {
+          Ok(()) => log::info!("Deleted temporary profile profile={}", profile.id),
+          Err(e) => log::warn!(
+            "Temporary profile delete failed profile={} err=\"{e}\"",
+            profile.id
+          ),
+        }
+      }
+
+      // Consolidate browser versions after stopping a browser
+      let _ = self
+        .downloaded_browsers_registry
+        .consolidate_browser_versions(&app_handle);
+
+      return Ok(());
+    }
+
+    Err(
+      format!(
+        "Unsupported browser '{}' for profile '{}' — only Wayfern is supported",
+        profile.browser, profile.name
+      )
+      .into(),
+    )
+  }
+
+  pub async fn open_url_with_profile(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile_id: String,
+    url: String,
+    gate: crate::launch_gate::FingerprintGate,
+  ) -> Result<(), String> {
+    // Get the profile by name
+    let profiles = self
+      .profile_manager
+      .list_profiles()
+      .map_err(|e| format!("Failed to list profiles: {e}"))?;
+    let profile = profiles
+      .into_iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| format!("Profile '{profile_id}' not found"))?;
+    let _profile_launch_guard = lock_profile_launch(&profile.id.to_string()).await;
+
+    // A profile already open on the leased fleet is driven, not launched. This
+    // sits above the cross-OS guard on purpose: a profile bound to another OS
+    // cannot run here, and refusing to point its remote session at a URL for
+    // that reason would make the session unusable from the one endpoint that
+    // exists to use it.
+    //
+    // Guarded on there being no local process, so a profile running here never
+    // pays for the lookup: a local launch records a pid, and the profile lock
+    // keeps a local and a remote session mutually exclusive.
+    if profile.process_id.is_none() {
+      if let Ok(target) = crate::cdp_target::resolve(&profile).await {
+        if target.is_remote() {
+          log::debug!(
+            "Opening URL through {} profile={}",
+            target.describe(),
+            profile.id
+          );
+          return crate::cdp_target::navigate(&target, &url, REMOTE_NAVIGATE_TIMEOUT_SECS)
+            .await
+            .map_err(|e| {
+              log::warn!(
+                "Opening URL on remote browser failed profile={} err=\"{}\"",
+                profile.id,
+                crate::log_redaction::text(&e.to_string())
+              );
+              format!("Failed to open URL with profile: {e}")
+            });
+        }
+      }
+    }
+
+    if let Some(reason) = local_os_refusal(&profile) {
+      return Err(format!(
+        "Cannot open URL with profile '{}': {reason}",
+        profile.name
+      ));
+    }
+
+    // Past this point a local browser is about to be launched, and until now
+    // this was the ONE launch path that took neither the profile lock nor any
+    // notice of the fleet. A remote session whose state could not be read (a
+    // dropped event stream plus an unreachable backend) fell straight through
+    // to a local launch on a profile a host was writing to.
+    crate::remote_handoff::await_startup_check().await;
+    crate::remote_handoff::ensure_local_launch_allowed(&profile.id.to_string())?;
+    let acquired_team_lock = crate::team_lock::acquire_team_lock_if_needed(&profile).await?;
+    if let Err(e) = crate::sync::download_before_first_launch(&app_handle, &profile).await {
+      unwind_launch(&profile, acquired_team_lock).await;
+      return Err(e);
+    }
+    let started = std::time::Instant::now();
+
+    // Use launch_or_open_url which handles both launching new instances and opening in existing ones
+    if let Err(e) = self
+      .launch_or_open_url(app_handle, &profile, Some(url.clone()), None, &gate)
+      .await
+    {
+      log_launch_failure(&profile, &e.to_string(), started);
+      // This path takes the team lock too, and a blocked launch never records a
+      // process_id for the status sweep to release it from.
+      unwind_launch(&profile, acquired_team_lock).await;
+      // Pass structured errors through untouched: the gate's block carries the
+      // mismatch detail the dialog renders, and wrapping it in English would
+      // reach the user as raw JSON.
+      return Err(crate::wrap_backend_error(
+        e,
+        "Failed to open URL with profile",
+      ));
+    }
+
+    Ok(())
+  }
+}
+
+#[tauri::command]
+pub async fn launch_browser_profile(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+  url: Option<String>,
+  consent_token: Option<String>,
+) -> Result<BrowserProfile, String> {
+  log::info!(
+    "Profile lifecycle request source=desktop_command action=launch profile={}",
+    profile.id
+  );
+  let options = LaunchOptions {
+    gate: match consent_token {
+      Some(token) => crate::launch_gate::FingerprintGate::Consented(token),
+      None => crate::launch_gate::FingerprintGate::Enforce,
+    },
+    ..Default::default()
+  };
+  launch_browser_profile_impl(app_handle, profile, url, options).await
+}
+
+/// How one launch should behave.
+///
+/// A struct rather than four trailing positional arguments: `headless` and
+/// `force_new` are already passed adjacently as bare booleans, so a fifth would
+/// compile everywhere while silently inverting behavior wherever the order was
+/// got wrong.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+  pub remote_debugging_port: Option<u16>,
+  pub headless: bool,
+  pub force_new: bool,
+  pub gate: crate::launch_gate::FingerprintGate,
+}
+
+impl LaunchOptions {
+  /// Automation defaults: report, never block, never probe. A headless client
+  /// has no dialog to answer and cannot regenerate its fingerprint mid-run, so
+  /// a hard failure would turn a warning into an outage for a whole fleet.
+  pub fn automation(remote_debugging_port: Option<u16>, headless: bool) -> Self {
+    Self {
+      remote_debugging_port,
+      headless,
+      force_new: true,
+      gate: crate::launch_gate::FingerprintGate::Advisory,
+    }
+  }
+}
+
+/// Release the team lock a launch attempt took before it failed.
+///
+/// Until the gate existed, failing here was rare enough that leaking was merely
+/// untidy. Cancelling a blocked launch is now an ordinary outcome, and the lock
+/// renews itself on a 30s heartbeat while only ever being released via a stored
+/// `process_id` — which a launch that never spawned does not have. So a leak
+/// leaves the profile reading as locked to the whole team until the app quits.
+///
+/// `acquired` is threaded from `acquire_team_lock_if_needed` so this releases
+/// only what this call took, never a lock a REST handler up the stack owns.
+///
+/// Several of these error paths are reachable while a browser for the profile
+/// is genuinely still running — `PROFILE_RUNNING`, or a failure to open a URL
+/// in an existing window. That browser owns the lock and the running mark, so
+/// releasing either would strand it: the team would see the profile as free
+/// while someone is typing in it, and `mark_profile_stopped` would queue a sync
+/// of a profile directory being written to. Hence the liveness check.
+async fn unwind_launch(profile: &BrowserProfile, acquired_team_lock: bool) {
+  if browser_is_running_for(&profile.id.to_string()) {
+    log::debug!(
+      "Launch state kept, a browser is still running profile={}",
+      profile.id
+    );
+    return;
+  }
+
+  if acquired_team_lock {
+    crate::team_lock::release_team_lock_if_needed(profile).await;
+  }
+  // Otherwise this mark sticks for the rest of the session and silently defers
+  // every sync of the profile. Safe here precisely because nothing is running.
+  if let Some(scheduler) = crate::sync::get_global_scheduler() {
+    scheduler
+      .mark_profile_stopped(&profile.id.to_string())
+      .await;
+  }
+}
+
+/// Whether a live browser process is recorded for this profile right now.
+/// Re-read from disk: the caller's copy predates the launch attempt.
+pub(crate) fn browser_is_running_for(profile_id: &str) -> bool {
+  BrowserRunner::instance()
+    .profile_manager
+    .list_profiles()
+    .ok()
+    .and_then(|profiles| {
+      profiles
+        .into_iter()
+        .find(|p| p.id.to_string() == profile_id)
+        .map(|p| {
+          p.process_id
+            .is_some_and(crate::proxy_storage::is_process_running)
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub async fn launch_browser_profile_impl(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+  url: Option<String>,
+  options: LaunchOptions,
+) -> Result<BrowserProfile, String> {
+  let _profile_launch_guard = lock_profile_launch(&profile.id.to_string()).await;
+  let started = std::time::Instant::now();
+  emit_launch_stage(&profile, "queued", None);
+  let mut profile = profile;
+  let mut result = launch_browser_profile_tracked(
+    app_handle.clone(),
+    profile.clone(),
+    url.clone(),
+    options.clone(),
+  )
+  .await;
+  // Wayfern refuses some overrides a whole supplied device carries (which ones
+  // depends on the values). Each refusal names one property, so the property
+  // is dropped and the launch tried again, a bounded number of times.
+  for _ in 0..MAX_OVERRIDE_RETRIES {
+    let Err(error) = &result else { break };
+    let Some(dropped) = drop_refused_override(&profile, error) else {
+      break;
+    };
+    log::warn!(
+      "Override refused by the browser, dropped and launching again profile={} property={}",
+      profile.id,
+      dropped.1
+    );
+    profile = dropped.0;
+    // The refused browser was killed; a new one may only start once it is gone.
+    wait_until_stopped(&app_handle, &profile).await;
+    result = launch_browser_profile_tracked(
+      app_handle.clone(),
+      profile.clone(),
+      url.clone(),
+      options.clone(),
+    )
+    .await;
+  }
+  match &result {
+    Ok(_) => emit_launch_stage(&profile, "running", None),
+    Err(error) => {
+      log_launch_failure(&profile, error, started);
+      emit_launch_stage(
+        &profile,
+        "failed",
+        Some(&crate::wrap_backend_error(error, "Browser launch failed")),
+      )
+    }
+  }
+  result
+}
+
+/// Wait, briefly, until no browser runs for `profile`.
+async fn wait_until_stopped(app_handle: &tauri::AppHandle, profile: &BrowserProfile) {
+  for _ in 0..50 {
+    match BrowserRunner::instance()
+      .check_browser_status(app_handle.clone(), profile)
+      .await
+    {
+      Ok(false) => return,
+      _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+    }
+  }
+  log::warn!(
+    "Refused browser still running after 5 s profile={}",
+    profile.id
+  );
+}
+
+/// How many refused overrides one launch may drop before it gives up.
+const MAX_OVERRIDE_RETRIES: usize = 6;
+
+/// The property a `WAYFERN_IDENTITY_REFUSED` error names, when it is one the
+/// profile overrides.
+fn refused_override(error: &str) -> Option<String> {
+  if !error.contains("WAYFERN_IDENTITY_REFUSED") {
+    return None;
+  }
+  let marker = "Fingerprint property was not applied: ";
+  let rest = &error[error.find(marker)? + marker.len()..];
+  let name: String = rest
+    .chars()
+    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+    .collect();
+  (!name.is_empty()).then_some(name)
+}
+
+/// `profile` without the override the browser refused, saved so the next
+/// launch does not trip on it again. `None` when the error names no override
+/// this profile carries.
+fn drop_refused_override(
+  profile: &BrowserProfile,
+  error: &str,
+) -> Option<(BrowserProfile, String)> {
+  let property = refused_override(error)?;
+  let mut updated = profile.clone();
+  let config = updated.wayfern_config.as_mut()?;
+  let mut overrides: serde_json::Map<String, serde_json::Value> =
+    serde_json::from_str(config.identity_overrides.as_deref()?).ok()?;
+  overrides.remove(&property)?;
+  config.identity_overrides = if overrides.is_empty() {
+    None
+  } else {
+    serde_json::to_string(&overrides).ok()
+  };
+  // Not an edit of the person's: the stored copy only stops asking for what the
+  // browser cannot give, so `updated_at` stays and sync is not woken.
+  if let Err(e) = ProfileManager::instance().save_profile(&updated) {
+    log::warn!(
+      "Refused override not saved profile={} err=\"{e}\"",
+      profile.id
+    );
+  }
+  Some((updated, property))
+}
+
+async fn launch_browser_profile_tracked(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+  url: Option<String>,
+  options: LaunchOptions,
+) -> Result<BrowserProfile, String> {
+  let LaunchOptions {
+    remote_debugging_port,
+    headless,
+    force_new,
+    gate,
+  } = options;
+  emit_launch_stage(&profile, "preparing", None);
+
+  if let Some(reason) = local_os_refusal(&profile) {
+    return Err(format!(
+      "Cannot launch profile '{}': {reason}",
+      profile.name
+    ));
+  }
+
+  // Refuse a launch that would run over work a remote session has not handed
+  // back yet. Checked before the profile lock because it answers without a
+  // round trip and because it stays true after the session's lock is released:
+  // the lock protects the browser, this protects the bytes it wrote.
+  crate::remote_handoff::await_startup_check().await;
+  crate::remote_handoff::ensure_local_launch_allowed(&profile.id.to_string())?;
+
+  // Team lock check: if profile is sync-enabled and user is on a team, acquire lock
+  let acquired_team_lock = crate::team_lock::acquire_team_lock_if_needed(&profile).await?;
+
+  // A profile that reached this machine as metadata alone downloads its files
+  // first; launched empty, its next sync would erase the real profile.
+  if let Err(e) = crate::sync::download_before_first_launch(&app_handle, &profile).await {
+    unwind_launch(&profile, acquired_team_lock).await;
+    return Err(e);
+  }
+
+  // Notify sync scheduler that profile is now running and queue sync for when it stops
+  if let Some(scheduler) = crate::sync::get_global_scheduler() {
+    let pid = profile.id.to_string();
+    scheduler.mark_profile_running(&pid).await;
+    if profile.is_sync_enabled() {
+      scheduler.queue_profile_sync(pid).await;
+    }
+  }
+
+  let browser_runner = BrowserRunner::instance();
+
+  // Resolve the most up-to-date profile from disk by ID to avoid using stale proxy_id/browser state
+  let profile_for_launch = match browser_runner
+    .profile_manager
+    .list_profiles()
+    .map_err(|e| format!("Failed to list profiles: {e}"))
+  {
+    Ok(profiles) => profiles
+      .into_iter()
+      .find(|p| p.id == profile.id)
+      .unwrap_or_else(|| profile.clone()),
+    Err(e) => {
+      unwind_launch(&profile, acquired_team_lock).await;
+      return Err(e);
+    }
+  };
+
+  if force_new {
+    let already_running = match browser_runner
+      .check_browser_status(app_handle.clone(), &profile_for_launch)
+      .await
+    {
+      Ok(running) => running,
+      Err(error) => {
+        unwind_launch(&profile, acquired_team_lock).await;
+        return Err(crate::wrap_backend_error(
+          error,
+          "Failed to check browser status before launch",
+        ));
+      }
+    };
+    if already_running {
+      unwind_launch(&profile, acquired_team_lock).await;
+      return Err(crate::backend_error("PROFILE_RUNNING"));
+    }
+  }
+
+  // Launch browser or open URL in existing instance. Wayfern starts its
+  // own local proxy inside `launch_browser_internal`; other browser types
+  // are rejected there, so no proxy needs to be staged here.
+  //
+  // `force_new` callers (API/MCP) always start a fresh instance with the
+  // requested debug port and headless mode, bypassing the "open URL in the
+  // existing window" path which would otherwise ignore both.
+  let launch_result = if force_new {
+    browser_runner
+      .launch_browser_with_debugging(
+        app_handle.clone(),
+        &profile_for_launch,
+        url,
+        remote_debugging_port,
+        headless,
+        &gate,
+      )
+      .await
+  } else {
+    browser_runner
+      .launch_or_open_url(app_handle.clone(), &profile_for_launch, url, None, &gate)
+      .await
+  };
+  let updated_profile = match launch_result {
+    Ok(updated) => updated,
+    Err(e) => {
+      // Emit a failure event to clear loading states in the frontend
+      #[derive(serde::Serialize)]
+      struct RunningChangedPayload {
+        id: String,
+        is_running: bool,
+      }
+      let payload = RunningChangedPayload {
+        id: profile_for_launch.id.to_string(),
+        is_running: false,
+      };
+
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
+        log::warn!("Event emit failed event=profile-running-changed err=\"{e}\"");
+      }
+
+      unwind_launch(&profile, acquired_team_lock).await;
+
+      // Check if this is an architecture compatibility issue
+      if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
+        if io_error.kind() == std::io::ErrorKind::Other
+          && io_error.to_string().contains("Exec format error")
+        {
+          return Err(format!("Failed to launch browser: Executable format error. This browser version is not compatible with your system architecture ({}). Please try a different browser or version that supports your platform.", std::env::consts::ARCH));
+        }
+      }
+      return Err(crate::wrap_backend_error(
+        e,
+        "Failed to launch browser or open URL",
+      ));
+    }
+  };
+
+  #[cfg(target_os = "windows")]
+  if !headless && updated_profile.browser == "wayfern" {
+    if let Some(process_id) = updated_profile.process_id {
+      // This also covers a profile that was already running when the user
+      // opened another tab in it.
+      crate::wayfern_manager::position_wayfern_window_in_background(&app_handle, process_id);
+    }
+  }
+
+  // The proxy PID mapping was already reconciled inside launch_browser_internal
+  // (placeholder → real browser PID); nothing is ever keyed by a constant here.
+
+  Ok(updated_profile)
+}
+
+#[tauri::command]
+pub fn check_browser_exists(browser_str: String, version: String) -> bool {
+  // This is an alias for is_browser_downloaded to provide clearer semantics for auto-updates
+  let runner = BrowserRunner::instance();
+  runner
+    .downloaded_browsers_registry
+    .is_browser_downloaded(&browser_str, &version)
+}
+
+#[tauri::command]
+pub async fn kill_browser_profile(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+) -> Result<(), String> {
+  log::info!(
+    "Profile lifecycle request source=desktop_command action=stop profile={}",
+    profile.id
+  );
+  kill_browser_profile_impl(app_handle, profile).await
+}
+
+// Internal synchronizer stops enter here instead of impersonating a desktop
+// command. The shared shutdown and persistence behavior stays the same.
+pub(crate) async fn kill_browser_profile_impl(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+) -> Result<(), String> {
+  let browser_runner = BrowserRunner::instance();
+
+  match browser_runner
+    .kill_browser_process(app_handle.clone(), &profile)
+    .await
+  {
+    Ok(()) => {
+      // Release team lock if applicable
+      crate::team_lock::release_team_lock_if_needed(&profile).await;
+
+      // Notify sync scheduler that profile stopped (sync was queued at launch)
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        scheduler
+          .mark_profile_stopped(&profile.id.to_string())
+          .await;
+      }
+
+      // Auto-update non-running profiles and cleanup unused binaries
+      let browser_for_update = profile.browser.clone();
+      let app_handle_for_update = app_handle.clone();
+      tauri::async_runtime::spawn(async move {
+        let registry = crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
+        let mut versions = registry.get_downloaded_versions(&browser_for_update);
+        if !versions.is_empty() {
+          versions.sort_by(|a, b| crate::api_client::compare_versions(b, a));
+          let latest_version = &versions[0];
+
+          let auto_updater = crate::auto_updater::AutoUpdater::instance();
+          match auto_updater
+            .auto_update_profile_versions(
+              &app_handle_for_update,
+              &browser_for_update,
+              latest_version,
+            )
+            .await
+          {
+            Ok(updated) => {
+              if !updated.is_empty() {
+                log::info!(
+                  "Profiles moved to latest browser after stop count={} browser={browser_for_update} version={latest_version}",
+                  updated.len()
+                );
+              }
+            }
+            Err(e) => {
+              log::warn!("Profile browser update after stop failed err=\"{e}\"");
+            }
+          }
+        }
+
+        if let Err(e) = registry.cleanup_unused_binaries() {
+          log::warn!("Unused browser cleanup after stop failed err=\"{e}\"");
+        }
+      });
+
+      Ok(())
+    }
+    Err(e) => {
+      log::error!(
+        "Browser stop failed profile={} pid={:?} err=\"{}\"",
+        profile.id,
+        profile.process_id,
+        log_err(&e.to_string(), &profile)
+      );
+
+      // Emit a failure event to clear loading states in the frontend
+      #[derive(serde::Serialize)]
+      struct RunningChangedPayload {
+        id: String,
+        is_running: bool,
+      }
+      // On kill failure, we assume the process is still running
+      let payload = RunningChangedPayload {
+        id: profile.id.to_string(),
+        is_running: true,
+      };
+
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
+        log::warn!("Event emit failed event=profile-running-changed err=\"{e}\"");
+      }
+
+      Err(format!("Failed to kill browser: {e}"))
+    }
+  }
+}
+
+#[tauri::command]
+pub async fn open_url_with_profile(
+  app_handle: tauri::AppHandle,
+  profile_id: String,
+  url: String,
+  consent_token: Option<String>,
+) -> Result<(), String> {
+  let browser_runner = BrowserRunner::instance();
+  let gate = match consent_token {
+    Some(token) => crate::launch_gate::FingerprintGate::Consented(token),
+    None => crate::launch_gate::FingerprintGate::Enforce,
+  };
+  browser_runner
+    .open_url_with_profile(app_handle, profile_id, url, gate)
+    .await
+}
+
+/// Where the browser of a profile running here takes DevTools connections.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DebugEndpoint {
+  pub port: u16,
+  /// `None` when the browser holds the port but did not answer in time.
+  pub ws_url: Option<String>,
+}
+
+/// The DevTools port `POST /v1/profiles/{id}/run` hands over for a browser
+/// already open, and its browser-level socket. `None` when not running here.
+async fn debug_endpoint(profile: &BrowserProfile) -> Option<DebugEndpoint> {
+  let port = crate::browser_tabs::local_port(profile).await?;
+  let ws_url = async {
+    let version: serde_json::Value = reqwest::Client::builder()
+      .no_proxy()
+      .timeout(Duration::from_secs(2))
+      .build()
+      .ok()?
+      .get(format!("http://127.0.0.1:{port}/json/version"))
+      .send()
+      .await
+      .ok()?
+      .json()
+      .await
+      .ok()?;
+    version
+      .get("webSocketDebuggerUrl")?
+      .as_str()
+      .map(str::to_string)
+  }
+  .await;
+  Some(DebugEndpoint { port, ws_url })
+}
+
+#[tauri::command]
+pub async fn get_profile_debug_endpoint(
+  profile_id: String,
+) -> Result<Option<DebugEndpoint>, String> {
+  let profile = ProfileManager::instance()
+    .list_profiles()
+    .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?
+    .into_iter()
+    .find(|p| p.id.to_string() == profile_id)
+    .ok_or_else(|| crate::backend_error("PROFILE_NOT_FOUND"))?;
+  Ok(debug_endpoint(&profile).await)
+}
+
+// Global singleton instance
+static BROWSER_RUNNER: std::sync::LazyLock<BrowserRunner> =
+  std::sync::LazyLock::new(BrowserRunner::new);
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn a_stopped_profile_has_no_debug_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let _data = crate::app_dirs::set_test_data_dir(dir.path().to_path_buf());
+    let profile = BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      process_id: None,
+      ..Default::default()
+    };
+    assert_eq!(debug_endpoint(&profile).await, None);
+  }
+
+  #[test]
+  fn a_refusal_names_the_override_to_drop() {
+    let refused = crate::backend_error_with_detail(
+      "WAYFERN_IDENTITY_REFUSED",
+      "the identity file overrides were rejected: Fingerprint property was not applied: batteryLevel. Check the property name and the value type.",
+    );
+    assert_eq!(refused_override(&refused).as_deref(), Some("batteryLevel"));
+    assert_eq!(
+      refused_override(&crate::backend_error("WAYFERN_IDENTITY_REFUSED")),
+      None
+    );
+    assert_eq!(
+      refused_override("Fingerprint property was not applied: x"),
+      None,
+      "only an identity refusal drops an override"
+    );
+  }
+
+  #[tokio::test]
+  async fn profile_launch_lock_serializes_only_the_same_profile() {
+    let profile = format!("launch-lock-{}", uuid::Uuid::new_v4());
+    let other_profile = format!("launch-lock-{}", uuid::Uuid::new_v4());
+    let first = lock_profile_launch(&profile).await;
+
+    assert!(tokio::time::timeout(
+      Duration::from_millis(100),
+      lock_profile_launch(&other_profile)
+    )
+    .await
+    .is_ok());
+    assert!(
+      tokio::time::timeout(Duration::from_millis(100), lock_profile_launch(&profile))
+        .await
+        .is_err()
+    );
+
+    drop(first);
+    assert!(
+      tokio::time::timeout(Duration::from_millis(100), lock_profile_launch(&profile))
+        .await
+        .is_ok()
+    );
+  }
+
+  fn profile_created_on(browser: &str, os: &str) -> BrowserProfile {
+    BrowserProfile {
+      name: "p".to_string(),
+      browser: browser.to_string(),
+      host_os: Some(os.to_string()),
+      ..BrowserProfile::default()
+    }
+  }
+
+  #[test]
+  fn a_wayfern_profile_from_any_os_launches_locally() {
+    for os in ["macos", "windows", "linux"] {
+      assert_eq!(
+        local_os_refusal(&profile_created_on("wayfern", os)),
+        None,
+        "a Wayfern profile created on {os} must launch here"
+      );
+    }
+  }
+
+  #[test]
+  fn a_profile_bound_to_another_os_is_refused_locally() {
+    let host = crate::profile::types::get_host_os();
+    let other = if host == "windows" {
+      "macos"
+    } else {
+      "windows"
+    };
+    let reason = local_os_refusal(&profile_created_on("camoufox", other))
+      .expect("a profile bound to another OS must be refused");
+    assert!(
+      reason.contains(other),
+      "the reason must name the OS: {reason}"
+    );
+    assert_eq!(
+      local_os_refusal(&profile_created_on("camoufox", &host)),
+      None
+    );
+  }
+}

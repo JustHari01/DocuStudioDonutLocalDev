@@ -1,0 +1,148 @@
+{
+  "version": "11.1.0-r1",
+  "required_studio": "2.4.324",
+  "masters": [
+    {
+      "domain": "G-13",
+      "topic": "Máy công cụ và đo lường",
+      "file": "G-13 - May cong cu va do luong - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "5a8b6512e22fddf7557db78c2b3d7e6eec878a81c3c8ca60f93562f2d3df64ce"
+    },
+    {
+      "domain": "G-10",
+      "topic": "Đường sắt và hạ tầng",
+      "file": "G-10 - Duong sat va ha tang - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "5c44944e52b9b414058aa608b5e81579c3b7e4fbff42e6bc31d47fd669f0493f"
+    },
+    {
+      "domain": "G-09",
+      "topic": "Ô tô, hybrid và pin",
+      "file": "G-09 - O to hybrid va pin - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "447f61ca285eb3518d37c8b68702f06736e0c7ec31e5d3186af523b296792828"
+    },
+    {
+      "domain": "G-12",
+      "topic": "Vật liệu và thiết bị bán dẫn",
+      "file": "G-12 - Vat lieu va thiet bi ban dan - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "d8387c8cab06f0785c2baf8c99fc27b08e419c238a65d42c8506dfda529bea2c"
+    },
+    {
+      "domain": "G-16",
+      "topic": "Linh kiện và chuỗi cung ứng",
+      "file": "G-16 - Linh kien va chuoi cung ung - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "19757f99907006f50450a9be78b71280294d3fc93faa05bc29461524c07b4527"
+    },
+    {
+      "domain": "G-11",
+      "topic": "Cảng, sân bay và logistics",
+      "file": "G-11 - Cang san bay va logistics - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "cd2f0f90bd1a7e1f73435243f456fb453fb71757e88d235f329ec103e54992b3"
+    },
+    {
+      "domain": "R-A6",
+      "topic": "Tiêu chuẩn và chứng nhận",
+      "file": "R-A6 - Tieu chuan va chung nhan - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "a9c44f9839334bd645781b1e2c74c3139fafd2720ae0479b49eac95bdc29b3e5"
+    },
+    {
+      "domain": "R-B2",
+      "topic": "Thương hiệu, bảo hành và hậu mãi",
+      "file": "R-B2 - Thuong hieu bao hanh va hau mai - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "9b01713e85c393c282a481736103d38f2a1134f1343f88fb86cae3331c8ad289"
+    },
+    {
+      "domain": "R-B3",
+      "topic": "Bằng sáng chế và nguồn gốc công nghệ",
+      "file": "R-B3 - Bang sang che va nguon goc cong nghe - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "2fe71faeb6cca2bbdf4ab3f54e4c18ca85d9f305be41fe852249c0540278fccf"
+    },
+    {
+      "domain": "R-B4",
+      "topic": "Tri thức ngầm và monozukuri",
+      "file": "R-B4 - Tri thuc ngam va monozukuri - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "ed864704a9db3c4d02cbb7260c83a07e51eec6a2f2d885b08fd0131ed6c0a235"
+    },
+    {
+      "domain": "R-B5",
+      "topic": "Hợp đồng, đấu thầu và hợp tác quốc tế",
+      "file": "R-B5 - Hop dong dau thau va hop tac quoc te - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "836196c549039a8b470e4eb2d6d170f67fc26dad49887b56a5ef1e6f4f7892dd"
+    },
+    {
+      "domain": "R-B6",
+      "topic": "Khủng hoảng và khả năng phục hồi hệ thống",
+      "file": "R-B6 - Khung hoang va kha nang phuc hoi - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "7ab4e4502daf1c0742bda22b1a984b136ca785915be1316bbe08d0aa95a6d2ab"
+    },
+    {
+      "domain": "R-C1",
+      "topic": "Kỹ sư, chuyển giao và hệ sinh thái",
+      "file": "R-C1 - Ky su chuyen giao va he sinh thai - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "7da50944f365e364d387a59833cca602c48b176bc88c4e908c46228245bd2450"
+    },
+    {
+      "domain": "R-C2",
+      "topic": "Tài chính, ngoại hối và thanh khoản",
+      "file": "R-C2 - Tai chinh ngoai hoi va thanh khoan - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "a59418fa887c60f17a8b97d49e2f2ff61ad86eb3cca7a5ff15164c32053ac6a5"
+    },
+    {
+      "domain": "R-C3",
+      "topic": "Ngân hàng, tín dụng và xếp hạng",
+      "file": "R-C3 - Ngan hang tin dung va xep hang - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "f37228fe159d7ed899a29eb9b0ed5a84766488f3b5a5ec4d8ee448f4392fa266"
+    },
+    {
+      "domain": "R-H3-01",
+      "topic": "Năng lượng mới và tài nguyên biển sâu",
+      "file": "R-H3-01 - Nang luong moi va tai nguyen bien sau - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "61c27df07867d814f84aa12cb7e2ab72942653d06801d843c407ba1e55715dd2"
+    },
+    {
+      "domain": "R-H3-02",
+      "topic": "Hàng không vũ trụ và thăm dò không gian",
+      "file": "R-H3-02 - Hang khong vu tru va tham do khong gian - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "21d7a08596ba4c62197286775706dd701141d714498adae82b32332f0d668252"
+    },
+    {
+      "domain": "R-H3-03",
+      "topic": "HVAC, bơm nhiệt và thích ứng khí hậu",
+      "file": "R-H3-03 - HVAC bom nhiet va thich ung khi hau - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "83f7ac703cecaca9d224ecd3d91a4fc25d44da3dd5419870133c3b27b1f9706c"
+    },
+    {
+      "domain": "R-H3-04",
+      "topic": "Kỹ thuật hậu cần quốc phòng và cứu hộ",
+      "file": "R-H3-04 - Hau can quoc phong va cuu ho - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "c7ee238ffac17937f150f4a95326f27a6bcba88a285c0d0c91d6915ed872d450"
+    },
+    {
+      "domain": "R-H3-05",
+      "topic": "Nghệ thuật biểu diễn và công nghệ giải trí",
+      "file": "R-H3-05 - Nghe thuat bieu dien va cong nghe giai tri - V11.1.0-r1.txt",
+      "version": "11.1.0-r1",
+      "sha256": "08801c4118a8f4963de34d5ad42760c0851b9b72d93a44d95f3b4cd59f43cb3e"
+    }
+  ],
+  "standalone_files": true,
+  "workspace_assignments_changed": false
+}

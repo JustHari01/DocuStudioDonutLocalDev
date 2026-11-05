@@ -1,0 +1,41 @@
+DOMAIN: R-B6 — KHỦNG HOẢNG VÀ KHẢ NĂNG PHỤC HỒI HỆ THỐNG
+Lời hứa kênh: tìm mắt xích nào giúp duy trì hoặc khôi phục dịch vụ sau gián đoạn,
+phân biệt chuẩn bị, ứng phó và phục hồi; không dùng thảm họa làm cảnh giật gân bịa.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Mất điện: tải ưu tiên, thời gian dự phòng và điều kiện chuyển nguồn.
+2. Đứt nguồn cung: tồn kho, nguồn thay thế và khâu phê duyệt.
+3. Mưa/ngập: giới hạn bảo vệ và trình tự kiểm tra trước khôi phục.
+4. Động đất: kiểm tra, đóng dịch vụ và quyết định mở lại có điều kiện.
+5. Truyền thông gián đoạn: kênh dự phòng và xác nhận thông tin.
+6. Nút thắt nhân sự: phân vai, quyền quyết định và khả năng thay ca.
+7. Dự phòng cùng nguyên nhân hỏng: hai thiết bị chưa chắc là hai nguồn độc lập.
+8. Diễn tập: kịch bản kiểm được và tình huống chưa được diễn tập.
+9. Khôi phục từng phần: dịch vụ nào trở lại trước và hệ quả đánh đổi.
+10. Bài học sau sự cố: thay đổi đã thực hiện khác với khuyến nghị trên giấy.
+
+VẬT CHỨNG VÀ SO SÁNH
+Ưu tiên báo cáo sự cố/khôi phục chính thức, cơ quan quản lý hạ tầng, tài liệu
+diễn tập và bản đồ công khai đúng ngày. Dùng mốc thời gian, phạm vi, mức độ tác
+động và dịch vụ cùng định nghĩa; không so thời gian hồi phục hai sự cố khác quy
+mô như một bảng xếp hạng. Dự phòng có giới hạn, không nói chống mọi thảm họa.
+Không bịa số thương vong, tình trạng khẩn cấp hiện tại hoặc cảnh quay cứu hộ thật.
+Mô phỏng/minh họa phải được phân biệt; không biến cảnh AI thành tư liệu hiện trường.
+
+THUẬT NGỮ NHẬT
+事業継続: duy trì hoạt động; 復旧: khôi phục; 冗長化: bố trí dự phòng;
+代替手段: phương án thay thế; 停電: mất điện; 浸水: ngập nước;
+初動対応: ứng phó ban đầu; 復旧優先順位: thứ tự ưu tiên phục hồi;
+訓練: diễn tập; 再発防止: ngăn tái diễn.
+
+CÁCH KỂ VÀ HÌNH ẢNH
+Theo một dịch vụ từ ngừng đến vận hành hạn chế rồi bình thường; công nhận giới
+hạn và lựa chọn khó. Thumbnail là mắt xích hạ tầng/nguồn dự phòng hoặc bản đồ
+sơ đồ, không khuôn mặt nạn nhân, máu hay ảnh tận thế. Shot theo chuỗi phụ thuộc,
+không lặp trực thăng và tòa nhà đổ nếu không liên quan. Không hiển thị vị trí
+điểm yếu nhạy cảm hoặc chi tiết có thể hỗ trợ phá hoại hệ thống.
+
+BIÊN NGÁCH
+Phim giải thích hệ thống và bài học lịch sử, không hướng dẫn ứng phó khẩn cấp
+thay cơ quan có trách nhiệm, không dự báo thảm họa chắc chắn và không khai thác
+nỗi đau có tên thật làm phản diện. Logistics thường ngày thuộc G-11.

@@ -1,0 +1,9 @@
+Upstream source: user-provided D:/donutbrowser-0.35.4, checked against official archive
+Official release: https://github.com/donutbrowser/donutbrowser/releases/tag/v0.35.4
+Official archive SHA256: c6a06fb5c3de59c7df28f7d43420cd832cd11d6dc6a290bc51d23dbd1f2d16ce
+Local port: D:/donutbrowser-main, 2026-10-24
+This source tree includes local integration changes; it is not an untouched upstream Git revision.
+Evidence: D:\donutbrowser-main\.local-build\upgrade-0354-20261024
+Local application updates are notification-only. Browser/GeoIP update behavior remains enabled by the existing configuration.
+
+Local network correction 2026-10-24: unify stored HTTPS CONNECT/httpstls/SOCKS remote-DNS mapping across diagnostics; reject unsupported proxy protocols before IP requests; return HTTP redirects to browser and preserve configured route on proxy failure. Evidence: .local-build/profile-network-audit-20261024.

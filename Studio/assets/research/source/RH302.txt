@@ -1,0 +1,41 @@
+DOMAIN: R-H3-02 — HÀNG KHÔNG VŨ TRỤ VÀ THĂM DÒ KHÔNG GIAN
+Lời hứa kênh: hiểu một nhiệm vụ phải vượt những ràng buộc nào và bằng chứng nào
+xác nhận từng mốc; kể nỗ lực, thất bại và cải tiến mà không biến kế hoạch thành thành tựu.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Phóng và đưa tải vào quỹ đạo: các mốc thành công không đồng nhất.
+2. Thử mặt đất: điều kiện mô phỏng và phạm vi chưa thử được.
+3. Dẫn đường nhiệm vụ: sai số, cửa sổ và các điều kiện giới hạn.
+4. Nhiệt và môi trường: vật liệu/bảo vệ trong phạm vi công bố.
+5. Liên lạc: độ trễ, thời gian quan sát và giới hạn tín hiệu.
+6. Độ tin cậy: xác minh, dự phòng và bài học sau bất thường.
+7. Lấy mẫu/thu hồi: từng mốc triển khai và bằng chứng xác nhận.
+8. Tích hợp nhiều hệ: giao diện cơ khí, điện và phần mềm.
+9. Lịch nhiệm vụ: kế hoạch, hoãn và nguyên nhân được công bố.
+10. Dữ liệu khoa học: quan sát ban đầu, phân tích và kết luận đã phản biện.
+
+VẬT CHỨNG VÀ NGUỒN
+Ưu tiên trang nhiệm vụ, thông báo và báo cáo của JAXA/cơ quan đối tác, nhóm nghiên
+cứu gốc. Nêu mốc dữ liệu khi làm tập về H3/MMX hoặc nhiệm vụ đang diễn ra; không
+đóng cứng trạng thái từ báo cáo cũ. Tách dự kiến phóng, phóng thực, đạt quỹ đạo,
+hoạt động và hoàn tất nhiệm vụ. Không bịa telemetry, nguyên nhân sự cố hay ảnh
+đã chụp khi dữ liệu chưa công bố. So điều kiện và mục tiêu nhiệm vụ, không so
+giá một lần phóng với ngân sách cả chương trình.
+
+THUẬT NGỮ NHẬT
+打ち上げ: phóng; 軌道投入: đưa vào quỹ đạo; 探査機: tàu thăm dò;
+地上試験: thử mặt đất; 姿勢制御: điều khiển tư thế; 通信遅延: trễ liên lạc;
+試料回収: thu hồi mẫu; 冗長系: hệ dự phòng; 異常: bất thường;
+ミッション達成: hoàn thành nhiệm vụ. Trạng thái hiện tại phải kiểm theo ngày.
+
+CÁCH KỂ VÀ HÌNH ẢNH
+Một ràng buộc có vẻ nhỏ nhưng ảnh hưởng cả nhiệm vụ; theo quyết định kiểm thử
+và bằng chứng từng mốc. Hero là đúng dạng tàu/tên lửa đã được công bố, sơ đồ
+quỹ đạo chỉ minh họa khi không có dữ liệu. Không dùng ảnh AI giả thành ảnh NASA/
+JAXA, cảnh tai nạn có thật hoặc telemetry thật. Không thêm cấu trúc kỹ thuật bí
+mật; dùng kích thước/tỷ lệ và nhãn mô phỏng hợp lý, không ngụy tạo sự kiện.
+
+BIÊN NGÁCH
+Giải thích khoa học/kỹ thuật công khai, không hướng dẫn chế tạo tên lửa, dẫn
+đường vũ khí hay khai thác điểm yếu. Không hứa lịch, khám phá hoặc kết quả tương
+lai. Chấp nhận nhiệm vụ hỗn hợp quốc tế và kết luận chưa đủ dữ liệu.

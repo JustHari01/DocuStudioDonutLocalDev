@@ -1,0 +1,45 @@
+DOMAIN: G-09 — Ô TÔ, HYBRID, EV VÀ PIN
+Lời hứa kênh: hiểu một lựa chọn công nghệ trong điều kiện sử dụng cụ thể, chi
+phí và độ bền thực tế; không mặc định EV/hybrid/hãng Nhật luôn hơn một phương án khác.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Quản lý nhiệt pin: khí hậu, trạng thái sạc và chu kỳ vận hành trước khi so kết quả.
+2. Suy giảm pin: tuổi, quãng đường, cách đo SOH và lịch sử dùng, không dự báo từ một xe.
+3. Hybrid trong từng chu kỳ: đô thị, đường dài, tải và điều kiện đường tương đương.
+4. Sạc và hành trình: công suất đỉnh khác đường cong sạc, thời gian chờ và thời gian chuyến đi.
+5. Lạnh/nóng/mưa/tải: điều kiện biên và giới hạn tài liệu, không ghép hai bài test khác nhau.
+6. Bảo hành và độ bền: điều kiện hợp đồng, mẫu xe/năm xe, dữ liệu lỗi có nguồn.
+7. Sửa chữa/phụ tùng: khả năng chẩn đoán, thời gian sửa và chi phí sử dụng có phạm vi.
+8. TCO: năng lượng, thuế, bảo hiểm, khấu hao và giá điện/nhiên liệu theo thời điểm/khu vực.
+9. Cảm giác/tính tiện dụng: ồn, điều hòa, phanh tái sinh và thao tác người dùng, tách cảm nhận khỏi số đo.
+10. Quyết định đội xe: chu kỳ nhiệm vụ, hạ tầng sạc, thời gian ngừng và phương án dự phòng.
+
+VẬT CHỨNG VÀ ĐIỀU KIỆN SO SÁNH
+Ưu tiên dữ liệu cơ quan thử nghiệm, tài liệu nhà sản xuất, tiêu chuẩn chu kỳ thử,
+triệu hồi/bảo hành công khai và báo cáo phép thử có điều kiện. Cùng cỡ xe, lốp,
+tải, vận tốc, nhiệt, tuổi pin và trạng thái sạc; không trộn WLTP/EPA/chu kỳ khác
+như cùng phép đo. Không suy giảm pin chỉ từ tầm hoạt động trên màn hình.
+Hóa học pin, thiết kế pack và phần mềm quản lý khác nhau; không đổi tên hãng để
+biến một ví dụ thành kết luận toàn ngành. Giá năng lượng phải có vùng và thời điểm.
+
+THUẬT NGỮ VÀ VẬT THỂ NHẬT
+熱管理: quản lý nhiệt; 充電曲線: đường cong sạc; 航続距離: tầm hoạt động;
+回生ブレーキ: phanh tái sinh; 電池劣化: suy giảm pin; 保証条件: điều kiện bảo hành;
+実走行: chạy thực tế; 電費: mức tiêu thụ điện; 燃費: mức tiêu thụ nhiên liệu;
+冷却系統: hệ thống làm mát. kW là công suất, kWh là năng lượng; không thay qua lại.
+
+CÁCH KỂ PHÙ HỢP
+Một xe chọn theo tầm hoạt động nhưng nhiệm vụ yêu cầu thời gian sạc khác; phép
+đo bị thay đổi bởi nhiệt độ; đội xe điều chỉnh hạ tầng thay vì đổ lỗi một hãng;
+một giải pháp Nhật bảo thủ có lợi trong một chu kỳ và bất lợi ở chu kỳ khác.
+
+THUMBNAIL/SHOT RIÊNG G-09
+Xe/pack/hệ làm mát/sạc đúng cấu trúc là hero, đi cùng vật chứng đúng câu hỏi.
+Hình cắt pack là minh họa, không giả scan một chiếc xe đã thử. Không lấy cháy
+nổ, hóa đơn bịa hay logo đối thủ làm bằng chứng lỗi. Shot đa dạng giữa xe,
+điều kiện đường, hạ tầng sạc, phép đo và quyết định sử dụng; không chỉ xe đẹp.
+
+BIÊN NGÁCH
+Cell fab/purity là G-12 nếu trọng tâm sản xuất bán dẫn/vật liệu fab; nguồn cung
+linh kiện chung là G-16. Ở G-09, câu hỏi cuối phải gắn hành vi xe/pin/người dùng.
+Không hướng dẫn thao tác pack cao áp, vượt bảo vệ pin, gây cháy hoặc chạy thử nguy hiểm.

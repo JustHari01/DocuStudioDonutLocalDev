@@ -1,0 +1,51 @@
+# Installs Node.js dependencies and pnpm, and checks formatting + linting
+
+name: Lint Node.js
+
+# Pull requests reach this through pr-checks.yml and tags through release.yml.
+# Both used to trigger it directly as well, so it ran twice for each of them.
+on:
+  workflow_call: {}
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  # A called workflow sees its caller's `github.workflow`, so the literal
+  # prefix keeps this group apart from the caller's own. Only the standalone
+  # push to main cancels a superseded run; Rolling Release runs one at a time.
+  group: lint-js-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+jobs:
+  build:
+    # biome and tsrs do not depend on the host. Linux starts faster than macOS
+    # and leaves the five-runner macOS pool to the Rust and release builds.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm package manager
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 #v6.1.0
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: "pnpm"
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Run lint step
+        run: pnpm run lint:js

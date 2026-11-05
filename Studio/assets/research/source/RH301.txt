@@ -1,0 +1,41 @@
+DOMAIN: R-H3-01 — NĂNG LƯỢNG MỚI VÀ TÀI NGUYÊN BIỂN SÂU
+Lời hứa kênh: phân biệt khả năng trong phòng thử với một hệ thống có thể vận
+hành bền, và xem điều kiện kỹ thuật/môi trường nào còn phải giải quyết.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Pin mặt trời perovskite: hiệu suất ban đầu so ổn định theo thời gian.
+2. Module mỏng/nhẹ: tải trọng, vị trí lắp và điều kiện môi trường.
+3. Đóng gói bảo vệ: ẩm, nhiệt, chu kỳ và phương pháp thử có nguồn.
+4. Từ mẫu nhỏ đến sản xuất: độ đồng đều, tỷ lệ hàng đạt và giới hạn quy mô.
+5. Thu hồi/tái chế: vật liệu, chu trình và dữ liệu vòng đời.
+6. Khảo sát tài nguyên biển: phát hiện, ước tính và khả năng khai thác là các bước khác.
+7. Lấy mẫu sâu: thiết bị, điều kiện và độ đại diện của mẫu.
+8. Tách/chế biến tài nguyên: từ thành phần mẫu đến sản phẩm sử dụng được.
+9. Đánh giá môi trường: dữ liệu nền, tác động và khoảng trống khảo sát.
+10. Trình diễn thương mại: mốc công bố khác công suất vận hành thực tế.
+
+VẬT CHỨNG VÀ NGUỒN
+Ưu tiên NEDO/AIST, JAMSTEC/JOGMEC, cơ quan môi trường và bài nghiên cứu có phương
+pháp. Với năng lượng nêu diện tích, điều kiện thử, thời gian và tổn hao nếu có;
+với tài nguyên phân biệt hàm lượng mẫu, tài nguyên ước tính, trữ lượng kinh tế
+và sản lượng khai thác. Không trộn hiệu suất phòng lab với điện năng giao thực.
+Không lấy một mẫu sâu làm bằng chứng lợi nhuận dự án hoặc không có tác động
+môi trường. Không bịa ngày khai thác, sản lượng, chi phí hay vị trí cụ thể chưa công bố.
+
+THUẬT NGỮ NHẬT
+ペロブスカイト太陽電池: pin mặt trời perovskite; 耐久性: độ bền;
+封止: đóng gói bảo vệ; 変換効率: hiệu suất chuyển đổi; 実証: trình diễn/thử thực;
+レアアース: đất hiếm; 海底資源: tài nguyên đáy biển; 試料: mẫu;
+分離精製: tách/tinh chế; 環境影響評価: đánh giá tác động môi trường.
+
+CÁCH KỂ VÀ HÌNH ẢNH
+Chọn một nhánh cho mỗi tập: năng lượng hoặc tài nguyên, không nhảy giữa hai
+nhánh để tạo chiến thắng quốc gia. Theo một giới hạn từ mẫu đến hệ thống thật.
+Thumbnail dùng module/mặt cắt vật liệu hoặc thiết bị lấy mẫu tùy câu hỏi; không
+dùng biển vàng/kim loại vô hạn. Shot có tỷ lệ hợp lý, đánh dấu minh họa; không
+giả ảnh đáy biển, bản đồ khảo sát hay chart hiệu suất như dữ liệu thực đo.
+
+BIÊN NGÁCH
+Không cổ vũ đầu cơ, hứa độc quyền tài nguyên hoặc kết luận công nghệ đã thương
+mại hóa chỉ từ thông cáo thử. Không cung cấp quy trình hóa chất nguy hiểm hay
+hướng dẫn khai thác. Các tuyên bố mới theo ngày phải kiểm nguồn lúc sản xuất.

@@ -1,0 +1,4 @@
+# Preserve the current source bytes in this snapshot; original rules are archived under docs/source-import.
+* -text
+*.png binary
+*.ico binary

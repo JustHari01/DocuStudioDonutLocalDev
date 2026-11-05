@@ -1,0 +1,1 @@
+This test-only copy of tauri-wd 0.2.1 keeps its source and licenses unchanged. Its Windows webview2-com, windows and windows-core dependencies follow the types used by Tauri 2.12.1 in Donut 0.32.0. Production Donut does not depend on this driver.

@@ -1,0 +1,33 @@
+{
+  "name": "docurandom-chat-bridge",
+  "version": "1.0.158",
+  "private": true,
+  "description": "Private loopback-only ChatGPT browser bridge for DocuRandom Studio",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.cjs",
+    "test:electron": "electron tests/electron-composer-smoke.cjs",
+    "package": "node --test tests/*.test.cjs && pnpm run test:electron && electron-builder --win --x64 --dir -c.win.signAndEditExecutable=false"
+  },
+  "devDependencies": {
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "local.docurandom.chatbridge",
+    "productName": "DocuRandom Chat Bridge",
+    "artifactName": "DocuRandomChatBridge-${version}-win-${arch}.${ext}",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**",
+      "package.json"
+    ],
+    "win": {
+      "signAndEditExecutable": false
+    }
+  }
+}

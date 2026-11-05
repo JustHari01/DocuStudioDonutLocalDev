@@ -1,0 +1,55 @@
+<!doctype html>
+<html data-docurandom-flow-test="1">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { margin: 0; min-height: 900px; }
+    button, [role="textbox"] { display: block; width: 240px; height: 44px; }
+    #generated-tile { margin-top: 80px; }
+    #composer-shell { margin-top: 520px; }
+    [role="dialog"] { position: fixed; inset: 0; background: white; }
+  </style>
+</head>
+<body>
+  <section id="generated-tile" data-tile-id="old-image-1">
+    <button id="tile-crop"><span class="material-symbols-outlined">crop</span></button>
+    <button id="tile-play"><span class="material-symbols-outlined">play_arrow</span></button>
+  </section>
+  <section id="composer-shell">
+    <button id="composer-config"><span class="material-symbols-outlined">tune</span></button>
+    <div id="composer" role="textbox" aria-multiline="true" contenteditable="true"></div>
+    <button id="composer-submit" type="submit"><span class="material-symbols-outlined">send</span></button>
+  </section>
+  <script>
+    globalThis.chrome = {
+      runtime: {
+        getManifest: () => ({ version: 'selector-test' }),
+        onMessage: { addListener: () => {} },
+        sendMessage: async () => ({ ok: true }),
+      },
+    };
+  </script>
+  <script src="../flow-extension/flow-selectors.js"></script>
+  <script src="../flow-extension/flow-ui.js"></script>
+  <script>
+    const hooks = globalThis.__DOCURANDOM_FLOW_TEST_HOOKS__;
+    const composer = hooks.findPromptEditor();
+    const firstPass = {
+      editor: composer?.id || '',
+      config: hooks.findComposerControl(composer, ['crop', 'tune'])?.id || '',
+      submit: hooks.findSubmitButton(composer)?.id || '',
+      normalized: hooks.normalizePrompt('first line\nsecond   line'),
+    };
+    const viewer = document.createElement('div');
+    viewer.id = 'image-viewer';
+    viewer.setAttribute('role', 'dialog');
+    document.body.appendChild(viewer);
+    const editorWhileCovered = hooks.findPromptEditor();
+    viewer.remove();
+    document.body.dataset.testResult = JSON.stringify({
+      ...firstPass,
+      editorWhileCovered: editorWhileCovered?.id || '',
+    });
+  </script>
+</body>
+</html>

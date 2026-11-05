@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "source_documents": [
+    {
+      "name": "Nghiên Cứu Ngách YouTube Nhật.docx",
+      "sha256": "13cdc51a4fa4c80b06a02adf936fd7bb678f52cb5412bb8cdd21d38e0bb36d46",
+      "extracted_sha256": "20a8d4e38f0870e2ab5857e2e99ffa8d125b83b1e39315ebaa50b2610b429d4a"
+    },
+    {
+      "name": "Báo cáo nghiên cứu sâu_ Bản đồ ngách YouTube tiếng Nhật “海外の反応・日本称賛” mở rộng từ hai tài liệu đầu vào.docx",
+      "sha256": "edc534d3dcd50a39802aa9968c21051bfdd9c89ed05eefa777761c3305e5bc06",
+      "extracted_sha256": "e72ad577006ddabac0db1e9c71be1ed6c613c10758efc8740c87a25ba54b9f11"
+    },
+    {
+      "name": "Nghiên Cứu Ngách Và Masterprompt.docx",
+      "sha256": "dd85b55c750559dd71d640cb1894d6f4c70e65e742f6cd77ab38240f0b438cc2",
+      "extracted_sha256": "d539ede4a74c3db48535a4fe781a272770f43429bfdfc78e15d6fad9bf466f5e"
+    }
+  ],
+  "legacy_master": {
+    "name": "MASTER PROMPT V10.46.34 — GLOBAL CO.txt",
+    "sha256": "a31710f42cd6f6e932d1880840015ff8d883fe336ad89a815aeeefce029d3f0b"
+  },
+  "scope": "Editorial hypotheses based on supplied research and preserved production protocol; not performance-validated Masters",
+  "quantitative_interpretation": {
+    "views_in_reports": "Examples for format/topic hypotheses, not proof of technical incidents or expected channel views",
+    "cpm_search_opportunity_scores": "Third-party estimates/scenarios, not observed revenue or guaranteed demand",
+    "ctr_claims": "Must be checked against same-channel impressions, traffic source and video age; no causal attribution from correlation"
+  },
+  "domain_mapping": {
+    "G-13": "Machinery/metrology/maintenance; deepen existing channel identity",
+    "G-10": "Rail/infrastructure; recognizable objects plus operating/lifecycle evidence",
+    "G-09": "Hybrid/EV/battery; controlled duty-cycle and thermal conditions",
+    "G-12": "Fab materials/equipment; purity, batch stability and defined yield",
+    "G-11": "Port/airport/logistics; handoff, waiting and system recovery",
+    "G-16": "Components/supply chain; qualification, lead time and traceability",
+    "R-A6": "Tiêu chuẩn và chứng nhận; supplied-research editorial charter, not independently measured performance",
+    "R-B2": "Thương hiệu, bảo hành và hậu mãi; supplied-research editorial charter, not independently measured performance",
+    "R-B3": "Bằng sáng chế và nguồn gốc công nghệ; supplied-research editorial charter, not independently measured performance",
+    "R-B4": "Tri thức ngầm và monozukuri; supplied-research editorial charter, not independently measured performance",
+    "R-B5": "Hợp đồng, đấu thầu và hợp tác quốc tế; supplied-research editorial charter, not independently measured performance",
+    "R-B6": "Khủng hoảng và khả năng phục hồi hệ thống; supplied-research editorial charter, not independently measured performance",
+    "R-C1": "Kỹ sư, chuyển giao và hệ sinh thái; supplied-research editorial charter, not independently measured performance",
+    "R-C2": "Tài chính, ngoại hối và thanh khoản; supplied-research editorial charter, not independently measured performance",
+    "R-C3": "Ngân hàng, tín dụng và xếp hạng; supplied-research editorial charter, not independently measured performance",
+    "R-H3-01": "Năng lượng mới và tài nguyên biển sâu; supplied-research editorial charter, not independently measured performance",
+    "R-H3-02": "Hàng không vũ trụ và thăm dò không gian; supplied-research editorial charter, not independently measured performance",
+    "R-H3-03": "HVAC, bơm nhiệt và thích ứng khí hậu; supplied-research editorial charter, not independently measured performance",
+    "R-H3-04": "Kỹ thuật hậu cần quốc phòng và cứu hộ; supplied-research editorial charter, not independently measured performance",
+    "R-H3-05": "Nghệ thuật biểu diễn và công nghệ giải trí; supplied-research editorial charter, not independently measured performance"
+  },
+  "live_channel_observations": "Injected dynamically from the matching channel/domain ledger at new-run start; never hardcoded or shared across all Masters",
+  "not_adopted": [
+    "Mandatory source sheet for every sentence",
+    "Fixed portfolio ratios across all workspaces",
+    "One image per minute",
+    "Automatic public-video A/B edits",
+    "Guaranteed view/revenue targets"
+  ],
+  "research_coverage": {
+    "groups": 20,
+    "internal_engines": 15,
+    "adjacent_expansions": 5,
+    "legacy_parent_taxonomy_not_additive": 18,
+    "new_R_ids": "Research-library identifiers, not a remapping of the old G parent IDs"
+  }
+}

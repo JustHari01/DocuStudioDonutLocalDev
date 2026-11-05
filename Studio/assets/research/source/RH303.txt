@@ -1,0 +1,39 @@
+DOMAIN: R-H3-03 — HVAC, BƠM NHIỆT VÀ THÍCH ỨNG KHÍ HẬU
+Lời hứa kênh: xem một hệ thống sưởi/làm mát hoạt động thế nào trong điều kiện
+thực, vì sao chọn đúng tải và vận hành quan trọng hơn một chỉ số quảng cáo.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Công suất thiết kế và tải thực: phòng/nhà khác điều kiện thử nhãn máy.
+2. Hiệu suất tức thời và theo mùa: đại lượng, phương pháp và phạm vi áp dụng.
+3. Khí hậu lạnh: thay đổi năng lực, xả băng và nguồn hỗ trợ theo tài liệu.
+4. Nhiệt độ/độ ẩm: tiện nghi không chỉ là một con số nhiệt.
+5. Cách nhiệt và hệ thống: phần máy giải quyết được và phần thuộc tòa nhà.
+6. Chọn cỡ máy: đóng/ngắt, tải một phần và các giới hạn của hệ.
+7. Lắp đặt và điều khiển: sai điều kiện làm kết quả khác thiết kế.
+8. Tiếng ồn: vị trí, khoảng cách, phương pháp và trạng thái vận hành.
+9. Môi chất/bảo trì: thông tin công khai và yêu cầu chuyên môn địa phương.
+10. Chi phí sử dụng: biểu giá, khí hậu, mức dùng và kỳ so sánh.
+
+VẬT CHỨNG VÀ SO SÁNH
+Ưu tiên dữ liệu chứng nhận, tiêu chuẩn thử, hướng dẫn nhà sản xuất và công bố
+độc lập có phương pháp. So cùng khí hậu, điểm đặt, tải, nhiệt độ cấp và phần
+điện được tính. Không dùng COP một điểm thay số điện cả năm; không gộp công
+suất nhiệt với điện vào. Một model/kiểu lắp không đại diện mọi sản phẩm của Daikin
+hoặc quốc gia. Không bịa bill điện, mức tiết kiệm, quy định hay sự cố tòa nhà thật.
+
+THUẬT NGỮ NHẬT
+ヒートポンプ: bơm nhiệt; 空調: điều hòa không khí; 暖房能力: năng lực sưởi;
+定格: định mức; 部分負荷: tải một phần; 除霜: xả băng; 断熱: cách nhiệt;
+冷媒: môi chất lạnh; 設定温度: nhiệt độ đặt; 季節効率: hiệu suất theo mùa.
+Giữ nguyên định nghĩa COP/SCOP/APF theo tài liệu, không coi chúng là cùng phép đo.
+
+CÁCH KỂ VÀ HÌNH ẢNH
+Theo một ngôi nhà/hệ ẩn danh từ nhu cầu đến điều kiện vận hành rồi phép so có
+giới hạn. Thumbnail là dàn nóng, vùng truyền nhiệt hoặc sơ đồ nhà phù hợp khí
+hậu, không biểu đồ tiền tiết kiệm bịa. Shot phân biệt thiết bị, tòa nhà, điều
+khiển và kết quả; luồng khí/nhiệt minh họa không giả là ảnh nhiệt đo thật.
+
+BIÊN NGÁCH
+Không hướng dẫn người không chuyên đấu điện, can thiệp áp lực/môi chất hoặc bỏ
+thiết bị bảo vệ. Không kê thiết kế cho nhà cụ thể hay bảo đảm tiết kiệm cá nhân.
+Không lấy một ngày nóng/lạnh để kết luận hiệu quả mọi mùa hoặc an toàn y tế.

@@ -1,0 +1,49 @@
+DOMAIN: G-10 — ĐƯỜNG SẮT, TÀU ĐIỆN VÀ HẠ TẦNG
+Lời hứa kênh: nhìn hệ thống vận hành phía sau một đoàn tàu, vì sao lựa chọn
+thiết kế/bảo trì ảnh hưởng hành trình thực tế và khả năng phục hồi.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Đúng giờ và khôi phục lịch: phân biệt giờ đến ga, số chuyến và tác động dây chuyền.
+2. Kiểm tra/bảo trì ban đêm: cửa sổ làm việc, bàn giao và xác nhận sẵn sàng tuyến.
+3. Ray/nền đường/công trình: hình học, thoát nước, mài mòn và kế hoạch kiểm tra.
+4. Đội xe và phụ tùng: khả dụng đoàn tàu, thời gian chờ linh kiện và khả năng sửa chữa.
+5. Khí hậu/thiên tai: điều kiện thiết kế, giới hạn khai thác và phục hồi có nguồn.
+6. Xe đã dùng/xuất khẩu: tương thích khổ ray, điện, tín hiệu, nền tảng bảo trì và đào tạo.
+7. Mua sắm theo vòng đời: chi phí đầu tư so với bảo trì, năng lực tuyến và đội ngũ vận hành.
+8. Nhà ga và luồng khách: thời gian dừng, đổi tuyến, lên xuống tàu và khả năng tiếp cận.
+9. Tín hiệu/điều độ: headway, công suất nút giao, dự phòng và xử lý gián đoạn ở mức giải thích.
+10. Chẩn đoán trên tàu: rung, ồn, tình trạng cửa và hệ thống phụ trợ, đối chiếu log/điều kiện.
+Không quay mọi đề tài thành cùng một chuyện nước ngoài mua rẻ rồi tàu Nhật thắng.
+
+VẬT CHỨNG VÀ ĐIỀU KIỆN SO SÁNH
+Ưu tiên tài liệu nhà khai thác, lịch công bố, báo cáo kiểm định/sự cố, hồ sơ đấu thầu
+và thông số phương tiện/tuyến. Một clip chạy nhanh không chứng minh punctuality.
+Cùng tốc độ danh nghĩa không đồng nghĩa cùng tốc độ hành trình: xét số ga dừng,
+cự ly, điều kiện tuyến, headway, ngày đo và cách định nghĩa trễ giờ.
+So sánh giá có cùng phạm vi đoàn tàu, hạ tầng, bảo trì và đào tạo. Không lấy thảm
+họa/số người thương vong hoặc thống kê an toàn chưa xác minh làm hook định lượng.
+Một trường hợp trên tuyến không chứng minh mọi tuyến/nhà khai thác của một nước.
+
+THUẬT NGỮ VÀ VẬT THỂ NHẬT
+鉄道インフラ: hạ tầng; 車両保守: bảo trì phương tiện; 定時運行: vận hành đúng giờ;
+運転間隔: giãn cách chạy tàu; 折り返し: quay đầu khai thác; 軌道: đường ray;
+予防保全: bảo trì phòng ngừa; 車両基地: depot; 運行管理: quản lý vận hành;
+ライフサイクルコスト: chi phí vòng đời. Không lẫn khổ ray, hệ điện và hệ tín hiệu.
+
+CÁCH KỂ PHÙ HỢP
+Một chậm trễ nhỏ lan qua nút giao; đoàn bảo trì tìm dấu hiệu trước khi thành sự cố;
+đơn vị mua sắm sửa tiêu chí từ tốc độ sang năng lực tuyến; hai giải pháp cùng tốt
+ở hai điều kiện khác nhau. Không bịa chuyên gia nước ngoài xác nhận một lời khen.
+
+THUMBNAIL/SHOT RIÊNG G-10
+Hero là đoàn tàu đúng loại/tuyến hoặc bộ phận liên quan; vật chứng là ray, cửa,
+depôt, hồ sơ lịch/bảo trì minh họa. Hình học bánh-ray/đầu máy/toa/điện tiếp xúc
+phải hợp lý. Không dùng tàu khoa học viễn tưởng, nửa ảnh đâm va giật gân hoặc
+màn hình giờ giả như screenshot thật. Shot cần có hành trình, nút thắt và thao
+tác quan sát được; không chỉ 20 ảnh tàu chạy ngang cùng góc.
+
+BIÊN NGÁCH
+Ô tô đường bộ và pin xe thuộc G-09; cảng biển, hành lý sân bay, kho và container
+thuộc G-11 khi bàn giao logistics là trọng tâm. Không dùng một luận điểm CNC
+rồi thay danh từ bằng Shinkansen. Không hướng dẫn truy cập/điều khiển hạ tầng
+đường sắt hoặc can thiệp hệ thống an toàn; câu chuyện giải thích dữ liệu công khai.

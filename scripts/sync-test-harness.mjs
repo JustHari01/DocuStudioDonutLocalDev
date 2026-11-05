@@ -1,0 +1,363 @@
+#!/usr/bin/env node
+/**
+ * Sync E2E Test Harness
+ *
+ * This script:
+ * 1. Downloads and starts rclone's S3 server (S3-compatible storage)
+ * 2. Builds and starts the donut-sync server
+ * 3. Runs the Rust sync e2e tests
+ * 4. Cleans up all processes
+ *
+ * Usage: node scripts/sync-test-harness.mjs
+ */
+
+import { execSync, spawn } from "node:child_process";
+import { createWriteStream, existsSync } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
+import http from "node:http";
+import https from "node:https";
+import os from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
+import { ensureRclone, serveS3Args } from "./rclone.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = path.resolve(__dirname, "..");
+const CACHE_DIR = path.join(ROOT_DIR, ".cache", "sync-test");
+
+const S3_PORT = 9876;
+const S3_ACCESS_KEY = "donuttestaccesskey";
+const S3_SECRET_KEY = "donuttestsecretkey";
+const SYNC_PORT = 3456;
+// Must be >= 24 chars and not a known default — the server's validateEnv()
+// rejects short/placeholder tokens and exits at startup otherwise.
+const SYNC_TOKEN = "test-sync-token-0123456789abcdef";
+
+const processes = [];
+
+function log(msg) {
+  console.log(`[sync-harness] ${msg}`);
+}
+
+function error(msg) {
+  console.error(`[sync-harness] ERROR: ${msg}`);
+}
+
+async function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const file = createWriteStream(dest);
+    const protocol = url.startsWith("https") ? https : http;
+
+    protocol
+      .get(url, (response) => {
+        if (response.statusCode === 302 || response.statusCode === 301) {
+          file.close();
+          downloadFile(response.headers.location, dest)
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+
+        if (response.statusCode !== 200) {
+          file.close();
+          reject(new Error(`Failed to download: ${response.statusCode}`));
+          return;
+        }
+
+        // pipeline() resolves once the source ends but doesn't await the
+        // destination fd closing. Linux refuses to exec a file whose write
+        // fd is still open (ETXTBSY), so explicitly wait for 'close'.
+        pipeline(response, file)
+          .then(
+            () =>
+              new Promise((res, rej) => {
+                if (file.closed) {
+                  res();
+                } else {
+                  file.once("close", res);
+                  file.once("error", rej);
+                }
+              }),
+          )
+          .then(resolve)
+          .catch(reject);
+      })
+      .on("error", reject);
+  });
+}
+
+function ensureS3Binary() {
+  return ensureRclone(CACHE_DIR, downloadFile, log);
+}
+
+async function startS3(bin) {
+  const dataDir = path.join(CACHE_DIR, "s3-data");
+  await mkdir(dataDir, { recursive: true });
+
+  log(`Starting rclone serve s3 on port ${S3_PORT}...`);
+
+  const proc = spawn(
+    bin,
+    serveS3Args({
+      dataDir,
+      address: `127.0.0.1:${S3_PORT}`,
+      accessKey: S3_ACCESS_KEY,
+      secretKey: S3_SECRET_KEY,
+    }),
+    {
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+
+  processes.push(proc);
+
+  proc.stdout.on("data", (data) => {
+    if (process.env.VERBOSE) {
+      console.log(`[s3] ${data.toString().trim()}`);
+    }
+  });
+
+  let lastStderr = "";
+  proc.stderr.on("data", (data) => {
+    lastStderr = data.toString();
+    if (process.env.VERBOSE) {
+      console.error(`[s3] ${lastStderr.trim()}`);
+    }
+  });
+
+  proc.on("error", (err) => {
+    error(`rclone error: ${err.message}`);
+  });
+
+  // Without this, a server that refuses to start (a busy port, most often)
+  // surfaces as a bare 30s timeout with the reason buried behind VERBOSE.
+  let exitReason = null;
+  proc.on("exit", (code) => {
+    exitReason = `rclone exited with code ${code}: ${lastStderr.trim() || "no output"}`;
+  });
+
+  // No health endpoint: an unauthenticated list is answered once the listener
+  // is up, and any HTTP status proves that much.
+  await waitForListening(
+    `http://127.0.0.1:${S3_PORT}/`,
+    30000,
+    () => exitReason,
+  );
+  log("S3 storage is ready");
+
+  return proc;
+}
+
+const SYNC_BINARY = path.join(
+  ROOT_DIR,
+  "donut-sync",
+  "target",
+  "debug",
+  process.platform === "win32" ? "donut-sync.exe" : "donut-sync",
+);
+
+async function buildDonutSync() {
+  log("Building donut-sync...");
+  execSync("cargo build --locked", {
+    cwd: path.join(ROOT_DIR, "donut-sync"),
+    stdio: process.env.VERBOSE ? "inherit" : "ignore",
+  });
+  if (!existsSync(SYNC_BINARY)) {
+    throw new Error(`donut-sync build did not produce ${SYNC_BINARY}`);
+  }
+  log("donut-sync built");
+}
+
+async function startDonutSync() {
+  log(`Starting donut-sync on port ${SYNC_PORT}...`);
+
+  // Started outside the project, so no developer .env reaches it.
+  const proc = spawn(SYNC_BINARY, [], {
+    cwd: os.tmpdir(),
+    env: {
+      ...process.env,
+      PORT: String(SYNC_PORT),
+      SYNC_TOKEN,
+      S3_ENDPOINT: `http://127.0.0.1:${S3_PORT}`,
+      S3_ACCESS_KEY_ID: S3_ACCESS_KEY,
+      S3_SECRET_ACCESS_KEY: S3_SECRET_KEY,
+      S3_BUCKET: "donut-sync-test",
+      S3_FORCE_PATH_STYLE: "true",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  processes.push(proc);
+
+  proc.stdout.on("data", (data) => {
+    if (process.env.VERBOSE) {
+      console.log(`[donut-sync] ${data.toString().trim()}`);
+    }
+  });
+
+  proc.stderr.on("data", (data) => {
+    if (process.env.VERBOSE) {
+      console.error(`[donut-sync] ${data.toString().trim()}`);
+    }
+  });
+
+  proc.on("error", (err) => {
+    error(`donut-sync error: ${err.message}`);
+  });
+
+  await waitForHealth(`http://localhost:${SYNC_PORT}/health`, 30000);
+  log("donut-sync is ready");
+
+  return proc;
+}
+
+async function waitForHealth(url, timeoutMs) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await new Promise((resolve, reject) => {
+        http
+          .get(url, (res) => {
+            if (res.statusCode === 200) {
+              resolve();
+            } else {
+              reject(new Error(`Status ${res.statusCode}`));
+            }
+          })
+          .on("error", reject);
+      });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  throw new Error(`Timeout waiting for ${url}`);
+}
+
+async function waitForListening(url, timeoutMs, failureReason = () => null) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const reason = failureReason();
+    if (reason) {
+      throw new Error(reason);
+    }
+    try {
+      await new Promise((resolve, reject) => {
+        // A per-attempt timeout matters: something else holding the port can
+        // accept the connection and then never answer, and without this the
+        // loop would wait on that one request forever instead of noticing
+        // that our own server is gone.
+        const req = http.get(url, (res) => {
+          res.resume();
+          resolve();
+        });
+        req.setTimeout(2000, () => {
+          req.destroy(new Error("probe timed out"));
+        });
+        req.on("error", reject);
+      });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  throw new Error(`Timeout waiting for ${url}`);
+}
+
+async function runTests() {
+  log("Running Rust sync e2e tests...");
+
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "cargo",
+      [
+        "test",
+        "--features",
+        "e2e",
+        "--test",
+        "sync_e2e",
+        "--",
+        "--test-threads=1",
+      ],
+      {
+        cwd: path.join(ROOT_DIR, "src-tauri"),
+        env: {
+          ...process.env,
+          DONUT_E2E_VAULT_WORKER:
+            process.env.DONUT_E2E_VAULT_WORKER ??
+            path.resolve(
+              ROOT_DIR,
+              "src-tauri",
+              process.env.CARGO_TARGET_DIR ?? "target",
+              "debug",
+              os.platform() === "win32" ? "donutbrowser.exe" : "donutbrowser",
+            ),
+          SYNC_SERVER_URL: `http://localhost:${SYNC_PORT}`,
+          SYNC_TOKEN,
+        },
+        stdio: "inherit",
+      },
+    );
+
+    proc.on("close", (code) => {
+      resolve(code || 0);
+    });
+  });
+}
+
+function cleanup() {
+  log("Cleaning up...");
+
+  for (const proc of processes) {
+    try {
+      if (os.platform() === "win32") {
+        // On Windows, SIGTERM is not supported; use taskkill for reliable cleanup
+        try {
+          execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: "ignore" });
+        } catch {
+          // Process may already be dead
+        }
+      } else {
+        proc.kill("SIGTERM");
+      }
+    } catch {
+      // Already dead
+    }
+  }
+}
+
+async function main() {
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(130);
+  });
+
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(143);
+  });
+
+  try {
+    const s3Bin = await ensureS3Binary();
+    await startS3(s3Bin);
+    await buildDonutSync();
+    await startDonutSync();
+
+    const exitCode = await runTests();
+
+    cleanup();
+    process.exit(exitCode);
+  } catch (err) {
+    error(err.message);
+    cleanup();
+    process.exit(1);
+  }
+}
+
+main();

@@ -1,0 +1,49 @@
+DOMAIN: G-13 — MÁY CÔNG CỤ, ĐO LƯỜNG VÀ BẢO TRÌ
+Lời hứa kênh: hiểu vì sao kết quả gia công/đo lường thay đổi và quyết định nào
+đáng sửa; năng lực Nhật được thể hiện bằng khả năng giữ quá trình ổn định.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Nhiệt và trôi kích thước: chi tiết đầu ca đạt nhưng đo sau khi máy ổn nhiệt khác.
+2. Chuẩn gá và lực kẹp: đạt khi còn kẹp, biến dạng sau tháo; kiểm lại trạng thái đo.
+3. Chuỗi đo: panme/CMM/đồ gá đo cho kết quả khác; kiểm chuẩn, chuẩn tham chiếu và độ không đảm bảo.
+4. Dao và điều kiện cắt: tuổi dao, runout, dung dịch và bề mặt; tách tác nhân thay đổi.
+5. Mài/độ tròn: đường kính hai điểm không mô tả mọi sai lệch hình dạng hay chức năng lắp.
+6. ATC và magazine: phân bố tải, chu kỳ trao đổi, giới hạn thiết bị theo tài liệu nhà chế tạo.
+7. Lỗ sâu và độ thẳng: kiểm bề mặt/độ lệch/thành mỏng phù hợp đối tượng, không nhầm chỉ tiêu.
+8. Bảo trì và chẩn đoán: thời gian sửa, dấu hiệu trước hỏng, điều kiện bảo dưỡng và phụ tùng.
+9. Sản lượng liên tục: đổi mã hàng, first-piece approval, phế phẩm và downtime theo ca.
+10. Mua máy/TCO: năng suất hàng đạt, đào tạo, phụ tùng, điện, bảo trì và chi phí dừng máy.
+Chọn cơ chế khác thực chất qua từng tập; không mặc định cứ máy cũ Nhật là thắng máy mới.
+
+VẬT CHỨNG VÀ ĐIỀU KIỆN SO SÁNH
+Ưu tiên bản vẽ có dung sai, hồ sơ đo/hiệu chuẩn, lịch bảo trì và log máy có nguồn;
+minh họa có thể dùng chi tiết mẫu, đồ gá, mặt cắt hay biểu đồ KHÔNG gắn số như số đo thật.
+Cùng bản vẽ chưa có nghĩa cùng phôi/nhiệt/dao/lực kẹp. Ghi những khác biệt đó.
+Không suy độ chính xác cả máy từ một chi tiết, độ bền cả hãng từ một lần sửa,
+hoặc TCO từ giá mua. Khi không có số định lượng thì mô tả giới hạn bằng chứng.
+Một phép so sánh cần nêu đại lượng đo, trạng thái chi tiết, điều kiện và giới hạn suy luận.
+
+THUẬT NGỮ VÀ VẬT THỂ NHẬT
+工作機械: máy công cụ; 寸法公差: dung sai kích thước; 真円度: độ tròn;
+熱変位: dịch chuyển do nhiệt; 段取り: chuẩn bị/đổi mã; 治具: đồ gá;
+校正: hiệu chuẩn; 測定不確かさ: độ không đảm bảo đo; 設備保全: bảo trì;
+稼働率: tỷ lệ vận hành (phải nêu mẫu số); 良品: hàng đạt; 主軸: trục chính.
+Giữ kanji nhất quán trong thoại/sub, không tự bịa cách đọc tên hãng/model.
+
+CÁCH KỂ PHÙ HỢP
+Điều tra hai phép đo bất đồng; phục hồi một máy rồi đánh giá hàng đạt; quyết định
+mua máy thay đổi vì downtime; một kỹ sư tự sửa giả định của chính mình. Nếu nguyên
+nhân không duy nhất, kết thúc bằng các yếu tố đã loại trừ và điều chưa biết.
+
+THUMBNAIL/SHOT RIÊNG G-13
+Hero là đúng chi tiết/máy/đồ gá; vật chứng là mặt đo, dấu cắt, chi tiết tháo kẹp
+hoặc giấy kiểm, trong xưởng có vật liệu đáng tin. Máy và dụng cụ đúng nguyên lý,
+không để panme đo một đại lượng nó không đo được. Shot nối phôi → thao tác →
+đo → quyết định; không thay cùng ảnh công nhân đứng chỉ máy ở mọi cảnh.
+Không dùng đoàn tàu, cảng hay wafer làm hero để câu view cho tập đo lường CNC.
+
+BIÊN NGÁCH
+Không chuyển thành video địa chính trị hoặc khoe GDP. Thiết bị fab bán dẫn thuộc
+G-12 khi purity/yield là câu hỏi chính. Chứng nhận nhà cung cấp thuộc G-16 khi
+nút thắt chính là phê duyệt/thay thế nguồn; nếu ở G-13, vẫn phải trả câu hỏi gia công/đo.
+Không hướng dẫn vô hiệu liên động, vượt tốc/giới hạn tải hoặc bỏ bước an toàn.

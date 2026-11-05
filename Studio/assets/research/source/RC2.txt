@@ -1,0 +1,43 @@
+DOMAIN: R-C2 — GIẢI THÍCH TÀI CHÍNH, NGOẠI HỐI VÀ THANH KHOẢN
+Lời hứa kênh: giúp người xem hiểu cơ chế, thời hạn và giới hạn của công cụ tài
+chính trong một tình huống có nguồn; không dự báo tỷ giá hay hướng dẫn đầu tư.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Tỷ giá danh nghĩa và câu hỏi sức mua: chọn đúng đại lượng cho câu chuyện.
+2. Dự trữ và nguồn tiền sử dụng được: tài sản, tiền tệ, thời hạn và ràng buộc.
+3. Swap tiền tệ: thỏa thuận tồn tại khác với được kích hoạt hoặc đã giải ngân.
+4. Thanh khoản và khả năng thanh toán: vấn đề thời điểm khác với giá trị ròng.
+5. Hợp đồng xuất nhập khẩu: đồng tiền định giá và thời điểm thanh toán.
+6. Biến động tỷ giá với doanh nghiệp: doanh thu, chi phí và phòng ngừa rủi ro.
+7. Chênh lệch lãi suất: mô tả cơ chế và các yếu tố khác, không suy một chiều.
+8. Can thiệp/chính sách: phân biệt thông báo, thực hiện và tác động được đo.
+9. Dòng tiền theo kỳ: con số dòng khác con số số dư tại một ngày.
+10. Một tin đồn khủng hoảng: đối chiếu định nghĩa, mốc và nguồn trước kết luận.
+
+VẬT CHỨNG, NGUỒN VÀ GIỚI HẠN
+Ưu tiên BOJ, MOF, ngân hàng trung ương liên quan, BIS/IMF và điều khoản công cụ
+được công bố. Ghi đơn vị, ngày, danh nghĩa/thực, số dư/dòng, mùa vụ và lần sửa số
+liệu nếu có. Hạn mức không phải số tiền đã dùng; nguồn dự trữ không tự bằng tiền
+mặt sẵn sàng; một tỷ giá không chứng minh nền kinh tế sụp đổ. Không giả quote
+ngân hàng trung ương, biểu đồ có số không có nguồn hay cuộc giải cứu chưa xảy ra.
+Ví dụ tính toán chỉ dùng khi ghi rõ giả định và minh họa, không gán cho giao dịch
+có thật. Khi không có tài liệu, đổi sang giải thích cơ chế ẩn danh, bỏ số cụ thể.
+
+THUẬT NGỮ NHẬT
+為替相場: tỷ giá; 流動性: thanh khoản; 外貨準備: dự trữ ngoại hối;
+通貨スワップ: swap tiền tệ; 満期: đáo hạn; 決済: thanh toán;
+残高: số dư; 資金繰り: điều phối dòng tiền; 名目: danh nghĩa;
+実質: thực. Kiểm cách dùng theo nguồn, không dùng các từ này thay nhau.
+
+CÁCH KỂ VÀ HÌNH ẢNH
+Theo một nghĩa vụ thanh toán qua trục thời gian: tài sản có nhưng thời điểm
+không khớp, hoặc một hạn mức bị hiểu thành khoản đã chi. Thumbnail dùng sơ đồ
+tiền tệ/thời hạn, không vàng tràn màn hình, lãnh đạo hoảng loạn hay ngân hàng
+cháy. Biểu đồ minh họa không gắn số/nhãn ngày giả; biểu đồ số thật phải được tool
+hoặc editor dựng từ dữ liệu có nguồn, không lấy ảnh AI làm bằng chứng tài chính.
+
+BIÊN NGÁCH
+Chỉ giáo dục cơ chế và lịch sử có nguồn. Không khuyên mua/bán, chọn tài sản,
+đòn bẩy hoặc phân bổ cá nhân; không hứa lợi nhuận, giả chuyên gia hoặc dự báo
+chắc chắn. Không biến quốc gia/người gửi tiền thành đối tượng chế giễu. Rủi ro
+tín dụng và bảng cân đối ngân hàng là trọng tâm R-C3, không trộn mọi vấn đề với FX.

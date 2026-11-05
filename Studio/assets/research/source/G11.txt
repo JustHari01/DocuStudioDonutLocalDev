@@ -1,0 +1,50 @@
+DOMAIN: G-11 — CẢNG, SÂN BAY, KHO VÀ ĐIỀU PHỐI LOGISTICS
+Lời hứa kênh: theo dấu một luồng hàng/hành lý để nhìn thấy nút thắt và tác động
+của bàn giao dữ liệu, dự phòng và khả năng phục hồi hệ thống.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Quay vòng tàu bay: nhiều công việc phụ thuộc nhau, không quy mọi chậm trễ cho một đội.
+2. Hành lý và bàn giao: định danh, mốc thời gian, luồng ngoại lệ và xử lý sai tuyến.
+3. Cảng/container: thời gian chờ cầu bến, bãi, thiết bị và thủ tục là các đại lượng khác.
+4. Bàn giao ca: thông tin đã có nhưng người nhận chưa xác nhận hoặc dùng phiên bản khác.
+5. Kho và lấy hàng: công suất một trạm khác throughput toàn chuỗi, có hàng chờ/WIP.
+6. Cross-dock/chuyển tuyến: đồng bộ cửa sổ đến/đi và giới hạn năng lực tiếp nhận.
+7. Giai đoạn cao điểm: dự báo, nguồn lực và điều kiện ngoài kế hoạch có nguồn.
+8. Phục hồi sau gián đoạn: thứ tự ưu tiên backlog, điểm khống chế và dự phòng.
+9. Hàng cần điều kiện bảo quản: log nhiệt/thời gian, trách nhiệm bàn giao và giới hạn dữ liệu.
+10. Mua hệ thống tự động: so độ tin cậy, vận hành ngoại lệ, hỗ trợ và chi phí vòng đời.
+
+VẬT CHỨNG VÀ ĐIỀU KIỆN SO SÁNH
+Ưu tiên báo cáo nhà khai thác/cơ quan quản lý, định nghĩa KPI, dữ liệu mốc thời
+gian công khai và hồ sơ quy trình được phép dùng. Timeline tái dựng phải có nhãn,
+không giả bảng điều hành thật hoặc tiết lộ dữ liệu cá nhân/vận đơn nhạy cảm.
+So cùng ranh giới bắt đầu/kết thúc, tải, ca, mix hàng và điều kiện thời tiết.
+Thời gian xử lý không gồm chờ khác end-to-end lead time; trung bình khác đuôi
+phân bố, capacity quảng cáo khác hàng giao được. Không dùng số chuyến/sản lượng
+khác mẫu số làm đối chứng, không khẳng định một người gây lỗi khi thiếu bằng chứng.
+
+THUẬT NGỮ VÀ VẬT THỂ NHẬT
+物流: logistics; 引き継ぎ記録: hồ sơ bàn giao; 荷役: bốc dỡ;
+滞留時間: thời gian lưu/chờ theo định nghĩa; 処理能力: năng lực xử lý;
+手荷物: hành lý; 搬送: vận chuyển nội bộ; 例外処理: xử lý ngoại lệ;
+復旧手順: quy trình khôi phục; 追跡可能性: khả năng truy vết.
+Phút/giờ là thời gian, kiện/giờ là tốc độ xử lý; không dùng thay nhau.
+
+CÁCH KỂ PHÙ HỢP
+Một kiện hàng đi qua nhiều bàn giao; timeline hé lộ hàng chờ bị bỏ khỏi KPI;
+tự động hóa tốt ở dòng chuẩn nhưng ngoại lệ cần quy trình; một ca Nhật chia sẻ
+phương pháp phục hồi với đối tác thay vì làm nhục đối tác. Kết thúc là quyết
+định/quy trình đổi có lý do, không chỉ cảnh cảng đẹp hoặc tuyên bố hiệu quả.
+
+THUMBNAIL/SHOT RIÊNG G-11
+Container, băng chuyền, xe kéo, kiện hàng hoặc giấy bàn giao đúng bối cảnh làm
+hero; kho/cảng/sân bay có luồng đi và tỷ lệ vật thể hợp lý. Phân biệt airside,
+kho hành lý và ga hành khách. Không bịa screenshot theo dõi lô hàng hay số KPI;
+timeline minh họa dùng nhãn rõ và không giả log một doanh nghiệp thật.
+Shot theo đường đi và thay đổi trạng thái, không lặp toàn cảnh container 20 lần.
+
+BIÊN NGÁCH
+Tốc độ tàu khách/ray/tín hiệu thuộc G-10; sản xuất linh kiện và qualification
+nhà cung cấp thuộc G-16. G-11 tập trung dòng vận chuyển/bàn giao, không kể lại
+cùng chuyện sai số gia công. Không hướng dẫn né kiểm soát sân bay/cảng, can thiệp
+thiết bị hoặc chỉ ra lỗ hổng an ninh có thể khai thác; dùng sơ đồ phổ thông.

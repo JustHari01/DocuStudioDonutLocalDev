@@ -1,0 +1,115 @@
+name: Generate Release Notes
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  generate-release-notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.repository == 'donutbrowser/donutbrowser' && github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Get release info
+        id: get-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          # head_branch is a tag name chosen by whoever pushed it; never let
+          # anything but a plain version reach the API path or the prompt.
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Refusing tag with unexpected characters"
+            exit 1
+          fi
+          echo "tag-name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+          # Get release info by tag
+          RELEASE_INFO=$(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME")
+          RELEASE_ID=$(echo "$RELEASE_INFO" | jq -r '.id')
+          IS_PRERELEASE=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
+
+          echo "release-id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "is-prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            echo "Skipping release notes generation for prerelease"
+          fi
+
+      - name: Get previous release tag
+        id: get-previous-tag
+        if: steps.get-release.outputs.is-prerelease == 'false'
+        env:
+          CURRENT_TAG: ${{ steps.get-release.outputs.tag-name }}
+        run: |
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vxF "$CURRENT_TAG" | head -n 1)
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous release found, using initial commit"
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          {
+            echo "current-tag=$CURRENT_TAG"
+            echo "previous-tag=$PREVIOUS_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "Previous release: $PREVIOUS_TAG"
+          echo "Current release: $CURRENT_TAG"
+
+      - name: Get commit messages between releases
+        id: get-commits
+        if: steps.get-release.outputs.is-prerelease == 'false'
+        env:
+          PREVIOUS_TAG: ${{ steps.get-previous-tag.outputs.previous-tag }}
+          CURRENT_TAG: ${{ steps.get-previous-tag.outputs.current-tag }}
+        run: |
+          git log --pretty=format:"- %s (%h by %an)" "$PREVIOUS_TAG".."$CURRENT_TAG" --no-merges > commits.txt
+          echo "Collected $(wc -l < commits.txt) commits"
+
+      - name: Generate release notes with AI
+        id: generate-notes
+        if: steps.get-release.outputs.is-prerelease == 'false'
+        env:
+          AI_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          VERSION: ${{ steps.get-previous-tag.outputs.current-tag }}
+        run: |
+          bash .github/scripts/render-prompt.sh .github/prompts/release-notes.prompt.yml \
+            "$VERSION" commits.txt "$RUNNER_TEMP/system.txt" "$RUNNER_TEMP/user.txt"
+          bash .github/scripts/ai-infer.sh "$RUNNER_TEMP/system.txt" "$RUNNER_TEMP/user.txt" "$RUNNER_TEMP/notes.txt"
+
+      - name: Update release with generated notes
+        if: steps.get-release.outputs.is-prerelease == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.get-release.outputs.release-id }}
+        run: |
+          RELEASE_NOTES=$(cat "$RUNNER_TEMP/notes.txt")
+
+          # An empty answer would PATCH the release body to nothing and wipe
+          # the notes the release already has.
+          if [ -z "${RELEASE_NOTES//[[:space:]]/}" ]; then
+            echo "::error::The generated release notes are empty; leaving the release unchanged"
+            exit 1
+          fi
+
+          gh api --method PATCH "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --field body="$RELEASE_NOTES" --silent
+
+          echo "Release notes updated"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f commits.txt

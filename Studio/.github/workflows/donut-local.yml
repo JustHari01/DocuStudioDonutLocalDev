@@ -1,0 +1,194 @@
+name: Build private Donut Local Developer
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: donut-local-private-stable
+  cancel-in-progress: false
+
+jobs:
+  build-private-donut-local:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      DONUT_SOURCE_REPOSITORY: JustHari01/donutbrowser-local
+      DONUT_SOURCE_BRANCH: main
+      DONUT_RELEASE_REPOSITORY: JustHari01/donutbrowser-local
+      DONUT_REPO_TOKEN: ${{ secrets.DISTRIBUTION_REPO_TOKEN }}
+      RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout DocuRandom release tooling
+        uses: actions/checkout@v7
+        with:
+          path: docurandom
+
+      - name: Validate private build secrets
+        shell: pwsh
+        run: |
+          if (-not $env:DONUT_REPO_TOKEN -or -not $env:RELEASE_SIGNING_KEY_PEM) {
+            throw "Missing private repository or signing secret."
+          }
+
+      - name: Checkout validated private Donut Local source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.DONUT_SOURCE_REPOSITORY }}
+          ref: ${{ env.DONUT_SOURCE_BRANCH }}
+          token: ${{ env.DONUT_REPO_TOKEN }}
+          fetch-depth: 0
+          path: donut-src
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.21.0
+          run_install: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: donut-src/.node-version
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Resolve immutable Local version
+        id: source
+        shell: pwsh
+        run: |
+          $package = Get-Content -LiteralPath "donut-src\package.json" -Raw | ConvertFrom-Json
+          $version = [string]$package.version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid Donut version: $version" }
+          $revision = [int](Get-Content -LiteralPath "donut-src\LOCAL_REVISION" -Raw).Trim()
+          if ($revision -lt 1) { throw "LOCAL_REVISION must be positive." }
+          $commit = (git -C donut-src rev-parse HEAD).Trim()
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "revision=$revision" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "commit=$commit" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=donut-local-v$version-r$revision" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Skip version already released privately
+        id: existing
+        env:
+          GH_TOKEN: ${{ env.DONUT_REPO_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release view "${{ steps.source.outputs.tag }}" --repo $env:DONUT_RELEASE_REPOSITORY *> $null
+          $exists = $LASTEXITCODE -eq 0
+          $global:LASTEXITCODE = 0
+          "skip=$($exists.ToString().ToLowerInvariant())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Verify Local MCP, REST, CDP and developer build contract
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          python docurandom\tools\verify_private_donut_source.py --source donut-src
+          Push-Location donut-src
+          try {
+            pnpm install --frozen-lockfile
+            pnpm verify:local-contract
+            pnpm test:local
+          } finally {
+            Pop-Location
+          }
+
+      - name: Restore Rust build cache
+        if: steps.existing.outputs.skip != 'true'
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: donut-src/src-tauri -> target
+
+      - name: Build Local application with developer tools
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: donut-src
+        shell: pwsh
+        run: |
+          pnpm tauri build --target $env:TARGET --no-bundle --features developer-tools
+
+      - name: Package binary and corresponding private source
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.source.outputs.version }}"
+          $revision = "${{ steps.source.outputs.revision }}"
+          $artifactRoot = Join-Path $PWD "artifacts\donut-local-$version-r$revision"
+          $portable = Join-Path $artifactRoot "Donut-Local"
+          $releaseRoot = "donut-src\src-tauri\target\$env:TARGET\release"
+          New-Item -ItemType Directory -Path $portable -Force | Out-Null
+          Copy-Item (Join-Path $releaseRoot "donutbrowser.exe") (Join-Path $portable "DonutLocal.exe")
+          Copy-Item (Join-Path $releaseRoot "donut-proxy.exe") $portable
+          Copy-Item "donut-src\src-tauri\binaries\xray-$env:TARGET.exe" (Join-Path $portable "xray.exe")
+          Set-Content (Join-Path $portable ".portable") "" -NoNewline
+          $archive = Join-Path $artifactRoot "DonutLocal_${version}_r${revision}_x64-portable.zip"
+          $sourceArchive = Join-Path $artifactRoot "DonutLocal_${version}_r${revision}-corresponding-source.zip"
+          Compress-Archive -Path $portable -DestinationPath $archive -CompressionLevel Optimal
+          git -C donut-src archive --format=zip --prefix=donut-src/ --output=$sourceArchive HEAD
+
+      - name: Sign private component manifest
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check cryptography>=44
+          $version = "${{ steps.source.outputs.version }}"
+          $revision = "${{ steps.source.outputs.revision }}"
+          $artifactRoot = Join-Path $PWD "artifacts\donut-local-$version-r$revision"
+          $keyPath = Join-Path $env:RUNNER_TEMP "docurandom-release-signing.pem"
+          [IO.File]::WriteAllText($keyPath, $env:RELEASE_SIGNING_KEY_PEM, [Text.Encoding]::ASCII)
+          python docurandom\tools\sign_donut_local.py `
+            --version $version `
+            --revision $revision `
+            --upstream-tag "v$version" `
+            --asset (Join-Path $artifactRoot "DonutLocal_${version}_r${revision}_x64-portable.zip") `
+            --source-asset (Join-Path $artifactRoot "DonutLocal_${version}_r${revision}-corresponding-source.zip") `
+            --private-key $keyPath `
+            --manifest (Join-Path $artifactRoot "donut-local-manifest.json") `
+            --signature (Join-Path $artifactRoot "donut-local-manifest.sig")
+
+      - name: Publish immutable private Donut Local release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ env.DONUT_REPO_TOKEN }}
+        shell: pwsh
+        run: |
+          $version = "${{ steps.source.outputs.version }}"
+          $revision = "${{ steps.source.outputs.revision }}"
+          $tag = "${{ steps.source.outputs.tag }}"
+          $artifactRoot = Join-Path $PWD "artifacts\donut-local-$version-r$revision"
+          $notes = @"
+          Private DocuRandom-DN Developer build from commit ${{ steps.source.outputs.commit }}.
+
+          - Built explicitly with the developer-tools Cargo feature.
+          - MCP, REST, CDP and local contract validation passed before packaging.
+          - Uses the existing Donut profile/data directory.
+          - The signed manifest and corresponding private source are attached.
+          "@
+          $notesPath = Join-Path $env:RUNNER_TEMP "donut-local-private-notes.md"
+          $notes | Set-Content $notesPath -Encoding utf8
+          gh release create $tag `
+            (Join-Path $artifactRoot "DonutLocal_${version}_r${revision}_x64-portable.zip") `
+            (Join-Path $artifactRoot "DonutLocal_${version}_r${revision}-corresponding-source.zip") `
+            (Join-Path $artifactRoot "donut-local-manifest.json") `
+            (Join-Path $artifactRoot "donut-local-manifest.sig") `
+            --repo $env:DONUT_RELEASE_REPOSITORY `
+            --target $env:DONUT_SOURCE_BRANCH `
+            --title "Donut Local Developer $version r$revision" `
+            --notes-file $notesPath `
+            --prerelease
+
+      - name: Remove signing key
+        if: always()
+        shell: pwsh
+        run: |
+          $keyPath = Join-Path $env:RUNNER_TEMP "docurandom-release-signing.pem"
+          if (Test-Path -LiteralPath $keyPath) { Remove-Item -LiteralPath $keyPath -Force }

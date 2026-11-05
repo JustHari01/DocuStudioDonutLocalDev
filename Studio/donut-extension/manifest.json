@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "DocuRandom Donut Bridge",
+  "version": "1.1.43",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAphWgf9tV13toLI0cpM5r0uqM+yzuBQcK7DqmRPck0EV1uQ03iwLlwWJ9V4XX+ezeZ4a8yXQ/WRagbNwzBpuJ6+4nbcu0eG1AccMP7I29CqS168ptaRcDODpSSm5+FSi0VmGAeWVO5BUOpnmLwzoUS35S4adTHG7OnVDtqTk0hX0bLStbRQMMWMEmA+s4cpGohCbIc9jKSWIGSI1GZ/w5ivAAyHzCeeOmpvrKWtWhaa0pMAtANCDddG8z4/EYSj747PCXDKYDiNN+yUbVzCFfnywdQ9Mm5SpBwbK6G6a9izwaVuuqIk/5NHILly0aqGRqOItrGFIuGMHWepKCMKl55wIDAQAB",
+  "description": "Điều khiển profile Donut đang mở từ DocuRandom Studio qua bridge local.",
+  "permissions": ["scripting", "storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background-v1143.js"
+  },
+  "action": {
+    "default_title": "Mở DocuRandom Donut Bridge"
+  },
+  "options_page": "popup.html"
+}

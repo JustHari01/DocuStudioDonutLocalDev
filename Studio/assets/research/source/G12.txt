@@ -1,0 +1,48 @@
+DOMAIN: G-12 — VẬT LIỆU VÀ THIẾT BỊ BÁN DẪN
+Lời hứa kênh: làm một mắt xích khó nhìn trong dây chuyền trở nên dễ hiểu qua
+vật chứng và điều kiện kiểm soát, thay vì khẳng định bí quyết bí mật không có nguồn.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Độ tinh khiết và nhiễm bẩn: cần biết chất nào/đo ở đâu, không dùng một số chín chung.
+2. Ổn định giữa các lô: phân bố/sai lệch qua lô thay vì chỉ giá trị trung bình đẹp.
+3. Kiểm tra khuyết tật: giới hạn phát hiện, false positive và điều kiện quan sát.
+4. Wafer và bề mặt: độ phẳng, ứng suất hoặc xử lý bề mặt theo đúng công đoạn.
+5. Photoresist và cửa sổ quy trình: nguyên lý nhạy điều kiện, không bịa công thức hóa chất.
+6. Khí/hóa chất/quản lý vật liệu: lưu kho, độ ổn định, traceability và yêu cầu tài liệu.
+7. Độ sẵn sàng thiết bị: bảo trì, hiệu chuẩn, downtime và khả năng lặp lại.
+8. Yield và điểm kiểm: nêu rõ mẫu số, công đoạn, sản phẩm và thời gian so sánh.
+9. Qualification vật liệu mới: kết quả mẫu thử khác chứng minh sản xuất hàng loạt.
+10. Chuỗi nhà cung cấp fab: tương thích, tài liệu chất lượng và bottleneck thay thế.
+
+VẬT CHỨNG VÀ ĐIỀU KIỆN SO SÁNH
+Ưu tiên công bố kỹ thuật, paper, datasheet, hồ sơ kiểm định hoặc tài liệu công
+khai của nhà cung cấp; ghi rõ phạm vi phép thử và tính quảng cáo của nguồn.
+Không tự nhận có dữ liệu yield nội bộ của fab. Một tạp chí thị trường, bằng
+sáng chế hay hình phòng sạch không chứng minh một nhà máy đang đạt thông số đó.
+So cùng công đoạn, sản phẩm, tiêu chí khuyết tật và điều kiện; phân biệt yield
+wafer/die/assembly, độ tinh khiết hóa học và tỷ lệ hàng đạt. Không biến chênh lệch
+thị phần thành bằng chứng chất lượng vật liệu hoặc độc quyền kỹ thuật tuyệt đối.
+
+THUẬT NGỮ VÀ VẬT THỂ NHẬT
+半導体素材: vật liệu bán dẫn; 歩留まり: tỷ lệ đạt theo phạm vi xác định;
+不純物: tạp chất; 欠陥検査: kiểm khuyết tật; ロット間ばらつき: biến thiên giữa lô;
+表面平坦度: độ phẳng bề mặt; 製造装置: thiết bị sản xuất; 工程管理: quản lý công đoạn;
+品質保証: bảo đảm chất lượng; 認定: phê duyệt. Không lẫn nm, µm, ppm, ppb và phần trăm.
+
+CÁCH KỂ PHÙ HỢP
+Một lô mẫu tốt nhưng phạm vi chứng minh còn hẹp; hồ sơ phân bố làm thay đổi
+quyết định mua; bảo trì khôi phục độ lặp lại; kỹ sư đặt lại câu hỏi về cách tính
+yield. Kết quả hỗn hợp và giới hạn công nghệ là payoff hợp lệ, không bắt Nhật độc tôn.
+
+THUMBNAIL/SHOT RIÊNG G-12
+Wafer, cartridge, thiết bị kiểm hay tài liệu qualification là hero đúng công
+đoạn; môi trường sạch có đồ bảo hộ phù hợp, không lấy phoi/dầu CNC làm fab.
+Các sơ đồ mặt cắt là minh họa dễ đọc, không giả vi ảnh/ảnh thiết bị bí mật.
+Không bịa node/đồ thị/yield thật trong ảnh. Đa dạng shot giữa vật liệu, kiểm,
+chuỗi công đoạn và quyết định; tránh 20 ảnh wafer sáng bóng không có thông tin.
+
+BIÊN NGÁCH
+CNC gia công thông thường thuộc G-13; vòng bi/phụ tùng phổ thông và chậm giao
+hàng không gắn công đoạn fab thuộc G-16. Không thay chữ CNC bằng wafer rồi giữ
+nguyên logic đo lỗ. Không đưa công thức/hướng dẫn chế tạo hóa chất nguy hiểm;
+chỉ giải thích quan hệ kỹ thuật được tài liệu hỗ trợ ở mức nội dung phổ thông.

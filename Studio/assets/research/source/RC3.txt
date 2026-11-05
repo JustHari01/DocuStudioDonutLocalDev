@@ -1,0 +1,42 @@
+DOMAIN: R-C3 — NGÂN HÀNG, TÍN DỤNG VÀ XẾP HẠNG
+Lời hứa kênh: đọc đúng chỉ tiêu và hồ sơ công khai để hiểu một quyết định tín
+dụng; không tạo hoảng loạn, tố mất khả năng thanh toán hoặc khuyên người xem rút tiền.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Vốn và thanh khoản: hai câu hỏi khác nhau trong cùng bảng cân đối.
+2. Tài sản và nghĩa vụ theo kỳ hạn: sai lệch thời điểm và giả định tài trợ.
+3. Tài sản bảo đảm: giá trị, điều kiện định giá và quyền sử dụng.
+4. Tái cấp vốn: khoản sắp đến hạn khác toàn bộ nghĩa vụ dài hạn.
+5. Xếp hạng: tổ chức, phạm vi, triển vọng và ngày đánh giá.
+6. Nợ xấu: định nghĩa, mẫu số và thay đổi phân loại giữa các kỳ.
+7. Kiểm thử sức chịu đựng: kịch bản giả định không phải dự báo chắc chắn.
+8. Chi phí vốn: nhiều yếu tố thay đổi, không quy hết cho một rating.
+9. Công bố rủi ro: đọc chú thích và giới hạn dữ liệu thay vì một tỷ lệ giật gân.
+10. Hỗ trợ chính sách: phân biệt cơ chế, công bố, sử dụng và kết quả quan sát.
+
+VẬT CHỨNG VÀ NGUỒN
+Ưu tiên báo cáo tài chính/kiểm toán, công bố cơ quan giám sát, BOJ/FSA và thông
+báo của tổ chức xếp hạng. So cùng kỳ, chuẩn kế toán, phạm vi hợp nhất, đồng tiền
+và định nghĩa chỉ tiêu. Rating không phải bảo đảm trả nợ; thay đổi triển vọng
+khác thay đổi mức xếp hạng. Không bịa tỷ lệ vốn, khoản cứu trợ, dòng người rút
+tiền hoặc lời giám đốc. Một chỉ số yếu chưa chứng minh mất khả năng thanh toán.
+Không tái dựng một cuộc đổ vỡ rồi gán tên ngân hàng thật; dùng ví dụ ẩn danh có
+disclaimer nếu hồ sơ không đủ. Báo cáo chuyên môn không biến thành lời khuyên cá nhân.
+
+THUẬT NGỮ NHẬT
+自己資本: vốn tự có; 流動性: thanh khoản; 信用リスク: rủi ro tín dụng;
+担保: tài sản bảo đảm; 格付け: xếp hạng; 見通し: triển vọng;
+借り換え: tái tài trợ; 不良債権: nợ xấu; 連結: hợp nhất;
+ストレステスト: kiểm thử sức chịu đựng. Luôn giữ định nghĩa của nguồn.
+
+CÁCH KỂ VÀ HÌNH ẢNH
+Một bảng số dễ hiểu sai rồi lần theo chú thích và kỳ hạn để thay cách đọc. Hero
+là cấu trúc bảng cân đối/sơ đồ nghĩa vụ và vật thể giao dịch thông thường, không
+khuôn mặt hoảng sợ hoặc biển hiệu ngân hàng thật bên cảnh cháy AI. Biểu đồ thật
+phải dựng từ số có nguồn; ảnh AI chỉ minh họa khái niệm. Không giả screenshot
+bảng điện, thông báo rút tiền hay văn bản của cơ quan giám sát.
+
+BIÊN NGÁCH
+Không chỉ định ngân hàng an toàn nhất, khuyên gửi/rút/vay/đầu tư, giả danh chuyên
+gia tài chính hoặc đưa kết luận kiểm toán. Tránh thuyết âm mưu, công kích quốc
+gia và tin đồn gây rút tiền hàng loạt. Chấp nhận kết luận chưa đủ dữ liệu.

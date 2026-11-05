@@ -1,0 +1,24 @@
+CÀI FLOW AGENT TRÊN MICROSOFT EDGE
+
+1. Khởi động Flow Agent backend trước.
+2. Mở Microsoft Edge và nhập: edge://extensions
+3. Bật "Chế độ nhà phát triển" (Developer mode).
+4. Chọn "Tải tiện ích đã giải nén" (Load unpacked).
+5. Chọn đúng thư mục Flow-Agent-Edge-v1.2.5 có file manifest.json.
+6. Mở https://flow.google.com/ và đăng nhập tài khoản Google.
+7. Giữ tab Flow mở, sau đó bấm biểu tượng Flow Agent trên thanh tiện ích.
+
+THIẾT LẬP KHUYẾN NGHỊ CHO YOUTUBE
+
+- Loại: Image
+- Model ảnh bắt buộc: Nano Banana 2 Lite
+- Số lượng bắt buộc: 1 ảnh cho mỗi prompt
+- Tỷ lệ: YouTube 16:9
+
+Extension sẽ nhớ model, tỷ lệ và thời lượng được chọn gần nhất.
+Nếu tài khoản hết credit hoặc bị giới hạn, lỗi sẽ xuất hiện trong kết quả/lịch sử và số credit ở đầu bảng điều khiển sẽ giúp kiểm tra tài khoản.
+
+LƯU Ý
+
+- File ZIP chỉ dùng để lưu trữ hoặc gửi sang máy khác. Phải giải nén ZIP trước khi chọn "Load unpacked".
+- Bộ chọn model chỉ áp dụng cho ảnh. Video sử dụng model theo thời lượng của Flow Agent.

@@ -1,0 +1,25 @@
+onlyBuiltDependencies:
+  - '@biomejs/biome'
+  - '@tailwindcss/oxide'
+  - better-sqlite3
+  - esbuild
+  - sharp
+  - sqlite3
+  - unrs-resolver
+
+# Dependency pins. Moved from package.json#pnpm.overrides — pnpm 11
+# no longer reads that field; settings live here now.
+overrides:
+  # Keep the API used by plugins on the Rust crate's minor version.
+  '@tauri-apps/api': '~2.12.1'
+
+allowBuilds:
+  '@parcel/watcher': false
+  sharp: true
+  unrs-resolver: true
+
+# exFAT portable sources cannot use NTFS junctions.
+nodeLinker: hoisted
+hoistWorkspacePackages: false
+packageImportMethod: copy
+verifyDepsBeforeRun: false

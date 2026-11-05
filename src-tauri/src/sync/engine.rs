@@ -1,0 +1,5385 @@
+use super::client::SyncClient;
+use super::encryption;
+use super::manifest::{
+  compute_diff_with_bias, generate_manifest, get_cache_path, DiffBias, HashCache, SyncManifest,
+};
+use super::types::*;
+use crate::events;
+use crate::log_redaction::Plain;
+use crate::log_streak::KeyedStreak;
+use crate::profile::types::{BrowserProfile, SyncMode};
+use crate::profile::ProfileManager;
+use crate::settings_manager::SettingsManager;
+use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Instant;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
+
+/// S3 object-metadata key (stored as `x-amz-meta-updated-at`) holding an
+/// entity's user-edit timestamp in unix seconds. Used to resolve sync conflicts
+/// (last-write-wins) from a HEAD request without downloading the object body.
+const UPDATED_AT_META_KEY: &str = "updated-at";
+/// The profile's group, in plain text on its metadata object, so the sync
+/// server can hold a team member to the groups the owner gave them.
+const GROUP_ID_META_KEY: &str = "group-id";
+
+/// Set when the server signed an upload without `group-id`: an older server
+/// that keeps no group, so asking it again on every sync changes nothing.
+static GROUP_META_UNSUPPORTED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// The `group-id` a profile's metadata object carries.
+fn group_meta(profile: &BrowserProfile) -> String {
+  profile
+    .group_id
+    .clone()
+    .filter(|id| !id.is_empty())
+    .unwrap_or_else(|| crate::team_members::UNGROUPED.to_string())
+}
+
+static TOMBSTONE_CHECK: KeyedStreak = KeyedStreak::new(module_path!(), "Sync tombstone check");
+
+/// What one profile reconcile actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileSyncOutcome {
+  /// The local directory and the remote copy now agree.
+  Completed,
+  /// Nothing was transferred, and the reason is not an error. A caller waiting
+  /// on the remote copy has NOT got it and must try again.
+  Skipped(&'static str),
+}
+
+impl ProfileSyncOutcome {
+  pub fn is_completed(&self) -> bool {
+    matches!(self, Self::Completed)
+  }
+
+  /// The `profile-sync-status` a finished reconcile leaves on the row. A skip
+  /// because the profile is busy waits for it; any other skip leaves the
+  /// copy as it was.
+  pub fn row_status(&self) -> &'static str {
+    match self {
+      Self::Skipped(
+        "profile is running remotely"
+        | "profile is running locally"
+        | "profile is locked elsewhere"
+        | "remote manifest is not available yet",
+      ) => "waiting",
+      Self::Completed | Self::Skipped(_) => "synced",
+    }
+  }
+}
+
+fn profile_sync_lock(profile_id: &str) -> Arc<TokioMutex<()>> {
+  static LOCKS: std::sync::OnceLock<StdMutex<HashMap<String, Weak<TokioMutex<()>>>>> =
+    std::sync::OnceLock::new();
+  let mut locks = LOCKS
+    .get_or_init(StdMutex::default)
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  locks.retain(|_, lock| lock.strong_count() > 0);
+  if let Some(lock) = locks.get(profile_id).and_then(Weak::upgrade) {
+    return lock;
+  }
+  let lock = Arc::new(TokioMutex::new(()));
+  locks.insert(profile_id.to_string(), Arc::downgrade(&lock));
+  lock
+}
+
+static SYNC_CANCEL_FLAGS: std::sync::LazyLock<StdMutex<HashMap<String, Arc<AtomicBool>>>> =
+  std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn register_sync_cancel(profile_id: &str) -> Arc<AtomicBool> {
+  let mut map = SYNC_CANCEL_FLAGS.lock().unwrap();
+  let flag = Arc::new(AtomicBool::new(false));
+  map.insert(profile_id.to_string(), flag.clone());
+  flag
+}
+
+fn clear_sync_cancel(profile_id: &str) {
+  SYNC_CANCEL_FLAGS.lock().unwrap().remove(profile_id);
+}
+
+pub fn request_sync_cancel(profile_id: &str) -> bool {
+  if let Some(flag) = SYNC_CANCEL_FLAGS.lock().unwrap().get(profile_id) {
+    flag.store(true, Ordering::SeqCst);
+    true
+  } else {
+    false
+  }
+}
+
+struct SyncCancelGuard(String);
+impl Drop for SyncCancelGuard {
+  fn drop(&mut self) {
+    clear_sync_cancel(&self.0);
+  }
+}
+
+#[tauri::command]
+pub async fn cancel_profile_sync(profile_id: String) -> Result<bool, String> {
+  Ok(request_sync_cancel(&profile_id))
+}
+
+/// Upload/download concurrency limit
+const SYNC_CONCURRENCY: usize = 32;
+
+/// Max retries for individual file uploads/downloads
+const MAX_FILE_RETRIES: u32 = 3;
+
+/// Critical file patterns — if any of these fail to upload/download, the sync is aborted.
+const CRITICAL_FILE_PATTERNS: &[&str] = &[
+  "Cookies",
+  "Login Data",
+  "Local Storage",
+  "Local State",
+  "Preferences",
+  "Secure Preferences",
+  "Web Data",
+  "Extension Cookies",
+  // Chromium profile equivalents
+  "cookies.sqlite",
+  "key4.db",
+  "logins.json",
+  "cert9.db",
+  "places.sqlite",
+  "formhistory.sqlite",
+  "permissions.sqlite",
+  "prefs.js",
+  "storage.sqlite",
+];
+
+fn is_critical_file(path: &str) -> bool {
+  CRITICAL_FILE_PATTERNS
+    .iter()
+    .any(|pattern| path.contains(pattern))
+}
+
+/// How many failed paths to name before collapsing the rest into a count.
+const MAX_LISTED_FAILURES: usize = 10;
+
+/// Aggregate a batch of failed transfers into the message the user sees.
+///
+/// Whatever breaks a sync usually breaks every file the same way — one
+/// unreachable storage host, one rejected signature — so the per-file causes
+/// were dropped and only the paths survived into the message. That left users
+/// staring at a list of filenames with nothing to act on. Carry the first
+/// cause through, and stop pasting hundreds of paths into a toast.
+fn critical_failure_message(action: &str, failures: &[(String, String)]) -> String {
+  let listed: Vec<&str> = failures
+    .iter()
+    .take(MAX_LISTED_FAILURES)
+    .map(|(path, _)| path.as_str())
+    .collect();
+  let hidden = failures.len().saturating_sub(listed.len());
+  let files = if hidden > 0 {
+    format!("{} (and {} more)", listed.join(", "), hidden)
+  } else {
+    listed.join(", ")
+  };
+
+  match failures.first() {
+    Some((_, cause)) => format!(
+      "Critical files failed to {action}: {files}. Cause: {cause}.{hint} Sync aborted to prevent data loss.",
+      hint = storage_endpoint_hint(cause)
+    ),
+    None => format!("Critical files failed to {action}: {files}. Sync aborted to prevent data loss."),
+  }
+}
+
+/// The one fix worth naming when every transfer dies at connect.
+///
+/// Transfers go straight to the storage host named in the presigned URL, not
+/// through the sync server, so a self-hosted server that signs URLs against an
+/// address only it can resolve fails every file here while its own `/health`
+/// and `/readyz` stay green. The cause string names the host, which says which
+/// address is wrong; this line says where to change it, because the setting
+/// lives on the server, where the user is not looking.
+///
+/// The host only started appearing in that string when the transfer path moved
+/// to `transport_reason_for`. Before that this comment claimed a host that was
+/// never there, and every report of this bug arrived with a list of file names
+/// and nothing to act on.
+fn storage_endpoint_hint(cause: &str) -> String {
+  let lowered = cause.to_ascii_lowercase();
+  let is_transport_failure = [
+    "connection failed",
+    "timed out",
+    "dns",
+    "error sending request",
+  ]
+  .iter()
+  .any(|marker| lowered.contains(marker));
+
+  if is_transport_failure {
+    " The storage host in the presigned URL could not be reached from this device. \
+     On a self-hosted server, set S3_PUBLIC_ENDPOINT to an address this device can reach."
+      .to_string()
+  } else {
+    String::new()
+  }
+}
+
+/// Validate that a manifest-supplied relative file path is safe to join onto a
+/// profile directory before writing/deleting. The manifest is remote-controlled
+/// (a self-hosted or compromised sync server, a MITM on a plaintext Regular-mode
+/// manifest, or a malicious team member who shares the E2E key), so an
+/// unvalidated `path` is an arbitrary file write/delete primitive:
+/// `profile_dir.join(path)` escapes the profile dir when `path` is absolute
+/// (`join` replaces the base) or contains `..`. Accept only plain relative paths
+/// built from normal components; reject absolute paths, `..`, and root/prefix.
+fn is_safe_manifest_path(path: &str) -> bool {
+  use std::path::{Component, Path};
+  let p = Path::new(path);
+  if path.is_empty() || p.is_absolute() {
+    return false;
+  }
+  p.components()
+    .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Whether this machine syncs the profile's browser files, or only its
+/// metadata. Every Wayfern profile syncs its files, whichever OS created it;
+/// only a profile of a browser bound to another OS keeps to its metadata.
+fn syncs_browser_files(profile: &BrowserProfile) -> bool {
+  !profile.is_cross_os()
+}
+
+/// True when `dir` holds no file at any depth, or does not exist.
+fn holds_no_files(dir: &Path) -> bool {
+  let Ok(entries) = fs::read_dir(dir) else {
+    return true;
+  };
+  entries.flatten().all(|entry| {
+    entry
+      .file_type()
+      .is_ok_and(|kind| kind.is_dir() && holds_no_files(&entry.path()))
+  })
+}
+
+/// Whether a synced profile created on another OS is on this machine as
+/// metadata alone, with no browser files yet. Earlier versions synced a
+/// profile from another OS that way.
+pub fn awaits_first_download(profile: &BrowserProfile, profiles_dir: &Path) -> bool {
+  profile.is_sync_enabled()
+    && syncs_browser_files(profile)
+    && profile
+      .resolved_os()
+      .is_some_and(|os| os != crate::profile::types::get_host_os())
+    && holds_no_files(&profile.get_profile_data_path(profiles_dir))
+}
+
+/// Download the browser files of a profile that `awaits_first_download`
+/// before it launches. Launched empty, the browser would write a fresh
+/// profile, and the sync after it closes would publish that as the newer copy
+/// and delete the real files everywhere, so a download that does not complete
+/// refuses the launch.
+pub async fn download_before_first_launch(
+  app_handle: &tauri::AppHandle,
+  profile: &BrowserProfile,
+) -> Result<(), String> {
+  let profiles_dir = ProfileManager::instance().get_profiles_dir();
+  if !awaits_first_download(profile, &profiles_dir) {
+    return Ok(());
+  }
+  let refused = |detail: String| {
+    log::warn!(
+      "Launch refused, profile data not downloaded profile={} err=\"{detail}\"",
+      profile.id
+    );
+    crate::backend_error_with_detail("PROFILE_DATA_NOT_DOWNLOADED", detail)
+  };
+  let engine = SyncEngine::create_from_settings(app_handle)
+    .await
+    .map_err(|e| refused(e.to_string()))?;
+  match engine
+    .sync_profile_with_bias(app_handle, profile, DiffBias::Auto)
+    .await
+  {
+    Ok(ProfileSyncOutcome::Completed) => {
+      log::info!(
+        "Profile data downloaded before launch profile={}",
+        profile.id
+      );
+      Ok(())
+    }
+    Ok(ProfileSyncOutcome::Skipped(reason)) => Err(refused(reason.to_string())),
+    Err(e) => Err(refused(e.to_string())),
+  }
+}
+
+/// Parse an S3 `lastModified` (RFC3339) into unix seconds.
+fn rfc3339_secs(value: &str) -> Option<u64> {
+  DateTime::parse_from_rfc3339(value)
+    .ok()
+    .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+}
+
+/// Whether a config entity's tombstone must stop this reconcile, given when the
+/// tombstone was written and the local entity's own last edit (0 once the local
+/// copy is gone).
+///
+/// A tombstone at least as new as the local edit wins. That keeps last-write-wins
+/// intact: an edit made strictly after the delete still uploads. A tombstone
+/// with no readable write time is treated as newer, because a skipped sync is
+/// retried and a resurrection is not self-correcting.
+fn tombstone_outranks_local(exists: bool, written_at: Option<u64>, local_updated_at: u64) -> bool {
+  if !exists {
+    return false;
+  }
+  match written_at {
+    Some(secs) => secs >= local_updated_at,
+    None => true,
+  }
+}
+
+/// Checkpoint all SQLite WAL files in a profile directory.
+///
+/// When a browser crashes or is killed, SQLite WAL files may contain
+/// uncommitted data (e.g. cookies, login data). Since WAL files are
+/// excluded from sync, we must checkpoint them into the main database
+/// files before generating the manifest to avoid data loss.
+fn checkpoint_sqlite_wal_files(profile_dir: &Path) {
+  fn find_wal_files(dir: &Path, wal_files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+      return;
+    };
+    for entry in entries.flatten() {
+      let path = entry.path();
+      if path.is_dir() {
+        find_wal_files(&path, wal_files);
+      } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.ends_with("-wal") {
+          wal_files.push(path);
+        }
+      }
+    }
+  }
+
+  let mut wal_files = Vec::new();
+  find_wal_files(profile_dir, &mut wal_files);
+
+  for wal_path in &wal_files {
+    // Only checkpoint non-empty WAL files
+    let is_non_empty = fs::metadata(wal_path).map(|m| m.len() > 0).unwrap_or(false);
+    if !is_non_empty {
+      continue;
+    }
+
+    // Derive the main database path by stripping the "-wal" suffix
+    let db_path_str = wal_path.to_string_lossy();
+    let db_path = PathBuf::from(db_path_str.strip_suffix("-wal").unwrap());
+
+    if !db_path.exists() {
+      continue;
+    }
+
+    match rusqlite::Connection::open(&db_path) {
+      Ok(conn) => match conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+        Ok(_) => {
+          log::debug!(
+            "WAL checkpointed db={}",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+          );
+        }
+        Err(e) => {
+          log::warn!(
+            "WAL checkpoint failed db={} err=\"{e}\"",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+          );
+        }
+      },
+      Err(e) => {
+        log::warn!(
+          "WAL checkpoint failed: DB not opened db={} err=\"{e}\"",
+          db_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+      }
+    }
+  }
+}
+
+/// Resume state persisted to disk so interrupted syncs can continue
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SyncResumeState {
+  profile_id: String,
+  direction: String,
+  started_at: String,
+  completed_files: HashSet<String>,
+}
+
+impl SyncResumeState {
+  fn path(profile_dir: &Path) -> std::path::PathBuf {
+    profile_dir.join(".donut-sync").join("resume-state.json")
+  }
+
+  fn load(profile_dir: &Path) -> Option<Self> {
+    let path = Self::path(profile_dir);
+    let content = fs::read_to_string(&path).ok()?;
+    let state: Self = serde_json::from_str(&content).ok()?;
+    // Discard if older than 12 hours (presigned URLs expire in 1h but files may still be there)
+    if let Ok(started) = DateTime::parse_from_rfc3339(&state.started_at) {
+      let age = Utc::now() - started.with_timezone(&Utc);
+      if age.num_hours() > 12 {
+        let _ = fs::remove_file(&path);
+        return None;
+      }
+    }
+    Some(state)
+  }
+
+  fn save(&self, profile_dir: &Path) -> SyncResult<()> {
+    let path = Self::path(profile_dir);
+    if let Some(parent) = path.parent() {
+      fs::create_dir_all(parent)
+        .map_err(|e| SyncError::IoError(format!("Failed to create resume state dir: {e}")))?;
+    }
+    let json = serde_json::to_string(self).map_err(|e| {
+      SyncError::SerializationError(format!("Failed to serialize resume state: {e}"))
+    })?;
+    fs::write(&path, json)
+      .map_err(|e| SyncError::IoError(format!("Failed to write resume state: {e}")))?;
+    Ok(())
+  }
+
+  fn delete(profile_dir: &Path) {
+    let path = Self::path(profile_dir);
+    let _ = fs::remove_file(&path);
+  }
+}
+
+/// Tracks live sync progress and emits throttled events to the frontend
+struct SyncProgressTracker {
+  profile_id: String,
+  profile_name: String,
+  phase: String,
+  total_files: u64,
+  total_bytes: u64,
+  completed_files: AtomicU64,
+  completed_bytes: AtomicU64,
+  failed_count: AtomicU64,
+  start_time: Instant,
+  last_emit: TokioMutex<Instant>,
+}
+
+impl SyncProgressTracker {
+  fn new(
+    profile_id: String,
+    profile_name: String,
+    phase: &str,
+    total_files: u64,
+    total_bytes: u64,
+  ) -> Self {
+    Self {
+      profile_id,
+      profile_name,
+      phase: phase.to_string(),
+      total_files,
+      total_bytes,
+      completed_files: AtomicU64::new(0),
+      completed_bytes: AtomicU64::new(0),
+      failed_count: AtomicU64::new(0),
+      start_time: Instant::now(),
+      last_emit: TokioMutex::new(Instant::now() - std::time::Duration::from_secs(1)),
+    }
+  }
+
+  fn record_success(&self, bytes: u64) {
+    self.completed_files.fetch_add(1, Ordering::Relaxed);
+    self.completed_bytes.fetch_add(bytes, Ordering::Relaxed);
+    self.maybe_emit();
+  }
+
+  fn record_failure(&self) {
+    self.completed_files.fetch_add(1, Ordering::Relaxed);
+    self.failed_count.fetch_add(1, Ordering::Relaxed);
+    self.maybe_emit();
+  }
+
+  fn maybe_emit(&self) {
+    let Ok(mut last) = self.last_emit.try_lock() else {
+      return;
+    };
+    if last.elapsed().as_millis() < 250 {
+      return;
+    }
+    *last = Instant::now();
+    self.emit_progress();
+  }
+
+  fn emit_final(&self) {
+    self.emit_progress();
+  }
+
+  fn emit_progress(&self) {
+    let completed_bytes = self.completed_bytes.load(Ordering::Relaxed);
+    let elapsed = self.start_time.elapsed().as_secs_f64().max(0.1);
+    let speed = (completed_bytes as f64 / elapsed) as u64;
+    let remaining_bytes = self.total_bytes.saturating_sub(completed_bytes);
+    let eta = remaining_bytes.checked_div(speed).unwrap_or(0);
+
+    let _ = events::emit(
+      "profile-sync-progress",
+      serde_json::json!({
+        "profile_id": self.profile_id,
+        "profile_name": self.profile_name,
+        "phase": self.phase,
+        "completed_files": self.completed_files.load(Ordering::Relaxed),
+        "total_files": self.total_files,
+        "completed_bytes": completed_bytes,
+        "total_bytes": self.total_bytes,
+        "speed_bytes_per_sec": speed,
+        "eta_seconds": eta,
+        "failed_count": self.failed_count.load(Ordering::Relaxed),
+      }),
+    );
+  }
+}
+
+/// Check if sync is configured (cloud or self-hosted)
+pub fn is_sync_configured() -> bool {
+  // Cloud backup is a plan capability. Gating on the capability — not just
+  // "is paid" — keeps this correct if a plan without cloud backup is ever
+  // added.
+  if crate::cloud_auth::CLOUD_AUTH.can_use_cloud_backup_sync() {
+    return true;
+  }
+  let manager = SettingsManager::instance();
+  if let Ok(settings) = manager.load_settings() {
+    return settings.sync_server_url.is_some();
+  }
+  false
+}
+
+#[derive(Clone)]
+pub struct SyncEngine {
+  pub(super) client: SyncClient,
+  /// A team launcher's engine: the team's copy of every setting wins, and
+  /// only what a session changed goes up (`team_roles.rs`).
+  pub(super) read_only: bool,
+}
+
+impl SyncEngine {
+  pub fn new(server_url: String, token: String) -> Self {
+    Self {
+      client: SyncClient::new(server_url, token),
+      read_only: false,
+    }
+  }
+
+  /// Whether the remote copy replaces the local one when both exist. On a
+  /// read-only engine any difference does, so a local change never sticks.
+  pub(super) fn remote_wins(&self, local_updated_at: u64, remote_updated_at: u64) -> bool {
+    remote_updated_at > local_updated_at
+      || (self.read_only && local_updated_at != remote_updated_at)
+  }
+
+  /// Whether this engine must leave the remote copy of `what` alone.
+  pub(super) fn skips_remote_write(&self, what: &str) -> bool {
+    if self.read_only {
+      log::debug!("Sync write skipped, team role is read-only {what}");
+    }
+    self.read_only
+  }
+
+  pub async fn create_from_settings(app_handle: &tauri::AppHandle) -> Result<Self, String> {
+    // Cloud auth takes priority
+    if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await
+      && !super::account_server::self_hosted_picked().await
+    {
+      let (url, token) = match super::account_server::configured().await {
+        Some(server) => {
+          let token = crate::cloud_auth::CLOUD_AUTH
+            .server_sync_token(&server)
+            .await
+            .map_err(|e| format!("Failed to get own server sync token: {e}"))?;
+          (server, token)
+        }
+        None => {
+          let token = crate::cloud_auth::CLOUD_AUTH
+            .get_or_refresh_sync_token()
+            .await
+            .map_err(|e| format!("Failed to get cloud sync token: {e}"))?
+            .ok_or_else(|| "Cloud sync token not available".to_string())?;
+          (crate::cloud_auth::CLOUD_SYNC_URL.to_string(), token)
+        }
+      };
+      let mut engine = Self::new(url, token);
+      engine.read_only = crate::team_roles::is_read_only();
+      return Ok(engine);
+    }
+
+    // Fall back to self-hosted settings
+    let manager = SettingsManager::instance();
+    let settings = manager
+      .load_settings()
+      .map_err(|e| format!("Failed to load settings: {e}"))?;
+
+    let server_url = settings
+      .sync_server_url
+      .ok_or_else(|| "Sync server URL not configured".to_string())?;
+
+    let token = manager
+      .get_sync_token(app_handle)
+      .await
+      .map_err(|e| format!("Failed to get sync token: {e}"))?
+      .ok_or_else(|| "Sync token not configured".to_string())?;
+
+    Ok(Self::new(server_url, token))
+  }
+
+  /// Get the key prefix for team profiles. Returns empty string for personal profiles.
+  pub(super) async fn get_team_key_prefix(profile: &BrowserProfile) -> String {
+    if profile.created_by_id.is_some() {
+      if let Some(auth) = crate::cloud_auth::CLOUD_AUTH.get_user().await {
+        if let Some(team_id) = &auth.user.team_id {
+          return format!("teams/{}/", team_id);
+        }
+      }
+    }
+    String::new()
+  }
+
+  /// Whether the signed-in account holds a team seat, where access by group
+  /// applies.
+  async fn is_team_seat() -> bool {
+    crate::cloud_auth::CLOUD_AUTH
+      .get_user()
+      .await
+      .is_some_and(|auth| auth.user.team_id.is_some())
+  }
+
+  /// The key that seals an end-to-end encrypted profile's files, or `None`.
+  pub(super) fn profile_encryption_key(profile: &BrowserProfile) -> SyncResult<Option<[u8; 32]>> {
+    if !profile.is_encrypted_sync() {
+      return Ok(None);
+    }
+    let password = encryption::load_e2e_password()
+      .map_err(|e| SyncError::InvalidData(format!("Failed to load E2E password: {e}")))?
+      .ok_or_else(|| {
+        let _ = events::emit("profile-sync-e2e-password-required", ());
+        SyncError::InvalidData("E2E password not set".to_string())
+      })?;
+    let salt = profile.encryption_salt.as_deref().ok_or_else(|| {
+      SyncError::InvalidData("Encryption salt missing on encrypted profile".to_string())
+    })?;
+    let key = encryption::derive_profile_key(&password, salt)
+      .map_err(|e| SyncError::InvalidData(format!("Key derivation failed: {e}")))?;
+    Ok(Some(key))
+  }
+
+  /// Check if this is a self-hosted sync (no cloud login).
+  async fn is_self_hosted_sync() -> bool {
+    !crate::cloud_auth::CLOUD_AUTH.is_logged_in().await
+  }
+
+  /// Resolve a remote config object's user-edit timestamp (`updated_at`) for
+  /// conflict resolution. Prefers the value from S3 object metadata returned by
+  /// the HEAD (`stat`) — no body transfer. Falls back to downloading and
+  /// decrypting the small JSON body and reading its embedded `updated_at` (for
+  /// older self-hosted servers that don't surface metadata). Legacy objects with
+  /// neither resolve to 0, so any real local edit (`updated_at` > 0) wins.
+  pub(super) async fn remote_updated_at(&self, stat: &StatResponse, remote_key: &str) -> u64 {
+    if let Some(meta) = &stat.metadata {
+      if let Some(v) = meta
+        .get(UPDATED_AT_META_KEY)
+        .and_then(|s| s.parse::<u64>().ok())
+      {
+        return v;
+      }
+    }
+    // Fallback: read updated_at from the (small) JSON body.
+    if let Ok(presign) = self.client.presign_download(remote_key).await {
+      if let Ok(raw) = self.client.download_bytes(&presign.url).await {
+        if let Ok(data) = encryption::maybe_unseal_after_download(&raw) {
+          if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data) {
+            if let Some(u) = val.get("updated_at").and_then(|x| x.as_u64()) {
+              return u;
+            }
+          }
+        }
+      }
+    }
+    0
+  }
+
+  /// Upload a small config JSON blob (proxy/vpn/group/extension/extension-group/
+  /// profile metadata), signing its `updated_at` into S3 object metadata so
+  /// future reconciles can compare via HEAD without downloading the body. The
+  /// body is sealed (E2E) exactly as before; only a plaintext unix timestamp
+  /// lives in the object metadata.
+  pub(super) async fn upload_config_json(
+    &self,
+    remote_key: &str,
+    json: &str,
+    updated_at: u64,
+  ) -> SyncResult<()> {
+    self
+      .upload_config_json_with(remote_key, json, updated_at, HashMap::new())
+      .await
+  }
+
+  /// `upload_config_json`, with more plain-text object metadata.
+  async fn upload_config_json_with(
+    &self,
+    remote_key: &str,
+    json: &str,
+    updated_at: u64,
+    mut meta: HashMap<String, String>,
+  ) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("key={remote_key}")) {
+      return Ok(());
+    }
+    let (payload, content_type) = encryption::maybe_seal_for_upload(json.as_bytes())
+      .map_err(|e| SyncError::InvalidData(format!("Failed to seal config: {e}")))?;
+    meta.insert(UPDATED_AT_META_KEY.to_string(), updated_at.to_string());
+    let wants_group = meta.contains_key(GROUP_ID_META_KEY);
+    let presign = self
+      .client
+      .presign_upload_with_metadata(remote_key, Some(content_type), Some(meta))
+      .await?;
+    if wants_group {
+      let kept = presign
+        .metadata
+        .as_ref()
+        .is_some_and(|signed| signed.contains_key(GROUP_ID_META_KEY));
+      GROUP_META_UNSUPPORTED.store(!kept, std::sync::atomic::Ordering::Relaxed);
+    }
+    self
+      .client
+      .upload_bytes_with_metadata(
+        &presign.url,
+        &payload,
+        Some(content_type),
+        presign.metadata.as_ref(),
+      )
+      .await?;
+    Ok(())
+  }
+
+  /// Whether a remote tombstone forbids syncing this config entity right now.
+  ///
+  /// Every `sync_X` reconciles local against remote by presence alone, so
+  /// without this a device that has not yet drained its tombstone queue
+  /// re-uploads an entity another device just deleted, then downloads its own
+  /// resurrection back once the drain removes the local copy. The delete never
+  /// sticks on either side.
+  ///
+  /// A failed stat is propagated, not swallowed, so the pass is reported as
+  /// failed rather than as a silent success. A caller that cannot propagate
+  /// treats the error as blocking: a skipped pass is retried, a resurrection is
+  /// not self-correcting.
+  pub(super) async fn tombstone_blocks(
+    &self,
+    kind: &str,
+    id: &str,
+    local_updated_at: u64,
+  ) -> SyncResult<bool> {
+    let tombstone_key = format!("tombstones/{}/{}.json", kind, id);
+    let stat = match self.client.stat(&tombstone_key).await {
+      Ok(stat) => {
+        TOMBSTONE_CHECK.succeeded(&format!("key={tombstone_key}"));
+        stat
+      }
+      Err(e) => {
+        TOMBSTONE_CHECK.failed(&format!("key={tombstone_key}"), &e);
+        return Err(e);
+      }
+    };
+    let written_at = stat.last_modified.as_deref().and_then(rfc3339_secs);
+    let blocked = tombstone_outranks_local(stat.exists, written_at, local_updated_at);
+    if blocked {
+      log::debug!("Sync skipped, deleted remotely kind={kind} id={id}");
+    }
+    Ok(blocked)
+  }
+
+  pub async fn sync_profile(
+    &self,
+    app_handle: &tauri::AppHandle,
+    profile: &BrowserProfile,
+  ) -> SyncResult<()> {
+    self
+      .sync_profile_with_bias(app_handle, profile, DiffBias::Auto)
+      .await
+      .map(|_| ())
+  }
+
+  /// Reconcile a profile, stating which side wins and whether anything happened.
+  ///
+  /// Every skip below returns `Ok(())` from `sync_profile`, so a caller
+  /// that treated success as "the profile is now current" would clear the local
+  /// launch gate without having downloaded a single byte — and the user would
+  /// then open a stale profile over the session's work. `Skipped` says so.
+  pub async fn sync_profile_with_bias(
+    &self,
+    app_handle: &tauri::AppHandle,
+    profile: &BrowserProfile,
+    bias: DiffBias,
+  ) -> SyncResult<ProfileSyncOutcome> {
+    self
+      .sync_profile_inner(app_handle, profile, bias, false)
+      .await
+  }
+
+  async fn sync_profile_inner(
+    &self,
+    app_handle: &tauri::AppHandle,
+    profile: &BrowserProfile,
+    bias: DiffBias,
+    reencrypt: bool,
+  ) -> SyncResult<ProfileSyncOutcome> {
+    let started = Instant::now();
+    let profile_id = profile.id.to_string();
+    let _sync_guard = profile_sync_lock(&profile_id).lock_owned().await;
+    let pending_session = match crate::remote_handoff::session_for(&profile_id) {
+      Some((crate::remote_handoff::HandoffState::Running, _)) => {
+        return Ok(ProfileSyncOutcome::Skipped("profile is running remotely"));
+      }
+      Some((crate::remote_handoff::HandoffState::PendingSync, session_id)) => Some(session_id),
+      None => None,
+    };
+    if bias == DiffBias::PreferRemote && pending_session.is_none() {
+      return Ok(ProfileSyncOutcome::Skipped(
+        "remote work was already pulled",
+      ));
+    }
+    if reencrypt && pending_session.is_some() {
+      return Err(SyncError::InvalidData(
+        "Remote profile changes are pending".to_string(),
+      ));
+    }
+    let bias = if pending_session.is_some() {
+      DiffBias::PreferRemote
+    } else {
+      bias
+    };
+    let current_profile = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| SyncError::IoError(format!("Failed to read profile: {e}")))?
+      .into_iter()
+      .find(|current| current.id == profile.id)
+      .ok_or_else(|| SyncError::InvalidData(format!("Profile {profile_id} not found")))?;
+    let profile = &current_profile;
+
+    if !syncs_browser_files(profile) {
+      log::debug!(
+        "Profile sync: cross-OS, metadata only profile={}",
+        profile.id
+      );
+      self.sync_cross_os_metadata(app_handle, profile).await?;
+      // The browser files are the thing a remote session changes, and a cross-OS
+      // profile syncs none of them here, so this is not a completed pull.
+      return Ok(ProfileSyncOutcome::Skipped("cross-OS profile"));
+    }
+
+    // Skip team profiles for self-hosted sync
+    if Self::is_self_hosted_sync().await && profile.created_by_id.is_some() {
+      log::debug!(
+        "Profile sync skipped: team profile on self-hosted sync profile={}",
+        profile.id
+      );
+      return Ok(ProfileSyncOutcome::Skipped(
+        "team profile, self-hosted sync",
+      ));
+    }
+
+    // Skip if profile is currently running locally
+    if profile.process_id.is_some() {
+      log::debug!("Profile sync skipped: running profile={}", profile.id);
+      return Ok(ProfileSyncOutcome::Skipped("profile is running locally"));
+    }
+
+    // Skip if profile is locked by another team member, or by one of this
+    // user's own remote sessions.
+    if pending_session.is_some()
+      && crate::team_lock::TEAM_LOCK
+        .is_locked_by_another(&profile_id)
+        .await
+    {
+      crate::team_lock::TEAM_LOCK
+        .fetch_locks()
+        .await
+        .map_err(SyncError::NetworkError)?;
+    }
+    if crate::team_lock::TEAM_LOCK
+      .is_locked_by_another(&profile.id.to_string())
+      .await
+    {
+      log::debug!(
+        "Profile sync skipped: locked elsewhere profile={}",
+        profile.id
+      );
+      return Ok(ProfileSyncOutcome::Skipped("profile is locked elsewhere"));
+    }
+
+    let reconciled_profile = self.reconcile_profile_metadata(profile).await?;
+    let profile = &reconciled_profile;
+
+    // Derive encryption key if encrypted sync
+    let encryption_key = Self::profile_encryption_key(profile)?;
+
+    let profile_manager = ProfileManager::instance();
+    let profiles_dir = profile_manager.get_profiles_dir();
+    let profile_dir = profiles_dir.join(profile.id.to_string());
+    let profile_id = profile.id.to_string();
+
+    let cancel_flag = register_sync_cancel(&profile_id);
+    let _cancel_guard = SyncCancelGuard(profile_id.clone());
+
+    // Determine team key prefix for team profiles
+    let key_prefix = Self::get_team_key_prefix(profile).await;
+
+    log::debug!(
+      "Profile sync started profile={profile_id} team={}",
+      !key_prefix.is_empty()
+    );
+
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "status": "syncing"
+      }),
+    );
+
+    // Ensure profile directory exists
+    fs::create_dir_all(&profile_dir).map_err(|e| {
+      SyncError::IoError(format!(
+        "Failed to create profile directory {}: {e}",
+        profile_dir.display()
+      ))
+    })?;
+
+    // Reading and hashing the whole profile directory blocks, so it runs off
+    // the async workers.
+    let local_manifest = {
+      let profile_dir = profile_dir.clone();
+      let profile_id = profile_id.clone();
+      tokio::task::spawn_blocking(move || {
+        // Checkpoint any SQLite WAL files to ensure all data is in the main DB
+        // before we generate the manifest (WAL files are excluded from sync)
+        checkpoint_sqlite_wal_files(&profile_dir);
+
+        #[cfg(target_os = "windows")]
+        match crate::profile_import::keyring::write_key_file_from_local_state(
+          &profile_dir.join("profile"),
+        ) {
+          Ok(true) => log::info!("Key file written from Local State profile={profile_id}"),
+          Ok(false) => {}
+          Err(e) => log::warn!("Key file not written profile={profile_id} err=\"{e}\""),
+        }
+
+        let cache_path = get_cache_path(&profile_dir);
+        let mut hash_cache = HashCache::load(&cache_path);
+        let manifest = generate_manifest(&profile_id, &profile_dir, &mut hash_cache)?;
+        // Save the hash cache for future runs
+        hash_cache.save(&cache_path)?;
+        Ok::<_, SyncError>(manifest)
+      })
+      .await
+      .map_err(|e| SyncError::IoError(format!("Manifest task failed: {e}")))??
+    };
+
+    let total_size: u64 = local_manifest.files.iter().map(|f| f.size).sum();
+    let has_cookies = local_manifest
+      .files
+      .iter()
+      .any(|f| f.path.contains("Cookies") || f.path.contains("cookies"));
+    let has_local_state = local_manifest
+      .files
+      .iter()
+      .any(|f| f.path.contains("Local State"));
+    log::debug!(
+      "Profile manifest built profile={profile_id} files={} bytes={total_size} cookies={has_cookies} local_state={has_local_state}",
+      local_manifest.files.len()
+    );
+
+    // Try to download remote manifest
+    let remote_manifest_key = format!("{}profiles/{}/manifest.json", key_prefix, profile_id);
+    let remote_manifest = if reencrypt {
+      // Compare against an empty manifest locally so every file is rewritten.
+      // Deleting it remotely would let a device with the previous password
+      // race this upload and recreate a manifest we can no longer decrypt.
+      None
+    } else {
+      self
+        .download_manifest(&remote_manifest_key, encryption_key.as_ref())
+        .await?
+    };
+
+    let skipped = if pending_session.is_some() && remote_manifest.is_none() {
+      Some("remote manifest is not available yet")
+    } else if self.read_only && remote_manifest.is_none() {
+      Some("the team role cannot add profiles")
+    } else {
+      None
+    };
+    if let Some(reason) = skipped {
+      // "syncing" went out above; every caller needs the row to settle.
+      let outcome = ProfileSyncOutcome::Skipped(reason);
+      let _ = events::emit(
+        "profile-sync-status",
+        serde_json::json!({ "profile_id": profile_id, "status": outcome.row_status() }),
+      );
+      return Ok(outcome);
+    }
+
+    // Compute diff
+    let diff = compute_diff_with_bias(&local_manifest, remote_manifest.as_ref(), bias);
+
+    if diff.is_empty() && !reencrypt && remote_manifest.is_some() && profile.last_sync.is_some() {
+      log::debug!(
+        "Profile already in sync profile={profile_id} files={} elapsed_ms={}",
+        local_manifest.files.len(),
+        started.elapsed().as_millis()
+      );
+      if let Some(session_id) = &pending_session {
+        crate::remote_handoff::clear_pending(&profile_id, session_id);
+      }
+      let _ = events::emit(
+        "profile-sync-status",
+        serde_json::json!({
+          "profile_id": profile_id,
+          "profile_name": profile.name,
+          "status": "synced"
+        }),
+      );
+      // Nothing to transfer IS a completed reconcile: the local copy already
+      // matches what the host pushed, which is exactly what the caller waits for.
+      return Ok(ProfileSyncOutcome::Completed);
+    }
+
+    let upload_bytes: u64 = diff.files_to_upload.iter().map(|f| f.size).sum();
+    let download_bytes: u64 = diff.files_to_download.iter().map(|f| f.size).sum();
+    let total_files = diff.files_to_upload.len()
+      + diff.files_to_download.len()
+      + diff.files_to_delete_local.len()
+      + diff.files_to_delete_remote.len();
+
+    log::debug!(
+      "Profile diff profile={profile_id} upload={} download={} delete_local={} delete_remote={}",
+      diff.files_to_upload.len(),
+      diff.files_to_download.len(),
+      diff.files_to_delete_local.len(),
+      diff.files_to_delete_remote.len()
+    );
+
+    let _ = events::emit(
+      "profile-sync-progress",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "phase": "started",
+        "total_files": total_files,
+        "total_bytes": upload_bytes + download_bytes
+      }),
+    );
+
+    // Perform uploads
+    if !diff.files_to_upload.is_empty() {
+      self
+        .upload_profile_files(
+          app_handle,
+          &profile_id,
+          &profile.name,
+          &profile_dir,
+          &diff.files_to_upload,
+          encryption_key.as_ref(),
+          &key_prefix,
+          &cancel_flag,
+        )
+        .await?;
+    }
+
+    if cancel_flag.load(Ordering::Relaxed) {
+      log::info!("Profile sync cancelled profile={profile_id} stage=upload");
+      return Err(SyncError::Cancelled);
+    }
+
+    // Perform downloads
+    if !diff.files_to_download.is_empty() {
+      if pending_session.is_some() {
+        // The diff already excludes files whose hashes match. A resume record
+        // from an older session must not skip a file that changed again.
+        SyncResumeState::delete(&profile_dir);
+      }
+      self
+        .download_profile_files(
+          app_handle,
+          &profile_id,
+          &profile.name,
+          &profile_dir,
+          &diff.files_to_download,
+          encryption_key.as_ref(),
+          &key_prefix,
+          &cancel_flag,
+        )
+        .await?;
+    }
+
+    if cancel_flag.load(Ordering::Relaxed) {
+      log::info!("Profile sync cancelled profile={profile_id} stage=download");
+      return Err(SyncError::Cancelled);
+    }
+
+    // Delete local files that don't exist remotely (when remote is newer)
+    for path in &diff.files_to_delete_local {
+      // The delete list comes from the remote-controlled manifest; guard against
+      // traversal/absolute paths so it can't delete files outside the profile.
+      if !is_safe_manifest_path(path) {
+        log::warn!("Unsafe manifest path, local delete skipped path={path:?}");
+        continue;
+      }
+      let file_path = profile_dir.join(path);
+      if file_path.exists() {
+        let _ = fs::remove_file(&file_path);
+        log::debug!("Local file deleted path={path}");
+      }
+    }
+
+    // Delete remote files that don't exist locally (when local is newer)
+    for path in &diff.files_to_delete_remote {
+      let remote_key = format!("{}profiles/{}/files/{}", key_prefix, profile_id, path);
+      let _ = self.client.delete(&remote_key, None).await;
+      log::debug!("Remote file deleted path={path}");
+    }
+
+    // If this sync changed the local profile directory (downloaded files and/or
+    // deleted local files), the manifest generated at the START of the sync is
+    // now stale. Uploading it would advertise wrong hashes/mtimes for the files
+    // we just pulled, so the peer keeps computing a non-empty diff and the two
+    // devices ping-pong re-uploads forever. Regenerate from the
+    // actual on-disk files before uploading. When only uploads happened, the
+    // on-disk state is unchanged and the original manifest is still accurate.
+    let local_changed =
+      !diff.files_to_download.is_empty() || !diff.files_to_delete_local.is_empty();
+    let final_manifest = if local_changed {
+      let downloaded: Vec<String> = diff
+        .files_to_download
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
+      let profile_dir = profile_dir.clone();
+      let profile_id = profile_id.clone();
+      let mut regenerated = tokio::task::spawn_blocking(move || {
+        let cache_path = get_cache_path(&profile_dir);
+        let mut new_cache = HashCache::load(&cache_path);
+        for path in &downloaded {
+          new_cache.entries.remove(path);
+        }
+        let regenerated = generate_manifest(&profile_id, &profile_dir, &mut new_cache)?;
+        new_cache.save(&cache_path)?;
+        Ok::<_, SyncError>(regenerated)
+      })
+      .await
+      .map_err(|e| SyncError::IoError(format!("Manifest task failed: {e}")))??;
+      regenerated.encrypted = encryption_key.is_some();
+      regenerated
+    } else {
+      let mut m = local_manifest;
+      m.encrypted = encryption_key.is_some();
+      m
+    };
+
+    if pending_session.is_some() {
+      // Partial downloads must remain pending, including files outside the
+      // critical-file list. Never publish an incomplete return as the new copy.
+      if !compute_diff_with_bias(&final_manifest, remote_manifest.as_ref(), bias).is_empty() {
+        return Err(SyncError::NetworkError(
+          "Remote profile download is incomplete".to_string(),
+        ));
+      }
+    } else {
+      self
+        .upload_manifest(
+          &profile_id,
+          &final_manifest,
+          encryption_key.as_ref(),
+          &key_prefix,
+        )
+        .await?;
+    }
+
+    // Sync completed successfully — clean up resume state
+    SyncResumeState::delete(&profile_dir);
+
+    // Sync associated proxy, group, and VPN
+    if pending_session.is_none() {
+      if let Some(proxy_id) = &profile.proxy_id {
+        let _ = self.sync_proxy(proxy_id, Some(app_handle)).await;
+      }
+      if let Some(group_id) = &profile.group_id {
+        let _ = self.sync_group(group_id, Some(app_handle)).await;
+      }
+      if let Some(vpn_id) = &profile.vpn_id {
+        let _ = self.sync_vpn(vpn_id, Some(app_handle)).await;
+      }
+    }
+
+    let mut updated_profile = profile.clone();
+    updated_profile.last_sync = Some(super::conflicts::synced_at(updated_profile.updated_at));
+    profile_manager
+      .save_profile(&updated_profile)
+      .map_err(|e| {
+        SyncError::IoError(format!("Failed to save reconciled profile metadata: {e}"))
+      })?;
+    let _ = events::emit("profiles-changed", ());
+
+    if let Some(session_id) = &pending_session {
+      crate::remote_handoff::clear_pending(&profile_id, session_id);
+    }
+
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "status": "synced"
+      }),
+    );
+
+    crate::cookie_bot::report_profile_state(&updated_profile);
+
+    log::info!(
+      "Profile synced profile={profile_id} uploaded={} downloaded={} deleted_local={} deleted_remote={} bytes_up={upload_bytes} bytes_down={download_bytes} elapsed_ms={}",
+      diff.files_to_upload.len(),
+      diff.files_to_download.len(),
+      diff.files_to_delete_local.len(),
+      diff.files_to_delete_remote.len(),
+      started.elapsed().as_millis()
+    );
+    if !diff.files_to_upload.is_empty() {
+      self.maybe_auto_restore_point(&updated_profile);
+    }
+    Ok(ProfileSyncOutcome::Completed)
+  }
+
+  pub(super) async fn download_manifest(
+    &self,
+    key: &str,
+    encryption_key: Option<&[u8; 32]>,
+  ) -> SyncResult<Option<SyncManifest>> {
+    let stat = self.client.stat(key).await?;
+    if !stat.exists {
+      return Ok(None);
+    }
+
+    let presign = self.client.presign_download(key).await?;
+    let data = self.client.download_bytes(&presign.url).await?;
+
+    // Try parsing as plaintext JSON first (unencrypted or backwards-compatible)
+    if let Ok(manifest) = serde_json::from_slice::<SyncManifest>(&data) {
+      return Ok(Some(manifest));
+    }
+
+    // If plaintext parse failed and we have an encryption key, try decrypting
+    if let Some(key) = encryption_key {
+      let decrypted = encryption::decrypt_bytes(key, &data)
+        .map_err(|e| SyncError::InvalidData(format!("Failed to decrypt manifest: {e}")))?;
+      let manifest: SyncManifest = serde_json::from_slice(&decrypted).map_err(|e| {
+        SyncError::SerializationError(format!("Failed to parse decrypted manifest: {e}"))
+      })?;
+      return Ok(Some(manifest));
+    }
+
+    Err(SyncError::SerializationError(
+      "Failed to parse manifest (not valid JSON and no encryption key available)".to_string(),
+    ))
+  }
+
+  pub(super) async fn upload_manifest(
+    &self,
+    profile_id: &str,
+    manifest: &SyncManifest,
+    encryption_key: Option<&[u8; 32]>,
+    key_prefix: &str,
+  ) -> SyncResult<()> {
+    let json = serde_json::to_string_pretty(manifest)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize manifest: {e}")))?;
+
+    let upload_data = if let Some(key) = encryption_key {
+      encryption::encrypt_bytes(key, json.as_bytes())
+        .map_err(|e| SyncError::InvalidData(format!("Failed to encrypt manifest: {e}")))?
+    } else {
+      json.into_bytes()
+    };
+
+    let content_type = if encryption_key.is_some() {
+      "application/octet-stream"
+    } else {
+      "application/json"
+    };
+
+    let remote_key = format!("{}profiles/{}/manifest.json", key_prefix, profile_id);
+    let presign = self
+      .client
+      .presign_upload(&remote_key, Some(content_type))
+      .await?;
+
+    self
+      .client
+      .upload_bytes(&presign.url, &upload_data, Some(content_type))
+      .await?;
+
+    Ok(())
+  }
+
+  async fn download_profile_metadata(&self, key: &str) -> SyncResult<BrowserProfile> {
+    let stat = self.client.stat(key).await?;
+    if !stat.exists {
+      return Err(SyncError::InvalidData(
+        "Remote metadata not found".to_string(),
+      ));
+    }
+
+    let presign = self.client.presign_download(key).await?;
+    let raw = self.client.download_bytes(&presign.url).await?;
+    let data = encryption::maybe_unseal_after_download(&raw)
+      .map_err(|e| SyncError::InvalidData(format!("Failed to unseal profile metadata: {e}")))?;
+    let profile: BrowserProfile = serde_json::from_slice(&data)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to parse metadata: {e}")))?;
+
+    Ok(profile)
+  }
+
+  async fn reconcile_profile_metadata(
+    &self,
+    profile: &BrowserProfile,
+  ) -> SyncResult<BrowserProfile> {
+    let profile_id = profile.id.to_string();
+    let key_prefix = Self::get_team_key_prefix(profile).await;
+    let remote_key = format!("{key_prefix}profiles/{profile_id}/metadata.json");
+    let stat = self.client.stat(&remote_key).await?;
+
+    if !stat.exists {
+      self
+        .upload_profile_metadata(&profile_id, profile, &key_prefix)
+        .await?;
+      return Ok(profile.clone());
+    }
+
+    let local_updated = profile.updated_at.unwrap_or(0);
+    let remote_updated = self.remote_updated_at(&stat, &remote_key).await;
+    if !self.remote_wins(local_updated, remote_updated) {
+      // An object an older app wrote has no group, and a member limited to
+      // some groups cannot reach it until it has one.
+      let group_differs = stat.metadata.as_ref().is_some_and(|meta| {
+        meta.get(GROUP_ID_META_KEY).map(String::as_str) != Some(group_meta(profile).as_str())
+      }) && !GROUP_META_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+        && Self::is_team_seat().await;
+      if local_updated > remote_updated || group_differs {
+        self
+          .upload_profile_metadata(&profile_id, profile, &key_prefix)
+          .await?;
+      }
+      return Ok(profile.clone());
+    }
+
+    super::conflicts::note_download(
+      self.read_only,
+      "profile",
+      &profile_id,
+      Some(&profile.name),
+      local_updated,
+      profile.last_sync,
+      remote_updated,
+    );
+    let mut remote = self.download_profile_metadata(&remote_key).await?;
+    // Process state is device-local and deliberately stripped from uploads.
+    remote.process_id = profile.process_id;
+    remote.last_launch = profile.last_launch;
+    remote.last_sync = profile.last_sync;
+    ProfileManager::instance()
+      .save_profile(&remote)
+      .map_err(|e| SyncError::IoError(format!("Failed to save remote profile metadata: {e}")))?;
+    Ok(remote)
+  }
+
+  /// Sync only metadata for profiles bound to another OS (tags, notes,
+  /// proxies, groups). No browser files are synced.
+  async fn sync_cross_os_metadata(
+    &self,
+    app_handle: &tauri::AppHandle,
+    profile: &BrowserProfile,
+  ) -> SyncResult<()> {
+    let profile_id = profile.id.to_string();
+    let reconciled_profile = self.reconcile_profile_metadata(profile).await?;
+    let profile = &reconciled_profile;
+
+    // Sync associated entities
+    if let Some(proxy_id) = &profile.proxy_id {
+      let _ = self.sync_proxy(proxy_id, Some(app_handle)).await;
+    }
+    if let Some(group_id) = &profile.group_id {
+      let _ = self.sync_group(group_id, Some(app_handle)).await;
+    }
+
+    let _ = events::emit("profiles-changed", ());
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "status": "synced"
+      }),
+    );
+
+    log::debug!("Cross-OS profile metadata synced profile={profile_id}");
+    Ok(())
+  }
+
+  async fn upload_profile_metadata(
+    &self,
+    profile_id: &str,
+    profile: &BrowserProfile,
+    key_prefix: &str,
+  ) -> SyncResult<()> {
+    let mut sanitized = profile.clone();
+    sanitized.process_id = None;
+    sanitized.last_launch = None;
+    sanitized.last_sync = None; // Avoid triggering sync loop on timestamp change
+
+    let json = serde_json::to_string_pretty(&sanitized)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize profile: {e}")))?;
+
+    let remote_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
+    let meta = HashMap::from([(GROUP_ID_META_KEY.to_string(), group_meta(&sanitized))]);
+    self
+      .upload_config_json_with(&remote_key, &json, sanitized.updated_at.unwrap_or(0), meta)
+      .await?;
+
+    Ok(())
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  async fn upload_profile_files(
+    &self,
+    _app_handle: &tauri::AppHandle,
+    profile_id: &str,
+    profile_name: &str,
+    profile_dir: &Path,
+    files: &[super::manifest::ManifestFileEntry],
+    encryption_key: Option<&[u8; 32]>,
+    key_prefix: &str,
+    cancel_flag: &Arc<AtomicBool>,
+  ) -> SyncResult<()> {
+    if files.is_empty() {
+      return Ok(());
+    }
+
+    // Load resume state to skip already-uploaded files
+    let mut resume_state = SyncResumeState::load(profile_dir)
+      .filter(|s| s.profile_id == profile_id && s.direction == "upload");
+
+    let already_done: HashSet<String> = resume_state
+      .as_ref()
+      .map(|s| s.completed_files.clone())
+      .unwrap_or_default();
+
+    let files_to_process: Vec<_> = files
+      .iter()
+      .filter(|f| !already_done.contains(&f.path))
+      .collect();
+    let skipped = files.len() - files_to_process.len();
+
+    if skipped > 0 {
+      log::info!(
+        "Profile upload resumed profile={profile_id} done={skipped} left={}",
+        files_to_process.len()
+      );
+    }
+
+    if files_to_process.is_empty() {
+      return Ok(());
+    }
+
+    // Initialize resume state if not resuming
+    if resume_state.is_none() {
+      resume_state = Some(SyncResumeState {
+        profile_id: profile_id.to_string(),
+        direction: "upload".to_string(),
+        started_at: Utc::now().to_rfc3339(),
+        completed_files: HashSet::new(),
+      });
+    }
+    let resume_state = Arc::new(TokioMutex::new(resume_state.unwrap()));
+
+    // Get batch presigned URLs
+    let items: Vec<(String, Option<String>)> = files_to_process
+      .iter()
+      .map(|f| {
+        let key = format!("{}profiles/{}/files/{}", key_prefix, profile_id, f.path);
+        let content_type = mime_guess::from_path(&f.path)
+          .first()
+          .map(|m| m.to_string());
+        (key, content_type)
+      })
+      .collect();
+
+    let batch_response = self.client.presign_upload_batch(items).await?;
+
+    // Build URL map
+    let url_map: HashMap<String, String> = batch_response
+      .items
+      .into_iter()
+      .map(|item| (item.key, item.url))
+      .collect();
+
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let already_bytes: u64 = files
+      .iter()
+      .filter(|f| already_done.contains(&f.path))
+      .map(|f| f.size)
+      .sum();
+
+    let tracker = Arc::new(SyncProgressTracker::new(
+      profile_id.to_string(),
+      profile_name.to_string(),
+      "uploading",
+      files.len() as u64,
+      total_bytes,
+    ));
+    // Pre-populate tracker with resumed progress
+    tracker
+      .completed_files
+      .store(skipped as u64, Ordering::Relaxed);
+    tracker
+      .completed_bytes
+      .store(already_bytes, Ordering::Relaxed);
+    tracker.emit_final();
+
+    let semaphore = Arc::new(Semaphore::new(SYNC_CONCURRENCY));
+    let client = self.client.clone();
+    let profile_dir = profile_dir.to_path_buf();
+    let profile_id_owned = profile_id.to_string();
+    let enc_key = encryption_key.copied();
+
+    type FileResult = Result<String, (String, String, bool)>;
+    let mut handles: Vec<tokio::task::JoinHandle<FileResult>> = Vec::new();
+
+    // Counter for batching resume state saves
+    let save_counter = Arc::new(AtomicU64::new(0));
+
+    for file in &files_to_process {
+      if cancel_flag.load(Ordering::Relaxed) {
+        log::debug!("Profile upload cancelled profile={profile_id_owned}");
+        break;
+      }
+      // Reject paths that would escape the profile dir (path traversal /
+      // absolute path). On download the manifest is remote-controlled, so this
+      // is the load-bearing containment check; on upload it is defense-in-depth.
+      // Legitimate profile files are always plain relative paths, so a real file
+      // is never skipped.
+      if !is_safe_manifest_path(&file.path) {
+        log::warn!("Unsafe manifest path skipped path={:?}", file.path);
+        continue;
+      }
+      let sem = semaphore.clone();
+      let file_path = profile_dir.join(&file.path);
+      let relative_path = file.path.clone();
+      let file_size = file.size;
+      let remote_key = format!(
+        "{}profiles/{}/files/{}",
+        key_prefix, profile_id_owned, file.path
+      );
+      let url = url_map.get(&remote_key).cloned();
+      let critical = is_critical_file(&file.path);
+
+      if url.is_none() {
+        log::warn!("Presigned URL missing key={remote_key}");
+        if critical {
+          return Err(SyncError::NetworkError(format!(
+            "No presigned URL for critical file: {}",
+            file.path
+          )));
+        }
+        continue;
+      }
+
+      let url = url.unwrap();
+      let client = client.clone();
+      let tracker = tracker.clone();
+      let resume_state = resume_state.clone();
+      let save_counter = save_counter.clone();
+      let profile_dir_clone = profile_dir.clone();
+      let cancel_flag_task = cancel_flag.clone();
+      let content_type = mime_guess::from_path(&file.path)
+        .first()
+        .map(|m| m.to_string());
+
+      handles.push(tokio::spawn(async move {
+        let _permit = sem.acquire().await.unwrap();
+
+        if cancel_flag_task.load(Ordering::Relaxed) {
+          return Err((relative_path, "cancelled".to_string(), false));
+        }
+
+        let data = match fs::read(&file_path) {
+          Ok(d) => d,
+          Err(e) if e.kind() == std::io::ErrorKind::NotFound && !critical => {
+            log::debug!("File gone before upload path={relative_path}");
+            tracker.record_success(0);
+            return Ok(relative_path);
+          }
+          Err(e) => {
+            let msg = format!("Failed to read {}: {}", file_path.display(), e);
+            log::debug!("{msg}");
+            tracker.record_failure();
+            return Err((relative_path, msg, critical));
+          }
+        };
+
+        let upload_data = if let Some(ref key) = enc_key {
+          match encryption::encrypt_bytes(key, &data) {
+            Ok(encrypted) => encrypted,
+            Err(e) => {
+              let msg = format!("Failed to encrypt {}: {}", file_path.display(), e);
+              log::debug!("{msg}");
+              tracker.record_failure();
+              return Err((relative_path, msg, critical));
+            }
+          }
+        } else {
+          data
+        };
+
+        // Retry loop for network uploads
+        let mut last_err = String::new();
+        for attempt in 0..MAX_FILE_RETRIES {
+          match client
+            .upload_bytes(&url, &upload_data, content_type.as_deref())
+            .await
+          {
+            Ok(()) => {
+              tracker.record_success(file_size);
+
+              // Record in resume state, save periodically
+              {
+                let mut state = resume_state.lock().await;
+                state.completed_files.insert(relative_path.clone());
+                let count = save_counter.fetch_add(1, Ordering::Relaxed);
+                if count.is_multiple_of(50) {
+                  let _ = state.save(&profile_dir_clone);
+                }
+              }
+
+              return Ok(relative_path);
+            }
+            Err(e) => {
+              last_err = format!("{}", e);
+              if attempt < MAX_FILE_RETRIES - 1 {
+                log::debug!(
+                  "File transfer retry attempt={} of={MAX_FILE_RETRIES} path={relative_path} err=\"{last_err}\"",
+                  attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)))
+                  .await;
+              }
+            }
+          }
+        }
+
+        let msg = format!(
+          "Failed to upload {} after {} retries: {}",
+          relative_path, MAX_FILE_RETRIES, last_err
+        );
+        log::debug!("{msg}");
+        tracker.record_failure();
+        Err((relative_path, msg, critical))
+      }));
+    }
+
+    // Collect results
+    let mut critical_failures = Vec::new();
+    let mut non_critical_failures = Vec::new();
+
+    for handle in handles {
+      match handle.await {
+        Ok(Ok(_)) => {}
+        Ok(Err((path, msg, true))) => critical_failures.push((path, msg)),
+        Ok(Err((path, msg, false))) => non_critical_failures.push((path, msg)),
+        Err(e) => {
+          log::warn!("Profile upload task panicked err=\"{e}\"");
+        }
+      }
+    }
+
+    // Final resume state save
+    {
+      let state = resume_state.lock().await;
+      let _ = state.save(&profile_dir);
+    }
+
+    tracker.emit_final();
+
+    if let Some((_, first)) = non_critical_failures.first() {
+      log::warn!(
+        "Profile upload skipped non-critical files profile={profile_id_owned} failed={} first_err=\"{first}\"",
+        non_critical_failures.len()
+      );
+    }
+
+    if !critical_failures.is_empty() {
+      return Err(SyncError::IoError(critical_failure_message(
+        "upload",
+        &critical_failures,
+      )));
+    }
+
+    Ok(())
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  async fn download_profile_files(
+    &self,
+    _app_handle: &tauri::AppHandle,
+    profile_id: &str,
+    profile_name: &str,
+    profile_dir: &Path,
+    files: &[super::manifest::ManifestFileEntry],
+    encryption_key: Option<&[u8; 32]>,
+    key_prefix: &str,
+    cancel_flag: &Arc<AtomicBool>,
+  ) -> SyncResult<()> {
+    if files.is_empty() {
+      return Ok(());
+    }
+
+    // Load resume state to skip already-downloaded files
+    let mut resume_state = SyncResumeState::load(profile_dir)
+      .filter(|s| s.profile_id == profile_id && s.direction == "download");
+
+    let already_done: HashSet<String> = resume_state
+      .as_ref()
+      .map(|s| s.completed_files.clone())
+      .unwrap_or_default();
+
+    let files_to_process: Vec<_> = files
+      .iter()
+      .filter(|f| !already_done.contains(&f.path))
+      .collect();
+    let skipped = files.len() - files_to_process.len();
+
+    if skipped > 0 {
+      log::info!(
+        "Profile download resumed profile={profile_id} done={skipped} left={}",
+        files_to_process.len()
+      );
+    }
+
+    if files_to_process.is_empty() {
+      return Ok(());
+    }
+
+    // Initialize resume state if not resuming
+    if resume_state.is_none() {
+      resume_state = Some(SyncResumeState {
+        profile_id: profile_id.to_string(),
+        direction: "download".to_string(),
+        started_at: Utc::now().to_rfc3339(),
+        completed_files: HashSet::new(),
+      });
+    }
+    let resume_state = Arc::new(TokioMutex::new(resume_state.unwrap()));
+
+    // Get batch presigned URLs
+    let keys: Vec<String> = files_to_process
+      .iter()
+      .map(|f| format!("{}profiles/{}/files/{}", key_prefix, profile_id, f.path))
+      .collect();
+
+    let batch_response = self.client.presign_download_batch(keys).await?;
+
+    // Build URL map
+    let url_map: HashMap<String, String> = batch_response
+      .items
+      .into_iter()
+      .map(|item| (item.key, item.url))
+      .collect();
+
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let already_bytes: u64 = files
+      .iter()
+      .filter(|f| already_done.contains(&f.path))
+      .map(|f| f.size)
+      .sum();
+
+    let tracker = Arc::new(SyncProgressTracker::new(
+      profile_id.to_string(),
+      profile_name.to_string(),
+      "downloading",
+      files.len() as u64,
+      total_bytes,
+    ));
+    tracker
+      .completed_files
+      .store(skipped as u64, Ordering::Relaxed);
+    tracker
+      .completed_bytes
+      .store(already_bytes, Ordering::Relaxed);
+    tracker.emit_final();
+
+    let semaphore = Arc::new(Semaphore::new(SYNC_CONCURRENCY));
+    let client = self.client.clone();
+    let profile_dir = profile_dir.to_path_buf();
+    let profile_id_owned = profile_id.to_string();
+    let enc_key = encryption_key.copied();
+
+    type FileResult = Result<String, (String, String, bool)>;
+    let mut handles: Vec<tokio::task::JoinHandle<FileResult>> = Vec::new();
+
+    let save_counter = Arc::new(AtomicU64::new(0));
+
+    for file in &files_to_process {
+      if cancel_flag.load(Ordering::Relaxed) {
+        log::debug!("Profile download cancelled profile={profile_id_owned}");
+        break;
+      }
+      // Reject paths that would escape the profile dir (path traversal /
+      // absolute path). On download the manifest is remote-controlled, so this
+      // is the load-bearing containment check; on upload it is defense-in-depth.
+      // Legitimate profile files are always plain relative paths, so a real file
+      // is never skipped.
+      if !is_safe_manifest_path(&file.path) {
+        log::warn!("Unsafe manifest path skipped path={:?}", file.path);
+        continue;
+      }
+      let sem = semaphore.clone();
+      let file_path = profile_dir.join(&file.path);
+      let relative_path = file.path.clone();
+      let file_size = file.size;
+      let remote_key = format!(
+        "{}profiles/{}/files/{}",
+        key_prefix, profile_id_owned, file.path
+      );
+      let url = url_map.get(&remote_key).cloned();
+      let critical = is_critical_file(&file.path);
+
+      if url.is_none() {
+        log::warn!("Presigned URL missing key={remote_key}");
+        if critical {
+          return Err(SyncError::NetworkError(format!(
+            "No presigned URL for critical file: {}",
+            file.path
+          )));
+        }
+        continue;
+      }
+
+      let url = url.unwrap();
+      let client = client.clone();
+      let tracker = tracker.clone();
+      let resume_state = resume_state.clone();
+      let save_counter = save_counter.clone();
+      let profile_dir_clone = profile_dir.clone();
+      let cancel_flag_task = cancel_flag.clone();
+
+      handles.push(tokio::spawn(async move {
+        let _permit = sem.acquire().await.unwrap();
+
+        if cancel_flag_task.load(Ordering::Relaxed) {
+          return Err((relative_path, "cancelled".to_string(), false));
+        }
+
+        // Retry loop for network downloads
+        let mut last_err = String::new();
+        for attempt in 0..MAX_FILE_RETRIES {
+          if cancel_flag_task.load(Ordering::Relaxed) {
+            return Err((relative_path, "cancelled".to_string(), false));
+          }
+          match client.download_bytes(&url).await {
+            Ok(data) => {
+              let write_data = if let Some(ref key) = enc_key {
+                match encryption::decrypt_bytes(key, &data) {
+                  Ok(decrypted) => decrypted,
+                  Err(e) => {
+                    let msg = format!("Failed to decrypt {}: {}", relative_path, e);
+                    log::debug!("{msg}");
+                    tracker.record_failure();
+                    return Err((relative_path, msg, critical));
+                  }
+                }
+              } else {
+                data
+              };
+
+              if let Some(parent) = file_path.parent() {
+                let _ = fs::create_dir_all(parent);
+              }
+              if let Err(e) = fs::write(&file_path, &write_data) {
+                let msg = format!("Failed to write {}: {}", file_path.display(), e);
+                log::debug!("{msg}");
+                tracker.record_failure();
+                return Err((relative_path, msg, critical));
+              }
+
+              tracker.record_success(file_size);
+
+              {
+                let mut state = resume_state.lock().await;
+                state.completed_files.insert(relative_path.clone());
+                let count = save_counter.fetch_add(1, Ordering::Relaxed);
+                if count.is_multiple_of(50) {
+                  let _ = state.save(&profile_dir_clone);
+                }
+              }
+
+              return Ok(relative_path);
+            }
+            Err(e) => {
+              last_err = format!("{}", e);
+              if attempt < MAX_FILE_RETRIES - 1 {
+                log::debug!(
+                  "File transfer retry attempt={} of={MAX_FILE_RETRIES} path={relative_path} err=\"{last_err}\"",
+                  attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)))
+                  .await;
+              }
+            }
+          }
+        }
+
+        let msg = format!(
+          "Failed to download {} after {} retries: {}",
+          relative_path, MAX_FILE_RETRIES, last_err
+        );
+        log::debug!("{msg}");
+        tracker.record_failure();
+        Err((relative_path, msg, critical))
+      }));
+    }
+
+    let mut critical_failures = Vec::new();
+    let mut non_critical_failures = Vec::new();
+
+    for handle in handles {
+      match handle.await {
+        Ok(Ok(_)) => {}
+        Ok(Err((path, msg, true))) => critical_failures.push((path, msg)),
+        Ok(Err((path, msg, false))) => non_critical_failures.push((path, msg)),
+        Err(e) => {
+          log::warn!("Profile download task panicked err=\"{e}\"");
+        }
+      }
+    }
+
+    // Final resume state save
+    {
+      let state = resume_state.lock().await;
+      let _ = state.save(&profile_dir);
+    }
+
+    tracker.emit_final();
+
+    if let Some((_, first)) = non_critical_failures.first() {
+      log::warn!(
+        "Profile download skipped non-critical files profile={profile_id_owned} failed={} first_err=\"{first}\"",
+        non_critical_failures.len()
+      );
+    }
+
+    if !critical_failures.is_empty() {
+      return Err(SyncError::IoError(critical_failure_message(
+        "download",
+        &critical_failures,
+      )));
+    }
+
+    Ok(())
+  }
+
+  async fn sync_proxy(
+    &self,
+    proxy_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let proxy_manager = &crate::proxy_manager::PROXY_MANAGER;
+    let proxies = proxy_manager.get_stored_proxies();
+    let local_proxy = proxies.iter().find(|p| p.id == proxy_id).cloned();
+
+    let local_updated_at = local_proxy.as_ref().and_then(|p| p.updated_at).unwrap_or(0);
+    if self
+      .tombstone_blocks("proxies", proxy_id, local_updated_at)
+      .await?
+    {
+      return Ok(());
+    }
+
+    let remote_key = format!("proxies/{}.json", proxy_id);
+    let stat = self.client.stat(&remote_key).await?;
+
+    match (local_proxy, stat.exists) {
+      (Some(proxy), true) => {
+        // Both exist - resolve by user-edit timestamp (last-write-wins).
+        let remote_updated = self.remote_updated_at(&stat, &remote_key).await;
+
+        if self.remote_wins(local_updated_at, remote_updated) {
+          super::conflicts::note_download(
+            self.read_only,
+            "proxy",
+            proxy_id,
+            Some(&proxy.name),
+            local_updated_at,
+            proxy.last_sync,
+            remote_updated,
+          );
+          self.download_proxy(proxy_id, app_handle).await?;
+        } else if local_updated_at > remote_updated {
+          self.upload_proxy(&proxy).await?;
+        }
+      }
+      (Some(proxy), false) => {
+        // Only local exists - upload
+        self.upload_proxy(&proxy).await?;
+      }
+      (None, true) => {
+        // Only remote exists - download
+        self.download_proxy(proxy_id, app_handle).await?;
+      }
+      (None, false) => {
+        // Neither exists - nothing to do
+        log::debug!("Sync no-op, missing on both sides proxy={proxy_id}");
+      }
+    }
+
+    Ok(())
+  }
+
+  async fn upload_proxy(&self, proxy: &crate::proxy_manager::StoredProxy) -> SyncResult<()> {
+    let mut updated_proxy = proxy.clone();
+    updated_proxy.last_sync = Some(
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs(),
+    );
+
+    let json = serde_json::to_string_pretty(&updated_proxy)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize proxy: {e}")))?;
+
+    let remote_key = format!("proxies/{}.json", proxy.id);
+    self
+      .upload_config_json(&remote_key, &json, updated_proxy.updated_at.unwrap_or(0))
+      .await?;
+
+    // Update local proxy with new last_sync (always write plaintext locally)
+    let proxy_manager = &crate::proxy_manager::PROXY_MANAGER;
+    let proxy_file = proxy_manager.get_proxy_file_path(&proxy.id);
+    fs::write(&proxy_file, &json).map_err(|e| {
+      SyncError::IoError(format!(
+        "Failed to update proxy file {}: {e}",
+        proxy_file.display()
+      ))
+    })?;
+
+    log::info!("Proxy uploaded proxy={}", proxy.id);
+    crate::cookie_bot::report_profiles_using_proxy(&proxy.id);
+    Ok(())
+  }
+
+  async fn download_proxy(
+    &self,
+    proxy_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let remote_key = format!("proxies/{}.json", proxy_id);
+    let presign = self.client.presign_download(&remote_key).await?;
+    let raw = self.client.download_bytes(&presign.url).await?;
+
+    let data = encryption::maybe_unseal_after_download(&raw)
+      .map_err(|e| SyncError::InvalidData(format!("Failed to unseal proxy: {e}")))?;
+
+    let mut proxy: crate::proxy_manager::StoredProxy = serde_json::from_slice(&data)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to parse proxy JSON: {e}")))?;
+
+    proxy.last_sync = Some(super::conflicts::synced_at(proxy.updated_at));
+
+    // The id names the file below, and the JSON came from the server.
+    if !crate::app_dirs::is_plain_path_part(&proxy.id) {
+      return Err(SyncError::InvalidData(
+        "Remote proxy has an unsafe id".to_string(),
+      ));
+    }
+
+    let proxy_manager = &crate::proxy_manager::PROXY_MANAGER;
+    let proxy_file = proxy_manager.get_proxy_file_path(&proxy.id);
+    if let Some(parent) = proxy_file.parent() {
+      fs::create_dir_all(parent).map_err(|e| {
+        SyncError::IoError(format!(
+          "Failed to create proxy directory {}: {e}",
+          parent.display()
+        ))
+      })?;
+    }
+
+    let json = serde_json::to_string_pretty(&proxy)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize proxy: {e}")))?;
+    fs::write(&proxy_file, &json).map_err(|e| {
+      SyncError::IoError(format!(
+        "Failed to write proxy file {}: {e}",
+        proxy_file.display()
+      ))
+    })?;
+
+    // Keep the in-memory cache in sync with disk. Without this, get_stored_proxies
+    // (which reads only the in-memory map) never sees the downloaded proxy until
+    // restart, so check_for_missing_synced_entities/sync_proxy treat it as
+    // missing every pass and re-download it forever. Mirrors download_group/
+    // download_vpn/download_extension.
+    proxy_manager.upsert_stored_proxy(proxy.clone());
+
+    // Emit event for UI update
+    if let Some(_handle) = app_handle {
+      let _ = events::emit("stored-proxies-changed", ());
+      let _ = events::emit(
+        "proxy-sync-status",
+        serde_json::json!({
+          "id": proxy_id,
+          "status": "synced"
+        }),
+      );
+    }
+
+    log::info!("Proxy downloaded proxy={proxy_id}");
+    Ok(())
+  }
+
+  async fn sync_group(
+    &self,
+    group_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let local_group = {
+      let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+      let groups = group_manager.get_all_groups().unwrap_or_default();
+      groups.into_iter().find(|g| g.id == group_id)
+    };
+
+    let local_updated_at = local_group.as_ref().and_then(|g| g.updated_at).unwrap_or(0);
+    if self
+      .tombstone_blocks("groups", group_id, local_updated_at)
+      .await?
+    {
+      return Ok(());
+    }
+
+    let remote_key = format!("groups/{}.json", group_id);
+    let stat = self.client.stat(&remote_key).await?;
+
+    match (local_group, stat.exists) {
+      (Some(group), true) => {
+        // Both exist - resolve by user-edit timestamp (last-write-wins).
+        let remote_updated = self.remote_updated_at(&stat, &remote_key).await;
+
+        if self.remote_wins(local_updated_at, remote_updated) {
+          super::conflicts::note_download(
+            self.read_only,
+            "group",
+            group_id,
+            Some(&group.name),
+            local_updated_at,
+            group.last_sync,
+            remote_updated,
+          );
+          self.download_group(group_id, app_handle).await?;
+        } else if local_updated_at > remote_updated {
+          self.upload_group(&group).await?;
+        }
+      }
+      (Some(group), false) => {
+        // Only local exists - upload
+        self.upload_group(&group).await?;
+      }
+      (None, true) => {
+        // Only remote exists - download
+        self.download_group(group_id, app_handle).await?;
+      }
+      (None, false) => {
+        // Neither exists - nothing to do
+        log::debug!("Sync no-op, missing on both sides group={group_id}");
+      }
+    }
+
+    Ok(())
+  }
+
+  async fn upload_group(&self, group: &crate::group_manager::ProfileGroup) -> SyncResult<()> {
+    let mut updated_group = group.clone();
+    updated_group.last_sync = Some(
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs(),
+    );
+
+    let json = serde_json::to_string_pretty(&updated_group)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize group: {e}")))?;
+
+    let remote_key = format!("groups/{}.json", group.id);
+    self
+      .upload_config_json(&remote_key, &json, updated_group.updated_at.unwrap_or(0))
+      .await?;
+
+    // Update local group with new last_sync
+    {
+      let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+      if let Err(e) = group_manager.update_group_internal(&updated_group) {
+        log::warn!("Group last_sync not saved group={} err=\"{e}\"", group.id);
+      }
+    }
+
+    log::info!("Group uploaded group={}", group.id);
+    Ok(())
+  }
+
+  async fn download_group(
+    &self,
+    group_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let remote_key = format!("groups/{}.json", group_id);
+    let presign = self.client.presign_download(&remote_key).await?;
+    let raw = self.client.download_bytes(&presign.url).await?;
+
+    let data = encryption::maybe_unseal_after_download(&raw)
+      .map_err(|e| SyncError::InvalidData(format!("Failed to unseal group: {e}")))?;
+
+    let mut group: crate::group_manager::ProfileGroup = serde_json::from_slice(&data)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to parse group JSON: {e}")))?;
+
+    group.last_sync = Some(super::conflicts::synced_at(group.updated_at));
+
+    // Save or update local group
+    {
+      let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+      if let Err(e) = group_manager.upsert_group_internal(&group) {
+        log::warn!("Downloaded group not saved group={group_id} err=\"{e}\"");
+      }
+    }
+
+    // Emit event for UI update
+    if let Some(_handle) = app_handle {
+      let _ = events::emit("groups-changed", ());
+      let _ = events::emit(
+        "group-sync-status",
+        serde_json::json!({
+          "id": group_id,
+          "status": "synced"
+        }),
+      );
+    }
+
+    log::info!("Group downloaded group={group_id}");
+    Ok(())
+  }
+
+  pub async fn sync_proxy_by_id(&self, proxy_id: &str) -> SyncResult<()> {
+    self.sync_proxy(proxy_id, None).await
+  }
+
+  pub async fn sync_proxy_by_id_with_handle(
+    &self,
+    proxy_id: &str,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    self.sync_proxy(proxy_id, Some(app_handle)).await
+  }
+
+  pub async fn sync_group_by_id(&self, group_id: &str) -> SyncResult<()> {
+    self.sync_group(group_id, None).await
+  }
+
+  pub async fn sync_group_by_id_with_handle(
+    &self,
+    group_id: &str,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    self.sync_group(group_id, Some(app_handle)).await
+  }
+
+  pub async fn delete_profile(&self, profile_id: &str) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("profile={profile_id}")) {
+      return Ok(());
+    }
+    let prefix = format!("profiles/{}/", profile_id);
+    let tombstone_key = format!("tombstones/profiles/{}.json", profile_id);
+
+    let result = self
+      .client
+      .delete_prefix(&prefix, Some(&tombstone_key))
+      .await?;
+
+    log::info!(
+      "Profile deleted from cloud profile={profile_id} objects={}",
+      result.deleted_count
+    );
+
+    // Also delete from team path if user is on a team
+    if let Some(auth) = crate::cloud_auth::CLOUD_AUTH.get_user().await {
+      if let Some(team_id) = &auth.user.team_id {
+        let team_prefix = format!("teams/{}/profiles/{}/", team_id, profile_id);
+        let team_tombstone = format!("teams/{}/tombstones/profiles/{}.json", team_id, profile_id);
+        let team_result = self
+          .client
+          .delete_prefix(&team_prefix, Some(&team_tombstone))
+          .await?;
+        if team_result.deleted_count > 0 {
+          log::info!(
+            "Profile deleted from team cloud profile={profile_id} objects={}",
+            team_result.deleted_count
+          );
+        }
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Whether the cloud still holds a tombstone for `profile`, personal or team.
+  /// A failed check counts as no: a skipped erase is retried by the next
+  /// reconcile, and an erase cannot be undone.
+  pub async fn profile_tombstone_exists(&self, profile: &BrowserProfile) -> bool {
+    for key in Self::profile_tombstone_keys(profile).await {
+      match self.client.stat(&key).await {
+        Ok(stat) if stat.exists => {
+          TOMBSTONE_CHECK.succeeded(&format!("key={key}"));
+          return true;
+        }
+        Ok(_) => TOMBSTONE_CHECK.succeeded(&format!("key={key}")),
+        Err(e) => {
+          TOMBSTONE_CHECK.failed(&format!("key={key}"), e);
+          return false;
+        }
+      }
+    }
+    false
+  }
+
+  async fn delete_profile_tombstones(&self, profile: &BrowserProfile) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("tombstone profile={}", profile.id)) {
+      return Ok(());
+    }
+    for key in Self::profile_tombstone_keys(profile).await {
+      self.client.delete(&key, None).await?;
+    }
+    Ok(())
+  }
+
+  async fn profile_tombstone_keys(profile: &BrowserProfile) -> Vec<String> {
+    let profile_id = profile.id.to_string();
+    let mut keys = vec![format!("tombstones/profiles/{profile_id}.json")];
+    let key_prefix = Self::get_team_key_prefix(profile).await;
+    if !key_prefix.is_empty() {
+      keys.push(format!("{key_prefix}tombstones/profiles/{profile_id}.json"));
+    }
+    keys
+  }
+
+  pub async fn delete_proxy(&self, proxy_id: &str) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("proxy={proxy_id}")) {
+      return Ok(());
+    }
+    let remote_key = format!("proxies/{}.json", proxy_id);
+    let tombstone_key = format!("tombstones/proxies/{}.json", proxy_id);
+
+    self
+      .client
+      .delete(&remote_key, Some(&tombstone_key))
+      .await?;
+
+    log::info!("Proxy deleted from cloud proxy={proxy_id}");
+    Ok(())
+  }
+
+  pub async fn delete_group(&self, group_id: &str) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("group={group_id}")) {
+      return Ok(());
+    }
+    let remote_key = format!("groups/{}.json", group_id);
+    let tombstone_key = format!("tombstones/groups/{}.json", group_id);
+
+    self
+      .client
+      .delete(&remote_key, Some(&tombstone_key))
+      .await?;
+
+    log::info!("Group deleted from cloud group={group_id}");
+    Ok(())
+  }
+
+  async fn sync_vpn(&self, vpn_id: &str, app_handle: Option<&tauri::AppHandle>) -> SyncResult<()> {
+    let local_vpn = {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      storage.load_config(vpn_id).ok()
+    };
+
+    let local_updated_at = local_vpn.as_ref().and_then(|v| v.updated_at).unwrap_or(0);
+    if self
+      .tombstone_blocks("vpns", vpn_id, local_updated_at)
+      .await?
+    {
+      return Ok(());
+    }
+
+    let remote_key = format!("vpns/{}.json", vpn_id);
+    let stat = self.client.stat(&remote_key).await?;
+
+    match (local_vpn, stat.exists) {
+      (Some(vpn), true) => {
+        // Both exist - resolve by user-edit timestamp (last-write-wins).
+        let remote_updated = self.remote_updated_at(&stat, &remote_key).await;
+
+        if self.remote_wins(local_updated_at, remote_updated) {
+          super::conflicts::note_download(
+            self.read_only,
+            "vpn",
+            vpn_id,
+            Some(&vpn.name),
+            local_updated_at,
+            vpn.last_sync,
+            remote_updated,
+          );
+          self.download_vpn(vpn_id, app_handle).await?;
+        } else if local_updated_at > remote_updated {
+          self.upload_vpn(&vpn).await?;
+        }
+      }
+      (Some(vpn), false) => {
+        self.upload_vpn(&vpn).await?;
+      }
+      (None, true) => {
+        self.download_vpn(vpn_id, app_handle).await?;
+      }
+      (None, false) => {
+        log::debug!("Sync no-op, missing on both sides vpn={vpn_id}");
+      }
+    }
+
+    Ok(())
+  }
+
+  async fn upload_vpn(&self, vpn: &crate::vpn::VpnConfig) -> SyncResult<()> {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+
+    let mut updated_vpn = vpn.clone();
+    updated_vpn.last_sync = Some(now);
+
+    let json = serde_json::to_string_pretty(&updated_vpn)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize VPN: {e}")))?;
+
+    let remote_key = format!("vpns/{}.json", vpn.id);
+    self
+      .upload_config_json(&remote_key, &json, updated_vpn.updated_at.unwrap_or(0))
+      .await?;
+
+    // Update local VPN with new last_sync
+    {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      if let Err(e) = storage.update_sync_fields(&vpn.id, vpn.sync_enabled, Some(now)) {
+        log::warn!("VPN last_sync not saved vpn={} err=\"{e}\"", vpn.id);
+      }
+    }
+
+    log::info!("VPN uploaded vpn={}", vpn.id);
+    crate::cookie_bot::report_profiles_using_vpn(&vpn.id);
+    Ok(())
+  }
+
+  async fn download_vpn(
+    &self,
+    vpn_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let remote_key = format!("vpns/{}.json", vpn_id);
+    let presign = self.client.presign_download(&remote_key).await?;
+    let raw = self.client.download_bytes(&presign.url).await?;
+
+    let data = encryption::maybe_unseal_after_download(&raw)
+      .map_err(|e| SyncError::InvalidData(format!("Failed to unseal VPN: {e}")))?;
+
+    let mut vpn: crate::vpn::VpnConfig = serde_json::from_slice(&data)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to parse VPN JSON: {e}")))?;
+
+    // Sync is not a second way in for a config the import path refuses: a
+    // multi-peer file resolves to whichever peer is listed last at connect
+    // time, which is not the tunnel its author described.
+    crate::vpn::VpnStorage::ensure_single_peer(vpn.vpn_type, &vpn.config_data)
+      .map_err(|e| SyncError::InvalidData(format!("Rejected synced VPN {vpn_id}: {e}")))?;
+
+    vpn.last_sync = Some(super::conflicts::synced_at(vpn.updated_at));
+    vpn.sync_enabled = true;
+
+    // Save via VPN storage (handles encryption)
+    {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      if let Err(e) = storage.save_config(&vpn) {
+        log::warn!("Downloaded VPN not saved vpn={vpn_id} err=\"{e}\"");
+      }
+    }
+
+    // Emit event for UI update
+    if let Some(_handle) = app_handle {
+      let _ = events::emit("vpn-configs-changed", ());
+      let _ = events::emit(
+        "vpn-sync-status",
+        serde_json::json!({
+          "id": vpn_id,
+          "status": "synced"
+        }),
+      );
+    }
+
+    log::info!("VPN downloaded vpn={vpn_id}");
+    Ok(())
+  }
+
+  pub async fn sync_vpn_by_id_with_handle(
+    &self,
+    vpn_id: &str,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    self.sync_vpn(vpn_id, Some(app_handle)).await
+  }
+
+  pub async fn delete_vpn(&self, vpn_id: &str) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("vpn={vpn_id}")) {
+      return Ok(());
+    }
+    let remote_key = format!("vpns/{}.json", vpn_id);
+    let tombstone_key = format!("tombstones/vpns/{}.json", vpn_id);
+
+    self
+      .client
+      .delete(&remote_key, Some(&tombstone_key))
+      .await?;
+
+    log::info!("VPN deleted from cloud vpn={vpn_id}");
+    Ok(())
+  }
+
+  // Extension sync
+
+  async fn sync_extension(
+    &self,
+    ext_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let local_ext = {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      manager.get_extension(ext_id).ok()
+    };
+
+    // A linked extension is an absolute path on this machine with no payload in
+    // the store. Uploading it would publish metadata another device could never
+    // resolve, so it stays local whatever queued this run.
+    if local_ext.as_ref().is_some_and(|e| e.is_linked()) {
+      return Ok(());
+    }
+
+    let local_updated_at = local_ext.as_ref().map_or(0, |e| e.updated_at);
+    if self
+      .tombstone_blocks("extensions", ext_id, local_updated_at)
+      .await?
+    {
+      return Ok(());
+    }
+
+    let remote_key = format!("extensions/{}.json", ext_id);
+    let stat = self.client.stat(&remote_key).await?;
+
+    match (local_ext, stat.exists) {
+      (Some(ext), true) => {
+        // Both exist - resolve by user-edit timestamp (last-write-wins).
+        let remote_updated = self.remote_updated_at(&stat, &remote_key).await;
+
+        if self.remote_wins(local_updated_at, remote_updated) {
+          super::conflicts::note_download(
+            self.read_only,
+            "extension",
+            ext_id,
+            Some(&ext.name),
+            local_updated_at,
+            ext.last_sync,
+            remote_updated,
+          );
+          self.download_extension(ext_id, app_handle).await?;
+        } else if local_updated_at > remote_updated {
+          self.upload_extension(&ext).await?;
+        }
+      }
+      (Some(ext), false) => {
+        self.upload_extension(&ext).await?;
+      }
+      (None, true) => {
+        self.download_extension(ext_id, app_handle).await?;
+      }
+      (None, false) => {
+        log::debug!("Sync no-op, missing on both sides extension={ext_id}");
+      }
+    }
+
+    Ok(())
+  }
+
+  async fn upload_extension(&self, ext: &crate::extension_manager::Extension) -> SyncResult<()> {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+
+    let mut updated_ext = ext.clone();
+    updated_ext.last_sync = Some(now);
+
+    let json = serde_json::to_string_pretty(&updated_ext)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize extension: {e}")))?;
+
+    let remote_key = format!("extensions/{}.json", ext.id);
+    self
+      .upload_config_json(&remote_key, &json, updated_ext.updated_at)
+      .await?;
+
+    // Also upload the extension file data — encrypted as a sealed envelope
+    // when E2E is on (the binary is the secret here, not just the metadata).
+    let file_path = {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      let file_dir = manager.get_file_dir_public(&ext.id);
+      file_dir.join(&ext.file_name)
+    };
+
+    if file_path.exists() {
+      let file_data = fs::read(&file_path).map_err(|e| {
+        SyncError::IoError(format!(
+          "Failed to read extension file {}: {e}",
+          file_path.display()
+        ))
+      })?;
+
+      let (file_payload, file_content_type) = encryption::maybe_seal_for_upload(&file_data)
+        .map_err(|e| SyncError::InvalidData(format!("Failed to seal extension file: {e}")))?;
+
+      let file_remote_key = format!("extensions/{}/file/{}", ext.id, ext.file_name);
+      let file_presign = self
+        .client
+        .presign_upload(&file_remote_key, Some(file_content_type))
+        .await?;
+      self
+        .client
+        .upload_bytes(&file_presign.url, &file_payload, Some(file_content_type))
+        .await?;
+    }
+
+    // Update local extension with new last_sync
+    {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      if let Err(e) = manager.update_extension_internal(&updated_ext) {
+        log::warn!(
+          "Extension last_sync not saved extension={} err=\"{e}\"",
+          ext.id
+        );
+      }
+    }
+
+    log::info!("Extension uploaded extension={}", ext.id);
+    Ok(())
+  }
+
+  async fn download_extension(
+    &self,
+    ext_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let remote_key = format!("extensions/{}.json", ext_id);
+    let presign = self.client.presign_download(&remote_key).await?;
+    let raw = self.client.download_bytes(&presign.url).await?;
+    let data = encryption::maybe_unseal_after_download(&raw)
+      .map_err(|e| SyncError::InvalidData(format!("Failed to unseal extension: {e}")))?;
+
+    let mut ext: crate::extension_manager::Extension = serde_json::from_slice(&data)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to parse extension JSON: {e}")))?;
+
+    ext.last_sync = Some(super::conflicts::synced_at(Some(ext.updated_at)));
+    ext.sync_enabled = true;
+
+    // Both become path parts below, and the JSON came from the server.
+    if !crate::app_dirs::is_plain_path_part(&ext.id)
+      || !crate::app_dirs::is_plain_path_part(&ext.file_name)
+    {
+      return Err(SyncError::InvalidData(
+        "Remote extension has an unsafe id or file name".to_string(),
+      ));
+    }
+
+    // Download the extension file
+    let file_remote_key = format!("extensions/{}/file/{}", ext.id, ext.file_name);
+    let file_stat = self.client.stat(&file_remote_key).await?;
+    if file_stat.exists {
+      let file_presign = self.client.presign_download(&file_remote_key).await?;
+      let file_raw = self.client.download_bytes(&file_presign.url).await?;
+      let file_data = encryption::maybe_unseal_after_download(&file_raw)
+        .map_err(|e| SyncError::InvalidData(format!("Failed to unseal extension file: {e}")))?;
+
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      let file_dir = manager.get_file_dir_public(&ext.id);
+      drop(manager);
+
+      fs::create_dir_all(&file_dir).map_err(|e| {
+        SyncError::IoError(format!(
+          "Failed to create extension file dir {}: {e}",
+          file_dir.display()
+        ))
+      })?;
+      let file_path = file_dir.join(&ext.file_name);
+      fs::write(&file_path, &file_data).map_err(|e| {
+        SyncError::IoError(format!(
+          "Failed to write extension file {}: {e}",
+          file_path.display()
+        ))
+      })?;
+    }
+
+    // Save or update local extension
+    {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      if let Err(e) = manager.upsert_extension_internal(&ext) {
+        log::warn!("Downloaded extension not saved extension={ext_id} err=\"{e}\"");
+      }
+    }
+
+    if let Some(_handle) = app_handle {
+      let _ = events::emit("extensions-changed", ());
+    }
+
+    log::info!("Extension downloaded extension={ext_id}");
+    Ok(())
+  }
+
+  pub async fn sync_extension_by_id_with_handle(
+    &self,
+    ext_id: &str,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    self.sync_extension(ext_id, Some(app_handle)).await
+  }
+
+  pub async fn delete_extension(&self, ext_id: &str) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("extension={ext_id}")) {
+      return Ok(());
+    }
+    let remote_key = format!("extensions/{}.json", ext_id);
+    let file_prefix = format!("extensions/{}/file/", ext_id);
+    let tombstone_key = format!("tombstones/extensions/{}.json", ext_id);
+
+    // Delete metadata
+    self
+      .client
+      .delete(&remote_key, Some(&tombstone_key))
+      .await?;
+
+    // Delete file data
+    let _ = self.client.delete_prefix(&file_prefix, None).await;
+
+    log::info!("Extension deleted from cloud extension={ext_id}");
+    Ok(())
+  }
+
+  // Extension group sync
+
+  async fn sync_extension_group(
+    &self,
+    group_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let local_group = {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      manager.get_group(group_id).ok()
+    };
+
+    let local_updated_at = local_group.as_ref().map_or(0, |g| g.updated_at);
+    if self
+      .tombstone_blocks("extension_groups", group_id, local_updated_at)
+      .await?
+    {
+      return Ok(());
+    }
+
+    let remote_key = format!("extension_groups/{}.json", group_id);
+    let stat = self.client.stat(&remote_key).await?;
+
+    match (local_group, stat.exists) {
+      (Some(group), true) => {
+        // Both exist - resolve by user-edit timestamp (last-write-wins).
+        let remote_updated = self.remote_updated_at(&stat, &remote_key).await;
+
+        if self.remote_wins(local_updated_at, remote_updated) {
+          super::conflicts::note_download(
+            self.read_only,
+            "extension_group",
+            group_id,
+            Some(&group.name),
+            local_updated_at,
+            group.last_sync,
+            remote_updated,
+          );
+          self.download_extension_group(group_id, app_handle).await?;
+        } else if local_updated_at > remote_updated {
+          self.upload_extension_group(&group).await?;
+        }
+      }
+      (Some(group), false) => {
+        self.upload_extension_group(&group).await?;
+      }
+      (None, true) => {
+        self.download_extension_group(group_id, app_handle).await?;
+      }
+      (None, false) => {
+        log::debug!("Sync no-op, missing on both sides extension_group={group_id}");
+      }
+    }
+
+    Ok(())
+  }
+
+  async fn upload_extension_group(
+    &self,
+    group: &crate::extension_manager::ExtensionGroup,
+  ) -> SyncResult<()> {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+
+    let mut updated_group = group.clone();
+    updated_group.last_sync = Some(now);
+
+    let json = serde_json::to_string_pretty(&updated_group).map_err(|e| {
+      SyncError::SerializationError(format!("Failed to serialize extension group: {e}"))
+    })?;
+
+    let remote_key = format!("extension_groups/{}.json", group.id);
+    self
+      .upload_config_json(&remote_key, &json, updated_group.updated_at)
+      .await?;
+
+    // Update local group with new last_sync
+    {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      if let Err(e) = manager.update_group_internal(&updated_group) {
+        log::warn!(
+          "Extension group last_sync not saved extension_group={} err=\"{e}\"",
+          group.id
+        );
+      }
+    }
+
+    log::info!("Extension group uploaded extension_group={}", group.id);
+    Ok(())
+  }
+
+  async fn download_extension_group(
+    &self,
+    group_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let remote_key = format!("extension_groups/{}.json", group_id);
+    let presign = self.client.presign_download(&remote_key).await?;
+    let raw = self.client.download_bytes(&presign.url).await?;
+
+    let data = encryption::maybe_unseal_after_download(&raw)
+      .map_err(|e| SyncError::InvalidData(format!("Failed to unseal extension group: {e}")))?;
+
+    let mut group: crate::extension_manager::ExtensionGroup = serde_json::from_slice(&data)
+      .map_err(|e| {
+        SyncError::SerializationError(format!("Failed to parse extension group JSON: {e}"))
+      })?;
+
+    group.last_sync = Some(super::conflicts::synced_at(Some(group.updated_at)));
+    group.sync_enabled = true;
+
+    // Save or update local group
+    {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      if let Err(e) = manager.upsert_group_internal(&group) {
+        log::warn!("Downloaded extension group not saved extension_group={group_id} err=\"{e}\"");
+      }
+    }
+
+    if let Some(_handle) = app_handle {
+      let _ = events::emit("extensions-changed", ());
+    }
+
+    log::info!("Extension group downloaded extension_group={group_id}");
+    Ok(())
+  }
+
+  pub async fn sync_extension_group_by_id_with_handle(
+    &self,
+    group_id: &str,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    self.sync_extension_group(group_id, Some(app_handle)).await
+  }
+
+  pub async fn delete_extension_group(&self, group_id: &str) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("extension_group={group_id}")) {
+      return Ok(());
+    }
+    let remote_key = format!("extension_groups/{}.json", group_id);
+    let tombstone_key = format!("tombstones/extension_groups/{}.json", group_id);
+
+    self
+      .client
+      .delete(&remote_key, Some(&tombstone_key))
+      .await?;
+
+    log::info!("Extension group deleted from cloud extension_group={group_id}");
+    Ok(())
+  }
+
+  /// Remove the tombstone a delete wrote under `tombstones/<folder>/<id>.json`.
+  /// An entity restored from the trash keeps its id, and the tombstone would
+  /// keep it off every other device. Unlike `clear_config_tombstone`, a
+  /// failure is returned, so the restore can keep sync off.
+  pub async fn delete_config_tombstone(&self, folder: &str, id: &str) -> SyncResult<()> {
+    if self.skips_remote_write(&format!("tombstone {folder}={id}")) {
+      return Ok(());
+    }
+    self
+      .client
+      .delete(&format!("tombstones/{folder}/{id}.json"), None)
+      .await?;
+    Ok(())
+  }
+
+  /// Whether `tombstones/<folder>/<id>.json` is still in the cloud. A
+  /// tombstone event can be stale: a restore from the trash removes it and
+  /// the entity is live again. A check that fails counts as gone, so a doubt
+  /// keeps the local copy, as for profiles.
+  /// `None` when the cloud could not be asked.
+  pub async fn config_tombstone_exists(&self, folder: &str, id: &str) -> Option<bool> {
+    let key = format!("tombstones/{folder}/{id}.json");
+    match self.client.stat(&key).await {
+      Ok(stat) => {
+        TOMBSTONE_CHECK.succeeded(&format!("key={key}"));
+        Some(stat.exists)
+      }
+      Err(e) => {
+        TOMBSTONE_CHECK.failed(&format!("key={key}"), e);
+        None
+      }
+    }
+  }
+
+  /// Download a profile from S3 if it exists remotely but not locally
+  pub async fn download_profile_if_missing(
+    &self,
+    app_handle: &tauri::AppHandle,
+    profile_id: &str,
+    key_prefix: &str,
+  ) -> SyncResult<bool> {
+    let started = Instant::now();
+    let profile_manager = ProfileManager::instance();
+    let profiles_dir = profile_manager.get_profiles_dir();
+    let profile_dir = profiles_dir.join(profile_id);
+
+    // Check if profile exists locally
+    let profile_uuid = uuid::Uuid::parse_str(profile_id)
+      .map_err(|_| SyncError::InvalidData(format!("Invalid profile ID format: {}", profile_id)))?;
+
+    let profiles = profile_manager
+      .list_profiles()
+      .map_err(|e| SyncError::IoError(format!("Failed to list profiles: {e}")))?;
+
+    let exists_locally = profiles.iter().any(|p| p.id == profile_uuid);
+
+    if exists_locally {
+      log::debug!("Missing-profile download skipped: exists locally profile={profile_id}");
+      return Ok(false);
+    }
+
+    // Check if profile exists remotely
+    let manifest_key = format!("{}profiles/{}/manifest.json", key_prefix, profile_id);
+    let stat = self.client.stat(&manifest_key).await?;
+
+    if !stat.exists {
+      log::debug!("Missing-profile download skipped: not in cloud profile={profile_id}");
+      return Ok(false);
+    }
+
+    // Download metadata.json first to get profile info
+    let metadata_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
+    let metadata_stat = self.client.stat(&metadata_key).await?;
+
+    if !metadata_stat.exists {
+      log::warn!("Cloud profile has a manifest but no metadata, skipped profile={profile_id}");
+      return Ok(false);
+    }
+
+    let metadata_presign = self.client.presign_download(&metadata_key).await?;
+    let metadata_raw = self.client.download_bytes(&metadata_presign.url).await?;
+    // Unseal E2E-encrypted metadata before parsing — otherwise an encrypted
+    // envelope fails to deserialize and the missing profile never downloads to
+    // this device. Plaintext (legacy) metadata passes through.
+    let metadata_data = encryption::maybe_unseal_after_download(&metadata_raw).map_err(|e| {
+      if e.contains("ENCRYPTION_PASSWORD_REQUIRED") {
+        let _ = events::emit("profile-sync-e2e-password-required", ());
+      }
+      SyncError::InvalidData(format!("Failed to unseal profile metadata: {e}"))
+    })?;
+    let mut profile: BrowserProfile = serde_json::from_slice(&metadata_data)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to parse metadata: {e}")))?;
+
+    // A profile bound to another OS: save metadata only, skip manifest + file
+    // downloads. A Wayfern profile from any OS downloads in full below.
+    if !syncs_browser_files(&profile) {
+      fs::create_dir_all(&profile_dir).map_err(|e| {
+        SyncError::IoError(format!(
+          "Failed to create profile directory {}: {e}",
+          profile_dir.display()
+        ))
+      })?;
+
+      if profile.sync_mode == SyncMode::Disabled {
+        profile.sync_mode = SyncMode::Regular;
+      }
+      profile.last_sync = Some(
+        std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .unwrap()
+          .as_secs(),
+      );
+
+      profile_manager
+        .save_profile(&profile)
+        .map_err(|e| SyncError::IoError(format!("Failed to save cross-OS profile: {e}")))?;
+
+      let _ = events::emit("profiles-changed", ());
+      let _ = events::emit(
+        "profile-sync-status",
+        serde_json::json!({
+          "profile_id": profile_id,
+          "profile_name": profile.name,
+          "status": "synced"
+        }),
+      );
+
+      log::info!(
+        "Cross-OS profile metadata downloaded profile={profile_id} host_os={:?}",
+        profile.host_os
+      );
+      return Ok(true);
+    }
+
+    // Derive encryption key before downloading manifest if profile uses encrypted sync.
+    // The manifest itself may be encrypted (new behavior) or plaintext (backwards compat).
+    let encryption_key = if profile.is_encrypted_sync() {
+      let password = encryption::load_e2e_password()
+        .map_err(|e| SyncError::InvalidData(format!("Failed to load E2E password: {e}")))?
+        .ok_or_else(|| {
+          let _ = events::emit("profile-sync-e2e-password-required", ());
+          SyncError::InvalidData(
+            "Remote profile is encrypted but no E2E password is set".to_string(),
+          )
+        })?;
+      let salt = profile.encryption_salt.as_deref().ok_or_else(|| {
+        SyncError::InvalidData("Encryption salt missing on encrypted profile".to_string())
+      })?;
+      let key = encryption::derive_profile_key(&password, salt)
+        .map_err(|e| SyncError::InvalidData(format!("Key derivation failed: {e}")))?;
+      Some(key)
+    } else {
+      None
+    };
+
+    // Download manifest (may be encrypted for e2e profiles)
+    let manifest = self
+      .download_manifest(&manifest_key, encryption_key.as_ref())
+      .await?;
+    let Some(manifest) = manifest else {
+      return Err(SyncError::InvalidData(
+        "Remote manifest not found".to_string(),
+      ));
+    };
+
+    // Ensure profile directory exists
+    fs::create_dir_all(&profile_dir).map_err(|e| {
+      SyncError::IoError(format!(
+        "Failed to create profile directory {}: {e}",
+        profile_dir.display()
+      ))
+    })?;
+
+    // Download all files from manifest
+    let total_size: u64 = manifest.files.iter().map(|f| f.size).sum();
+    if !manifest.files.is_empty() {
+      let cancel_flag = register_sync_cancel(profile_id);
+      let _cancel_guard = SyncCancelGuard(profile_id.to_string());
+      self
+        .download_profile_files(
+          app_handle,
+          profile_id,
+          &profile.name,
+          &profile_dir,
+          &manifest.files,
+          encryption_key.as_ref(),
+          key_prefix,
+          &cancel_flag,
+        )
+        .await?;
+    }
+
+    // Verify critical files after download
+    let os_crypt_key_path = profile_dir.join("profile").join("os_crypt_key");
+    let cookies_path =
+      crate::cookie_manager::CookieManager::wayfern_cookie_path(&profile_dir.join("profile"));
+    let has_os_crypt_key = os_crypt_key_path.exists();
+    let cookies_bytes = fs::metadata(&cookies_path).ok().map(|meta| meta.len());
+    if !has_os_crypt_key || cookies_bytes.is_none() {
+      log::warn!(
+        "Downloaded profile lacks critical files profile={profile_id} os_crypt_key={has_os_crypt_key} cookies={}",
+        cookies_bytes.is_some()
+      );
+    }
+
+    // Set sync mode and save profile
+    if profile.sync_mode == SyncMode::Disabled {
+      profile.sync_mode = if manifest.encrypted {
+        SyncMode::Encrypted
+      } else {
+        SyncMode::Regular
+      };
+    }
+    profile.last_sync = Some(
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs(),
+    );
+
+    profile_manager
+      .save_profile(&profile)
+      .map_err(|e| SyncError::IoError(format!("Failed to save downloaded profile: {e}")))?;
+
+    let _ = events::emit("profiles-changed", ());
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "status": "synced"
+      }),
+    );
+
+    log::info!(
+      "Missing profile downloaded profile={profile_id} files={} bytes={total_size} cookies_bytes={} elapsed_ms={}",
+      manifest.files.len(),
+      cookies_bytes.unwrap_or(0),
+      started.elapsed().as_millis()
+    );
+    Ok(true)
+  }
+
+  /// Check for profiles that exist remotely but not locally and download them
+  pub async fn check_for_missing_synced_profiles(
+    &self,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<Vec<String>> {
+    // List all personal profiles from S3 (paginated)
+    let all_objects = self.client.list_all("profiles/").await?;
+
+    let mut downloaded: Vec<String> = Vec::new();
+
+    // Extract unique profile IDs with their key prefix
+    let mut profiles_to_check: HashMap<String, String> = HashMap::new();
+    for obj in all_objects {
+      if obj.key.starts_with("profiles/") && obj.key.ends_with("/manifest.json") {
+        if let Some(profile_id) = obj
+          .key
+          .strip_prefix("profiles/")
+          .and_then(|s| s.strip_suffix("/manifest.json"))
+        {
+          profiles_to_check.insert(profile_id.to_string(), String::new());
+        }
+      }
+    }
+
+    // Also list team profiles if user is on a team
+    if let Some(auth) = crate::cloud_auth::CLOUD_AUTH.get_user().await {
+      if let Some(team_id) = &auth.user.team_id {
+        let team_prefix = format!("teams/{}/", team_id);
+        let team_list_key = format!("{}profiles/", team_prefix);
+        if let Ok(team_objects) = self.client.list_all(&team_list_key).await {
+          for obj in team_objects {
+            if obj.key.starts_with("profiles/") && obj.key.ends_with("/manifest.json") {
+              if let Some(profile_id) = obj
+                .key
+                .strip_prefix("profiles/")
+                .and_then(|s| s.strip_suffix("/manifest.json"))
+              {
+                profiles_to_check.insert(profile_id.to_string(), team_prefix.clone());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let remote_count = profiles_to_check.len();
+
+    // Deletes this device made while the cloud was out of reach. They are
+    // settled before anything downloads, or the download below would bring the
+    // deleted profile back. A cloud copy changed after the delete was used on
+    // another device since, and wins, as a newer edit does everywhere else.
+    for pending in super::pending_deletes::list() {
+      let profile_id = pending.profile_id;
+      let Some(key_prefix) = profiles_to_check.remove(&profile_id) else {
+        log::info!("Owed cloud delete dropped: already gone profile={profile_id}");
+        super::pending_deletes::forget(&profile_id);
+        continue;
+      };
+      let manifest_key = format!("{key_prefix}profiles/{profile_id}/manifest.json");
+      let changed_at = match self.client.stat(&manifest_key).await {
+        Ok(stat) => stat.last_modified.as_deref().and_then(rfc3339_secs),
+        Err(e) => {
+          log::warn!("Owed cloud delete postponed: check failed profile={profile_id} err=\"{e}\"");
+          continue;
+        }
+      };
+      if changed_at.is_some_and(|changed| changed > pending.deleted_at) {
+        log::info!("Owed cloud delete dropped: cloud copy is newer profile={profile_id}");
+        super::pending_deletes::forget(&profile_id);
+        profiles_to_check.insert(profile_id, key_prefix);
+        continue;
+      }
+      match self.delete_profile(&profile_id).await {
+        Ok(()) => super::pending_deletes::forget(&profile_id),
+        Err(e) => log::warn!("Owed cloud delete failed again profile={profile_id} err=\"{e}\""),
+      }
+    }
+
+    // For each remote profile, check if it exists locally and download if missing.
+    // Skip any profile that has a tombstone — a leftover manifest under a
+    // tombstoned id means delete_prefix raced or partially failed, and
+    // re-downloading it here is what surfaced the "Browsing keeps re-syncing"
+    // bug after a delete.
+    for (profile_id, key_prefix) in &profiles_to_check {
+      let personal_tombstone = format!("tombstones/profiles/{}.json", profile_id);
+      let has_personal_tombstone = matches!(
+        self.client.stat(&personal_tombstone).await,
+        Ok(stat) if stat.exists
+      );
+      let team_tombstone_key = if key_prefix.is_empty() {
+        None
+      } else {
+        Some(format!(
+          "{}tombstones/profiles/{}.json",
+          key_prefix, profile_id
+        ))
+      };
+      let has_team_tombstone = if let Some(ref tk) = team_tombstone_key {
+        matches!(self.client.stat(tk).await, Ok(stat) if stat.exists)
+      } else {
+        false
+      };
+      if has_personal_tombstone || has_team_tombstone {
+        if self.skips_remote_write(&format!("leftovers profile={profile_id}")) {
+          continue;
+        }
+        let prefix = format!("{}profiles/{}/", key_prefix, profile_id);
+        match self.client.delete_prefix(&prefix, None).await {
+          Ok(_) => {
+            log::info!("Leftover cloud files of a deleted profile cleared profile={profile_id}")
+          }
+          Err(e) => log::warn!(
+            "Leftover cloud files of a deleted profile not cleared profile={profile_id} err=\"{e}\""
+          ),
+        }
+        continue;
+      }
+
+      match self
+        .download_profile_if_missing(app_handle, profile_id, key_prefix)
+        .await
+      {
+        Ok(true) => {
+          downloaded.push(profile_id.clone());
+        }
+        Ok(false) => {
+          // Profile exists locally or doesn't exist remotely, skip
+        }
+        Err(e) => {
+          log::warn!("Missing profile download failed profile={profile_id} err=\"{e}\"");
+        }
+      }
+    }
+
+    if !downloaded.is_empty() {
+      log::info!(
+        "Missing profile check done remote={remote_count} downloaded={} profiles={downloaded:?}",
+        downloaded.len()
+      );
+    } else {
+      log::debug!("Missing profile check done remote={remote_count} downloaded=0");
+    }
+
+    // Delete local synced profiles that have a remote tombstone (deleted on another device)
+    {
+      let profile_manager = ProfileManager::instance();
+      let local_synced: Vec<BrowserProfile> = profile_manager
+        .list_profiles()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.is_sync_enabled())
+        .collect();
+
+      for profile in &local_synced {
+        let pid = &profile.id.to_string();
+        if self.profile_tombstone_exists(profile).await {
+          // Originator guard: re-read the profile right before deleting. If the
+          // local user disabled sync between the snapshot above and this stat
+          // call, they're the one who wrote this tombstone — keep their local
+          // copy. Tombstones must delete remote-originated changes, never the
+          // sender's own data. (Caused mass local deletion in v0.24.x.)
+          let still_sync_enabled = profile_manager
+            .list_profiles()
+            .unwrap_or_default()
+            .iter()
+            .find(|p| p.id.to_string() == *pid)
+            .is_some_and(|p| p.is_sync_enabled());
+          if !still_sync_enabled {
+            log::info!("Tombstone ignored, sync turned off here profile={pid}");
+            continue;
+          }
+          match profile_manager.delete_profile_local_only(pid) {
+            Ok(_) => log::info!("Profile deleted remotely, removed locally profile={pid}"),
+            Err(e) => {
+              log::warn!("Remotely deleted profile not removed locally profile={pid} err=\"{e}\"")
+            }
+          }
+        }
+      }
+    }
+
+    // Refresh metadata for local cross-OS profiles (propagate renames, tags, notes from originating device)
+    let profile_manager = ProfileManager::instance();
+    // Collect cross-OS profiles before async operations to avoid holding non-Send Result across await
+    let cross_os_profiles: Vec<(String, SyncMode, Option<String>)> = profile_manager
+      .list_profiles()
+      .unwrap_or_default()
+      .iter()
+      .filter(|p| !syncs_browser_files(p) && p.is_sync_enabled())
+      .map(|p| (p.id.to_string(), p.sync_mode, p.created_by_id.clone()))
+      .collect();
+
+    if !cross_os_profiles.is_empty() {
+      let team_prefix = if let Some(auth) = crate::cloud_auth::CLOUD_AUTH.get_user().await {
+        auth.user.team_id.map(|tid| format!("teams/{}/", tid))
+      } else {
+        None
+      };
+
+      for (pid, sync_mode, created_by_id) in &cross_os_profiles {
+        let kp = if created_by_id.is_some() {
+          team_prefix.as_deref().unwrap_or("")
+        } else {
+          ""
+        };
+        let metadata_key = format!("{}profiles/{}/metadata.json", kp, pid);
+        match self.client.stat(&metadata_key).await {
+          Ok(stat) if stat.exists => match self.client.presign_download(&metadata_key).await {
+            Ok(presign) => match self.client.download_bytes(&presign.url).await {
+              Ok(data) => {
+                // Unseal E2E metadata before parsing; keep the tolerant skip so a
+                // profile without a loaded password (or bad data) is left as-is.
+                if let Ok(mut remote_profile) = encryption::maybe_unseal_after_download(&data)
+                  .and_then(|d| {
+                    serde_json::from_slice::<BrowserProfile>(&d).map_err(|e| e.to_string())
+                  })
+                {
+                  remote_profile.sync_mode = *sync_mode;
+                  remote_profile.last_sync = Some(
+                    std::time::SystemTime::now()
+                      .duration_since(std::time::UNIX_EPOCH)
+                      .unwrap()
+                      .as_secs(),
+                  );
+                  if let Err(e) = profile_manager.save_profile(&remote_profile) {
+                    log::warn!("Cross-OS profile metadata not saved profile={pid} err=\"{e}\"");
+                  } else {
+                    log::debug!("Cross-OS profile metadata refreshed profile={pid}");
+                  }
+                }
+              }
+              Err(e) => {
+                log::warn!("Cross-OS profile metadata download failed profile={pid} err=\"{e}\"");
+              }
+            },
+            Err(e) => {
+              log::warn!("Cross-OS profile metadata presign failed profile={pid} err=\"{e}\"");
+            }
+          },
+          _ => {}
+        }
+      }
+      let _ = events::emit("profiles-changed", ());
+    }
+
+    Ok(downloaded)
+  }
+
+  /// Check for remote entities (proxies, groups, VPNs) not present locally and download them
+  pub async fn check_for_missing_synced_entities(
+    &self,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    // Check for remote proxies not present locally
+    let remote_proxies = self.client.list("proxies/").await?;
+    for obj in &remote_proxies.objects {
+      if let Some(proxy_id) = obj
+        .key
+        .strip_prefix("proxies/")
+        .and_then(|s| s.strip_suffix(".json"))
+      {
+        let exists_locally = crate::proxy_manager::PROXY_MANAGER
+          .get_stored_proxies()
+          .iter()
+          .any(|p| p.id == proxy_id);
+        if !exists_locally {
+          if self
+            .tombstone_blocks("proxies", proxy_id, 0)
+            .await
+            .unwrap_or(true)
+          {
+            continue;
+          }
+          if let Err(e) = self.download_proxy(proxy_id, Some(app_handle)).await {
+            log::warn!("Missing proxy download failed proxy={proxy_id} err=\"{e}\"");
+          }
+        }
+      }
+    }
+
+    // Check for remote groups not present locally
+    let remote_groups = self.client.list("groups/").await?;
+    for obj in &remote_groups.objects {
+      if let Some(group_id) = obj
+        .key
+        .strip_prefix("groups/")
+        .and_then(|s| s.strip_suffix(".json"))
+      {
+        let exists_locally = {
+          let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+          group_manager
+            .get_all_groups()
+            .unwrap_or_default()
+            .iter()
+            .any(|g| g.id == group_id)
+        };
+        if !exists_locally {
+          if self
+            .tombstone_blocks("groups", group_id, 0)
+            .await
+            .unwrap_or(true)
+          {
+            continue;
+          }
+          if let Err(e) = self.download_group(group_id, Some(app_handle)).await {
+            log::warn!("Missing group download failed group={group_id} err=\"{e}\"");
+          }
+        }
+      }
+    }
+
+    // Check for remote VPNs not present locally
+    let remote_vpns = self.client.list("vpns/").await?;
+    for obj in &remote_vpns.objects {
+      if let Some(vpn_id) = obj
+        .key
+        .strip_prefix("vpns/")
+        .and_then(|s| s.strip_suffix(".json"))
+      {
+        let exists_locally = {
+          let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+          storage.load_config(vpn_id).is_ok()
+        };
+        if !exists_locally {
+          if self
+            .tombstone_blocks("vpns", vpn_id, 0)
+            .await
+            .unwrap_or(true)
+          {
+            continue;
+          }
+          if let Err(e) = self.download_vpn(vpn_id, Some(app_handle)).await {
+            log::warn!("Missing VPN download failed vpn={vpn_id} err=\"{e}\"");
+          }
+        }
+      }
+    }
+
+    // Check for remote extensions not present locally. The extensions/ prefix
+    // also holds binary files under extensions/{id}/file/..., so the `/` filter
+    // keeps only the top-level extensions/{id}.json entries.
+    let remote_extensions = self.client.list("extensions/").await?;
+    for obj in &remote_extensions.objects {
+      if let Some(ext_id) = obj
+        .key
+        .strip_prefix("extensions/")
+        .and_then(|s| s.strip_suffix(".json"))
+        .filter(|s| !s.contains('/'))
+      {
+        let exists_locally = {
+          let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+          manager
+            .list_extensions()
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.id == ext_id)
+        };
+        if !exists_locally {
+          if self
+            .tombstone_blocks("extensions", ext_id, 0)
+            .await
+            .unwrap_or(true)
+          {
+            continue;
+          }
+          if let Err(e) = self.download_extension(ext_id, Some(app_handle)).await {
+            log::warn!("Missing extension download failed extension={ext_id} err=\"{e}\"");
+          }
+        }
+      }
+    }
+
+    // Check for remote extension groups not present locally
+    let remote_ext_groups = self.client.list("extension_groups/").await?;
+    for obj in &remote_ext_groups.objects {
+      if let Some(group_id) = obj
+        .key
+        .strip_prefix("extension_groups/")
+        .and_then(|s| s.strip_suffix(".json"))
+        .filter(|s| !s.contains('/'))
+      {
+        let exists_locally = {
+          let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+          manager
+            .list_groups()
+            .unwrap_or_default()
+            .iter()
+            .any(|g| g.id == group_id)
+        };
+        if !exists_locally {
+          if self
+            .tombstone_blocks("extension_groups", group_id, 0)
+            .await
+            .unwrap_or(true)
+          {
+            continue;
+          }
+          if let Err(e) = self
+            .download_extension_group(group_id, Some(app_handle))
+            .await
+          {
+            log::warn!(
+              "Missing extension group download failed extension_group={group_id} err=\"{e}\""
+            );
+          }
+        }
+      }
+    }
+
+    log::debug!("Missing entity check done");
+    Ok(())
+  }
+}
+
+/// Check if proxy is used by any synced profile
+pub fn is_proxy_used_by_synced_profile(proxy_id: &str) -> bool {
+  let profile_manager = ProfileManager::instance();
+  if let Ok(profiles) = profile_manager.list_profiles() {
+    profiles
+      .iter()
+      .any(|p| p.is_sync_enabled() && p.proxy_id.as_deref() == Some(proxy_id))
+  } else {
+    false
+  }
+}
+
+/// Check if group is used by any synced profile
+pub fn is_group_used_by_synced_profile(group_id: &str) -> bool {
+  let profile_manager = ProfileManager::instance();
+  if let Ok(profiles) = profile_manager.list_profiles() {
+    profiles
+      .iter()
+      .any(|p| p.is_sync_enabled() && p.group_id.as_deref() == Some(group_id))
+  } else {
+    false
+  }
+}
+
+/// Enable sync for proxy if not already enabled
+pub async fn enable_proxy_sync_if_needed(proxy_id: &str) -> Result<(), String> {
+  let proxy_manager = &crate::proxy_manager::PROXY_MANAGER;
+  let proxies = proxy_manager.get_stored_proxies();
+  let proxy = proxies
+    .iter()
+    .find(|p| p.id == proxy_id)
+    .ok_or_else(|| format!("Proxy with ID '{proxy_id}' not found"))?;
+
+  if !proxy.sync_enabled {
+    proxy_manager.set_stored_proxy_sync_state(proxy_id, true, proxy.last_sync)?;
+    let _ = events::emit("stored-proxies-changed", ());
+    log::info!("Sync auto-enabled proxy={proxy_id}");
+  }
+
+  Ok(())
+}
+
+/// Check if VPN is used by any synced profile
+pub fn is_vpn_used_by_synced_profile(vpn_id: &str) -> bool {
+  let profile_manager = ProfileManager::instance();
+  if let Ok(profiles) = profile_manager.list_profiles() {
+    profiles
+      .iter()
+      .any(|p| p.is_sync_enabled() && p.vpn_id.as_deref() == Some(vpn_id))
+  } else {
+    false
+  }
+}
+
+/// Enable sync for VPN if not already enabled
+pub async fn enable_vpn_sync_if_needed(vpn_id: &str) -> Result<(), String> {
+  let vpn = {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .load_config(vpn_id)
+      .map_err(|e| format!("VPN with ID '{vpn_id}' not found: {e}"))?
+  };
+
+  if !vpn.sync_enabled {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .update_sync_fields(vpn_id, true, None)
+      .map_err(|e| format!("Failed to enable VPN sync: {e}"))?;
+
+    let _ = events::emit("vpn-configs-changed", ());
+    log::info!("Sync auto-enabled vpn={vpn_id}");
+  }
+
+  Ok(())
+}
+
+/// Enable sync for group if not already enabled
+pub async fn enable_group_sync_if_needed(group_id: &str) -> Result<(), String> {
+  let group = {
+    let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+    let groups = group_manager.get_all_groups().unwrap_or_default();
+    groups
+      .iter()
+      .find(|g| g.id == group_id)
+      .ok_or_else(|| format!("Group with ID '{group_id}' not found"))?
+      .clone()
+  };
+
+  if !group.sync_enabled {
+    let mut updated_group = group.clone();
+    updated_group.sync_enabled = true;
+
+    {
+      let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+      if let Err(e) = group_manager.update_group_internal(&updated_group) {
+        return Err(format!("Failed to update group: {e}"));
+      }
+    }
+
+    let _ = events::emit("groups-changed", ());
+    log::info!("Sync auto-enabled group={group_id}");
+  }
+
+  Ok(())
+}
+
+/// Enable sync for extension group (and its member extensions) if not
+/// already enabled. Mirrors the proxy/vpn/group helpers — call from any
+/// site where a synced profile gains an `extension_group_id`.
+pub async fn enable_extension_group_sync_if_needed(extension_group_id: &str) -> Result<(), String> {
+  let (group_already_synced, extension_ids) = {
+    let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let group = manager
+      .get_group(extension_group_id)
+      .map_err(|e| format!("Extension group with ID '{extension_group_id}' not found: {e}"))?;
+    (group.sync_enabled, group.extension_ids.clone())
+  };
+
+  if !group_already_synced {
+    let mut updated_group = {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      manager
+        .get_group(extension_group_id)
+        .map_err(|e| format!("Failed to load extension group: {e}"))?
+    };
+    updated_group.sync_enabled = true;
+    {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      manager
+        .update_group_internal(&updated_group)
+        .map_err(|e| format!("Failed to update extension group sync: {e}"))?;
+    }
+    let _ = events::emit("extensions-changed", ());
+    log::info!("Sync auto-enabled extension_group={extension_group_id}");
+  }
+
+  // Cascade to every extension referenced by the group so the other device
+  // has the actual extension binaries when it pulls the group.
+  for ext_id in &extension_ids {
+    let already_synced = {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      manager
+        .get_extension(ext_id)
+        .ok()
+        // A linked extension has no binary to hand the other device, only a
+        // path that means nothing there, so the cascade must not pick it up.
+        .map(|e| e.sync_enabled || e.is_linked())
+        .unwrap_or(true)
+    };
+    if !already_synced {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      if let Ok(mut ext) = manager.get_extension(ext_id) {
+        ext.sync_enabled = true;
+        if let Err(e) = manager.update_extension_internal(&ext) {
+          log::warn!("Sync auto-enable failed extension={ext_id} err=\"{e}\"");
+        } else {
+          log::info!("Sync auto-enabled extension={ext_id}");
+        }
+      }
+    }
+  }
+
+  // Enabling sync only flips a local flag; without queueing a sync run the
+  // group and its extensions are never uploaded, so the other device never
+  // receives them. Queue them now.
+  if let Some(scheduler) = crate::sync::get_global_scheduler() {
+    scheduler
+      .queue_extension_group_sync(extension_group_id.to_string())
+      .await;
+    for ext_id in &extension_ids {
+      scheduler.queue_extension_sync(ext_id.clone()).await;
+    }
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub async fn set_profile_sync_mode(
+  app_handle: tauri::AppHandle,
+  profile_id: String,
+  sync_mode: String,
+) -> Result<(), String> {
+  let new_mode = match sync_mode.as_str() {
+    "Disabled" => SyncMode::Disabled,
+    "Regular" => SyncMode::Regular,
+    "Encrypted" => SyncMode::Encrypted,
+    _ => {
+      return Err(crate::backend_error_with_detail(
+        "INTERNAL_ERROR",
+        format!("invalid sync mode {sync_mode}"),
+      ))
+    }
+  };
+  apply_profile_sync_mode(app_handle, profile_id, new_mode, false).await
+}
+
+/// Turn sync back on for a profile restored from the trash.
+///
+/// Unlike the command, it fails when the tombstone the delete wrote cannot be
+/// cleared, and leaves the profile as it was. Enabled with that tombstone in
+/// place, the profile would be erased by the next reconcile.
+pub async fn resume_profile_sync(
+  app_handle: tauri::AppHandle,
+  profile_id: String,
+  mode: SyncMode,
+) -> Result<(), String> {
+  apply_profile_sync_mode(app_handle, profile_id, mode, true).await
+}
+
+async fn apply_profile_sync_mode(
+  app_handle: tauri::AppHandle,
+  profile_id: String,
+  new_mode: SyncMode,
+  require_tombstone_cleared: bool,
+) -> Result<(), String> {
+  let profile_manager = ProfileManager::instance();
+  let profiles = profile_manager
+    .list_profiles()
+    .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
+
+  let profile_uuid =
+    uuid::Uuid::parse_str(&profile_id).map_err(|_| crate::backend_error("INVALID_PROFILE_ID"))?;
+  let mut profile = profiles
+    .into_iter()
+    .find(|p| p.id == profile_uuid)
+    .ok_or_else(|| crate::backend_error("PROFILE_NOT_FOUND"))?;
+
+  if !syncs_browser_files(&profile) {
+    return Err(crate::backend_error("SYNC_CROSS_OS_PROFILE"));
+  }
+
+  let enabling_now = new_mode != SyncMode::Disabled;
+  if enabling_now && profile.process_id.is_some() {
+    return Err(serde_json::json!({ "code": "PROFILE_RUNNING" }).to_string());
+  }
+
+  if profile.ephemeral {
+    return Err(crate::backend_error("SYNC_EPHEMERAL_PROFILE"));
+  }
+
+  let old_mode = profile.sync_mode;
+  let enabling = new_mode != SyncMode::Disabled;
+
+  if enabling {
+    let cloud_logged_in = crate::cloud_auth::CLOUD_AUTH.is_logged_in().await;
+
+    if !cloud_logged_in {
+      let manager = SettingsManager::instance();
+      let settings = manager
+        .load_settings()
+        .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
+
+      let configured = settings.sync_server_url.is_some()
+        && manager
+          .get_sync_token(&app_handle)
+          .await
+          .ok()
+          .flatten()
+          .is_some();
+      if !configured {
+        let not_configured = crate::backend_error("SYNC_NOT_CONFIGURED");
+        let _ = events::emit(
+          "profile-sync-status",
+          serde_json::json!({
+            "profile_id": profile_id,
+            "profile_name": profile.name,
+            "status": "error",
+            "error": not_configured
+          }),
+        );
+        return Err(not_configured);
+      }
+    }
+  }
+
+  // If switching to Encrypted, verify password is set and generate salt
+  if new_mode == SyncMode::Encrypted {
+    if !encryption::has_e2e_password() {
+      return Err(crate::backend_error("NO_E2E_PASSWORD_SET"));
+    }
+    if profile.encryption_salt.is_none() {
+      profile.encryption_salt = Some(encryption::generate_salt());
+    }
+  }
+
+  // If switching between Regular<->Encrypted, delete remote manifest to force full re-upload
+  let mode_switched = old_mode != SyncMode::Disabled && enabling && old_mode != new_mode;
+  if mode_switched {
+    if let Ok(engine) = SyncEngine::create_from_settings(&app_handle).await {
+      let key_prefix = SyncEngine::get_team_key_prefix(&profile).await;
+      let manifest_key = format!("{}profiles/{}/manifest.json", key_prefix, profile_id);
+      let _ = engine.client.delete(&manifest_key, None).await;
+      log::info!(
+        "Cloud manifest deleted for sync mode change profile={} from={old_mode:?} to={new_mode:?}",
+        Plain(&profile_id)
+      );
+    }
+  }
+
+  // When (re-)enabling sync, clear any stale tombstone from a previous
+  // disable or delete first, while the profile is still local-only. Otherwise
+  // the next reconcile on any device would see the tombstone and delete the
+  // freshly re-uploaded data, and a tombstone event handled between the save
+  // and a later clear would erase the profile that was just switched on.
+  if enabling {
+    let cleared = match SyncEngine::create_from_settings(&app_handle).await {
+      Ok(engine) => engine
+        .delete_profile_tombstones(&profile)
+        .await
+        .map_err(|e| e.to_string()),
+      Err(e) => Err(e),
+    };
+    if let Err(e) = cleared {
+      if require_tombstone_cleared {
+        return Err(crate::backend_error_with_detail(
+          "SYNC_TOMBSTONE_NOT_CLEARED",
+          e,
+        ));
+      }
+      log::warn!(
+        "Profile tombstone not cleared profile={} err=\"{e}\"",
+        Plain(&profile_id)
+      );
+    }
+  }
+
+  profile.sync_mode = new_mode;
+
+  profile_manager
+    .save_profile(&profile)
+    .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
+
+  // A remote run obtains the profile through sync, so a local-only profile has
+  // nothing there — and switching to Encrypted leaves a copy that cannot be
+  // decrypted remotely. Either is a refusal reason. The server holds only the
+  // copy this machine declared; without this, an enrolment keeps claiming a
+  // syncable profile every night after the user turned sync off.
+  crate::cookie_bot::report_profile_state(&profile);
+  if (old_mode == SyncMode::Disabled) == enabling {
+    // Turning sync on puts a profile in the team's hands; turning it off takes
+    // it out. Either is worth a line in the team's log.
+    crate::team_activity::record(
+      if enabling {
+        "profile.sync_on"
+      } else {
+        "profile.sync_off"
+      },
+      &profile_id,
+      Some(&profile.name),
+      None,
+    );
+  }
+
+  let _ = events::emit("profiles-changed", ());
+
+  if enabling {
+    let is_running = profile.process_id.is_some();
+
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "status": if is_running { "waiting" } else { "syncing" }
+      }),
+    );
+
+    if let Some(scheduler) = super::get_global_scheduler() {
+      scheduler
+        .queue_profile_sync_immediate(profile_id.clone())
+        .await;
+
+      if let Some(ref proxy_id) = profile.proxy_id {
+        if let Err(e) = enable_proxy_sync_if_needed(proxy_id).await {
+          log::warn!("Sync enable failed proxy={proxy_id} err=\"{e}\"");
+        } else {
+          scheduler.queue_proxy_sync(proxy_id.clone()).await;
+        }
+      }
+      if let Some(ref group_id) = profile.group_id {
+        if let Err(e) = enable_group_sync_if_needed(group_id).await {
+          log::warn!("Sync enable failed group={group_id} err=\"{e}\"");
+        } else {
+          scheduler.queue_group_sync(group_id.clone()).await;
+        }
+      }
+      if let Some(ref vpn_id) = profile.vpn_id {
+        if let Err(e) = enable_vpn_sync_if_needed(vpn_id).await {
+          log::warn!("Sync enable failed vpn={vpn_id} err=\"{e}\"");
+        } else {
+          scheduler.queue_vpn_sync(vpn_id.clone()).await;
+        }
+      }
+      if let Some(ref ext_group_id) = profile.extension_group_id {
+        if let Err(e) = enable_extension_group_sync_if_needed(ext_group_id).await {
+          log::warn!("Sync enable failed extension_group={ext_group_id} err=\"{e}\"");
+        } else {
+          scheduler
+            .queue_extension_group_sync(ext_group_id.clone())
+            .await;
+        }
+      }
+    } else {
+      log::warn!(
+        "Profile sync not queued: no scheduler profile={}",
+        Plain(&profile_id)
+      );
+    }
+  } else {
+    // Delete remote data when disabling sync. Awaited (not spawned) so the
+    // tombstone write completes before this command returns. A previous
+    // tokio::spawn here allowed the tombstone-write to land *after* a fast
+    // user-triggered re-enable's tombstone-clear, re-introducing the
+    // tombstone and tripping the reconcile-pass deletion of a profile the
+    // user had just re-enabled.
+    if old_mode != SyncMode::Disabled {
+      match SyncEngine::create_from_settings(&app_handle).await {
+        Ok(engine) => {
+          if let Err(e) = engine.delete_profile(&profile_id).await {
+            log::warn!(
+              "Cloud profile delete failed profile={} err=\"{e}\"",
+              Plain(&profile_id)
+            );
+          }
+        }
+        Err(e) => {
+          log::debug!("Cloud profile delete skipped: sync not configured err=\"{e}\"");
+        }
+      }
+    }
+
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "status": "disabled"
+      }),
+    );
+  }
+
+  // The cloud counts what it stores; another server counts for itself.
+  if super::account_server::current().await == Some(super::account_server::SyncSource::Cloud) {
+    let sync_count = profile_manager
+      .list_profiles()
+      .map(|profiles| profiles.iter().filter(|p| p.is_sync_enabled()).count())
+      .unwrap_or(0);
+
+    tokio::spawn(async move {
+      if let Err(e) = crate::cloud_auth::CLOUD_AUTH
+        .report_sync_profile_count(sync_count as i64)
+        .await
+      {
+        log::warn!("Sync profile count not reported err=\"{e}\"");
+      }
+    });
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub async fn request_profile_sync(
+  _app_handle: tauri::AppHandle,
+  profile_id: String,
+) -> Result<(), String> {
+  // Validate profile exists and sync is enabled
+  let profile_manager = ProfileManager::instance();
+  let profiles = profile_manager
+    .list_profiles()
+    .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
+
+  let profile_uuid =
+    uuid::Uuid::parse_str(&profile_id).map_err(|_| crate::backend_error("INVALID_PROFILE_ID"))?;
+  let profile = profiles
+    .into_iter()
+    .find(|p| p.id == profile_uuid)
+    .ok_or_else(|| crate::backend_error("PROFILE_NOT_FOUND"))?;
+
+  if !profile.is_sync_enabled() {
+    return Err(crate::backend_error("SYNC_NOT_ENABLED"));
+  }
+
+  // Queue sync via scheduler
+  if let Some(scheduler) = super::get_global_scheduler() {
+    let is_running = profile.process_id.is_some();
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "profile_name": profile.name,
+        "status": if is_running { "waiting" } else { "syncing" }
+      }),
+    );
+
+    scheduler.queue_profile_sync_immediate(profile_id).await;
+    Ok(())
+  } else {
+    Err(crate::backend_error("SYNC_NOT_CONFIGURED"))
+  }
+}
+
+#[tauri::command]
+pub async fn sync_profile(app_handle: tauri::AppHandle, profile_id: String) -> Result<(), String> {
+  trigger_sync_for_profile(app_handle, profile_id).await
+}
+
+/// Ensure the device has either a cloud login or a self-hosted server URL + token.
+/// Returns a JSON error code string consumable by the frontend translator.
+async fn ensure_sync_configured(app_handle: &tauri::AppHandle) -> Result<(), String> {
+  let cloud_logged_in = crate::cloud_auth::CLOUD_AUTH.is_logged_in().await;
+  if cloud_logged_in {
+    return Ok(());
+  }
+  let manager = SettingsManager::instance();
+  let settings = manager.load_settings().map_err(|e| {
+    serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": e.to_string() } })
+      .to_string()
+  })?;
+  if settings.sync_server_url.is_none() {
+    return Err(serde_json::json!({ "code": "SYNC_NOT_CONFIGURED" }).to_string());
+  }
+  let token = manager.get_sync_token(app_handle).await.ok().flatten();
+  if token.is_none() {
+    return Err(serde_json::json!({ "code": "SYNC_NOT_CONFIGURED" }).to_string());
+  }
+  Ok(())
+}
+
+pub async fn trigger_sync_for_profile(
+  app_handle: tauri::AppHandle,
+  profile_id: String,
+) -> Result<(), String> {
+  let engine = SyncEngine::create_from_settings(&app_handle)
+    .await
+    .map_err(|e| super::types::engine_setup_code(&e))?;
+
+  let profile_manager = ProfileManager::instance();
+  let profiles = profile_manager
+    .list_profiles()
+    .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
+
+  let profile_uuid =
+    uuid::Uuid::parse_str(&profile_id).map_err(|_| crate::backend_error("INVALID_PROFILE_ID"))?;
+  let profile = profiles
+    .into_iter()
+    .find(|p| p.id == profile_uuid)
+    .ok_or_else(|| crate::backend_error("PROFILE_NOT_FOUND"))?;
+
+  engine
+    .sync_profile(&app_handle, &profile)
+    .await
+    .map_err(|e| {
+      log::warn!("Profile sync failed profile={profile_id} err=\"{e}\"");
+      e.to_code_json()
+    })?;
+
+  Ok(())
+}
+
+/// Pull a profile back down after a remote session wrote to it.
+///
+/// Not `trigger_sync_for_profile` with a different name. Two things differ, and
+/// both of them are the reason the session's work used to be destroyed:
+///
+/// - The diff is biased to the remote copy. The host has just written the
+///   authoritative profile; local mtimes may nonetheless be newer, and under the
+///   ordinary rule that uploads the stale copy and deletes the host's files.
+/// - The outcome is reported. Every skip inside `sync_profile` returns success,
+///   so the caller could otherwise mark the profile current without a byte
+///   having moved.
+pub async fn pull_profile_after_remote_session(
+  app_handle: &tauri::AppHandle,
+  profile_id: &str,
+) -> Result<ProfileSyncOutcome, String> {
+  let engine = SyncEngine::create_from_settings(app_handle)
+    .await
+    .map_err(|e| format!("Failed to create sync engine: {e}"))?;
+
+  let profile_uuid =
+    uuid::Uuid::parse_str(profile_id).map_err(|_| format!("Invalid profile ID: {profile_id}"))?;
+  let profile = ProfileManager::instance()
+    .list_profiles()
+    .map_err(|e| format!("Failed to list profiles: {e}"))?
+    .into_iter()
+    .find(|p| p.id == profile_uuid)
+    .ok_or_else(|| format!("Profile with ID '{profile_id}' not found"))?;
+
+  engine
+    .sync_profile_with_bias(app_handle, &profile, DiffBias::PreferRemote)
+    .await
+    .map_err(|e| format!("Sync failed: {e}"))
+}
+
+/// Drop a stale tombstone for a config entity that is being (re-)enabled for
+/// sync.
+///
+/// `sync_X` refuses to touch an entity whose tombstone is newer than its last
+/// edit, so an id that was ever deleted could otherwise never be uploaded
+/// again, which matters when an import restores a previously-deleted id. The
+/// profile path clears its own tombstone on re-enable for the same reason.
+async fn clear_config_tombstone(app_handle: &tauri::AppHandle, kind: &str, id: &str) {
+  if let Ok(engine) = SyncEngine::create_from_settings(app_handle).await {
+    let tombstone_key = format!("tombstones/{}/{}.json", kind, id);
+    if let Err(e) = engine.client.delete(&tombstone_key, None).await {
+      log::warn!("Tombstone not cleared key={tombstone_key} err=\"{e}\"");
+    }
+  }
+}
+
+#[tauri::command]
+pub async fn set_proxy_sync_enabled(
+  app_handle: tauri::AppHandle,
+  proxy_id: String,
+  enabled: bool,
+) -> Result<(), String> {
+  let proxy_manager = &crate::proxy_manager::PROXY_MANAGER;
+  let proxies = proxy_manager.get_stored_proxies();
+  let proxy = proxies
+    .iter()
+    .find(|p| p.id == proxy_id)
+    .ok_or_else(|| serde_json::json!({ "code": "PROXY_NOT_FOUND" }).to_string())?;
+
+  // Block modifying sync for cloud-managed proxies
+  if proxy.is_cloud_managed {
+    return Err(serde_json::json!({ "code": "CANNOT_MODIFY_CLOUD_MANAGED_PROXY" }).to_string());
+  }
+
+  // If disabling, check if proxy is used by any synced profile
+  if !enabled && is_proxy_used_by_synced_profile(&proxy_id) {
+    return Err(serde_json::json!({ "code": "SYNC_LOCKED_BY_PROFILE" }).to_string());
+  }
+
+  // If enabling, check that sync settings are configured
+  if enabled {
+    ensure_sync_configured(&app_handle).await?;
+  }
+
+  let new_last_sync = if enabled { proxy.last_sync } else { None };
+  proxy_manager
+    .set_stored_proxy_sync_state(&proxy_id, enabled, new_last_sync)
+    .map_err(|e| {
+      serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": e } }).to_string()
+    })?;
+
+  let _ = events::emit("stored-proxies-changed", ());
+
+  if enabled {
+    clear_config_tombstone(&app_handle, "proxies", &proxy_id).await;
+
+    let _ = events::emit(
+      "proxy-sync-status",
+      serde_json::json!({
+        "id": proxy_id,
+        "status": "syncing"
+      }),
+    );
+
+    if let Some(scheduler) = super::get_global_scheduler() {
+      scheduler.queue_proxy_sync(proxy_id).await;
+    }
+  } else {
+    let _ = events::emit(
+      "proxy-sync-status",
+      serde_json::json!({
+        "id": proxy_id,
+        "status": "disabled"
+      }),
+    );
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub async fn set_group_sync_enabled(
+  app_handle: tauri::AppHandle,
+  group_id: String,
+  enabled: bool,
+) -> Result<(), String> {
+  let group = {
+    let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+    let groups = group_manager.get_all_groups().unwrap_or_default();
+    groups
+      .iter()
+      .find(|g| g.id == group_id)
+      .ok_or_else(|| serde_json::json!({ "code": "GROUP_NOT_FOUND" }).to_string())?
+      .clone()
+  };
+
+  // If disabling, check if group is used by any synced profile
+  if !enabled && is_group_used_by_synced_profile(&group_id) {
+    return Err(serde_json::json!({ "code": "SYNC_LOCKED_BY_PROFILE" }).to_string());
+  }
+
+  // If enabling, check that sync settings are configured
+  if enabled {
+    ensure_sync_configured(&app_handle).await?;
+  }
+
+  let mut updated_group = group.clone();
+  updated_group.sync_enabled = enabled;
+
+  if !enabled {
+    updated_group.last_sync = None;
+  }
+
+  {
+    let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+    if let Err(e) = group_manager.update_group_internal(&updated_group) {
+      return Err(
+        serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": e.to_string() } })
+          .to_string(),
+      );
+    }
+  }
+
+  let _ = events::emit("groups-changed", ());
+
+  if enabled {
+    clear_config_tombstone(&app_handle, "groups", &group_id).await;
+
+    let _ = events::emit(
+      "group-sync-status",
+      serde_json::json!({
+        "id": group_id,
+        "status": "syncing"
+      }),
+    );
+
+    if let Some(scheduler) = super::get_global_scheduler() {
+      scheduler.queue_group_sync(group_id).await;
+    }
+  } else {
+    let _ = events::emit(
+      "group-sync-status",
+      serde_json::json!({
+        "id": group_id,
+        "status": "disabled"
+      }),
+    );
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub fn is_proxy_in_use_by_synced_profile(proxy_id: String) -> bool {
+  is_proxy_used_by_synced_profile(&proxy_id)
+}
+
+#[tauri::command]
+pub fn is_group_in_use_by_synced_profile(group_id: String) -> bool {
+  is_group_used_by_synced_profile(&group_id)
+}
+
+#[tauri::command]
+pub async fn set_vpn_sync_enabled(
+  app_handle: tauri::AppHandle,
+  vpn_id: String,
+  enabled: bool,
+) -> Result<(), String> {
+  let vpn = {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .load_config(&vpn_id)
+      .map_err(|_| serde_json::json!({ "code": "VPN_NOT_FOUND" }).to_string())?
+  };
+
+  // If disabling, check if VPN is used by any synced profile
+  if !enabled && is_vpn_used_by_synced_profile(&vpn_id) {
+    return Err(serde_json::json!({ "code": "SYNC_LOCKED_BY_PROFILE" }).to_string());
+  }
+
+  // If enabling, check that sync settings are configured
+  if enabled {
+    ensure_sync_configured(&app_handle).await?;
+  }
+
+  let last_sync = if enabled { vpn.last_sync } else { None };
+
+  {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .update_sync_fields(&vpn_id, enabled, last_sync)
+      .map_err(|e| {
+        serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": e.to_string() } })
+          .to_string()
+      })?;
+  }
+
+  let _ = events::emit("vpn-configs-changed", ());
+
+  if enabled {
+    clear_config_tombstone(&app_handle, "vpns", &vpn_id).await;
+
+    let _ = events::emit(
+      "vpn-sync-status",
+      serde_json::json!({
+        "id": vpn_id,
+        "status": "syncing"
+      }),
+    );
+
+    if let Some(scheduler) = super::get_global_scheduler() {
+      scheduler.queue_vpn_sync(vpn_id).await;
+    }
+  } else {
+    let _ = events::emit(
+      "vpn-sync-status",
+      serde_json::json!({
+        "id": vpn_id,
+        "status": "disabled"
+      }),
+    );
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub fn is_vpn_in_use_by_synced_profile(vpn_id: String) -> bool {
+  is_vpn_used_by_synced_profile(&vpn_id)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnsyncedEntityCounts {
+  pub proxies: usize,
+  pub groups: usize,
+  pub vpns: usize,
+  pub extensions: usize,
+  pub extension_groups: usize,
+}
+
+#[tauri::command]
+pub fn get_unsynced_entity_counts() -> Result<UnsyncedEntityCounts, String> {
+  let proxy_count = {
+    let proxies = crate::proxy_manager::PROXY_MANAGER.get_stored_proxies();
+    proxies
+      .iter()
+      .filter(|p| !p.sync_enabled && !p.is_cloud_managed)
+      .count()
+  };
+
+  let group_count = {
+    let gm = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+    let groups = gm
+      .get_all_groups()
+      .map_err(|e| format!("Failed to get groups: {e}"))?;
+    groups.iter().filter(|g| !g.sync_enabled).count()
+  };
+
+  let vpn_count = {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    let configs = storage
+      .list_configs()
+      .map_err(|e| format!("Failed to list VPN configs: {e}"))?;
+    configs.iter().filter(|c| !c.sync_enabled).count()
+  };
+
+  let extension_count = {
+    let em = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let exts = em
+      .list_extensions()
+      .map_err(|e| format!("Failed to list extensions: {e}"))?;
+    exts.iter().filter(|e| !e.sync_enabled).count()
+  };
+
+  let extension_group_count = {
+    let em = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let groups = em
+      .list_groups()
+      .map_err(|e| format!("Failed to list extension groups: {e}"))?;
+    groups.iter().filter(|g| !g.sync_enabled).count()
+  };
+
+  Ok(UnsyncedEntityCounts {
+    proxies: proxy_count,
+    groups: group_count,
+    vpns: vpn_count,
+    extensions: extension_count,
+    extension_groups: extension_group_count,
+  })
+}
+
+#[tauri::command]
+pub async fn enable_sync_for_all_entities(app_handle: tauri::AppHandle) -> Result<(), String> {
+  // Intentionally excludes profiles: enabling profile sync uploads the entire
+  // browser data dir per profile, which is destructive if the user expected
+  // an opt-in. Profile sync stays under explicit per-profile control via
+  // set_profile_sync_mode. This command only touches metadata-sized entities.
+
+  // Enable sync for all unsynced proxies
+  {
+    let proxies = crate::proxy_manager::PROXY_MANAGER.get_stored_proxies();
+    for proxy in &proxies {
+      if !proxy.sync_enabled && !proxy.is_cloud_managed {
+        if let Err(e) = set_proxy_sync_enabled(app_handle.clone(), proxy.id.clone(), true).await {
+          log::warn!("Sync enable failed proxy={} err=\"{e}\"", proxy.id);
+        }
+      }
+    }
+  }
+
+  // Enable sync for all unsynced groups
+  {
+    let groups = {
+      let gm = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+      gm.get_all_groups()
+        .map_err(|e| format!("Failed to get groups: {e}"))?
+    };
+    for group in &groups {
+      if !group.sync_enabled {
+        if let Err(e) = set_group_sync_enabled(app_handle.clone(), group.id.clone(), true).await {
+          log::warn!("Sync enable failed group={} err=\"{e}\"", group.id);
+        }
+      }
+    }
+  }
+
+  // Enable sync for all unsynced VPNs
+  {
+    let configs = {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      storage
+        .list_configs()
+        .map_err(|e| format!("Failed to list VPN configs: {e}"))?
+    };
+    for config in &configs {
+      if !config.sync_enabled {
+        if let Err(e) = set_vpn_sync_enabled(app_handle.clone(), config.id.clone(), true).await {
+          log::warn!("Sync enable failed vpn={} err=\"{e}\"", config.id);
+        }
+      }
+    }
+  }
+
+  // Enable sync for all unsynced extensions
+  {
+    let exts = {
+      let em = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      em.list_extensions()
+        .map_err(|e| format!("Failed to list extensions: {e}"))?
+    };
+    for ext in &exts {
+      // Linked extensions are machine-local by definition and are skipped
+      // rather than reported as a failure on every sync setup.
+      if !ext.sync_enabled && !ext.is_linked() {
+        if let Err(e) = set_extension_sync_enabled(app_handle.clone(), ext.id.clone(), true).await {
+          log::warn!("Sync enable failed extension={} err=\"{e}\"", ext.id);
+        }
+      }
+    }
+  }
+
+  // Enable sync for all unsynced extension groups
+  {
+    let groups = {
+      let em = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      em.list_groups()
+        .map_err(|e| format!("Failed to list extension groups: {e}"))?
+    };
+    for group in &groups {
+      if !group.sync_enabled {
+        if let Err(e) =
+          set_extension_group_sync_enabled(app_handle.clone(), group.id.clone(), true).await
+        {
+          log::warn!(
+            "Sync enable failed extension_group={} err=\"{e}\"",
+            group.id
+          );
+        }
+      }
+    }
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub async fn set_extension_sync_enabled(
+  app_handle: tauri::AppHandle,
+  extension_id: String,
+  enabled: bool,
+) -> Result<(), String> {
+  let ext = {
+    let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    manager
+      .get_extension(&extension_id)
+      .map_err(|_| serde_json::json!({ "code": "EXTENSION_NOT_FOUND" }).to_string())?
+  };
+
+  if enabled {
+    // A linked extension is a path on this machine and nothing else; there is
+    // no payload to upload and the path would be meaningless on another device.
+    if ext.is_linked() {
+      return Err(serde_json::json!({ "code": "EXTENSION_LINKED_CANNOT_SYNC" }).to_string());
+    }
+    ensure_sync_configured(&app_handle).await?;
+  }
+
+  let mut updated_ext = ext;
+  updated_ext.sync_enabled = enabled;
+  if !enabled {
+    updated_ext.last_sync = None;
+  }
+
+  {
+    let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    manager
+      .update_extension_internal(&updated_ext)
+      .map_err(|e| {
+        serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": e.to_string() } })
+          .to_string()
+      })?;
+  }
+
+  let _ = events::emit("extensions-changed", ());
+
+  if enabled {
+    clear_config_tombstone(&app_handle, "extensions", &extension_id).await;
+
+    if let Some(scheduler) = super::get_global_scheduler() {
+      scheduler.queue_extension_sync(extension_id).await;
+    }
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub async fn set_extension_group_sync_enabled(
+  app_handle: tauri::AppHandle,
+  extension_group_id: String,
+  enabled: bool,
+) -> Result<(), String> {
+  let group = {
+    let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    manager
+      .get_group(&extension_group_id)
+      .map_err(|_| serde_json::json!({ "code": "EXTENSION_GROUP_NOT_FOUND" }).to_string())?
+  };
+
+  if enabled {
+    ensure_sync_configured(&app_handle).await?;
+  }
+
+  let mut updated_group = group;
+  updated_group.sync_enabled = enabled;
+  if !enabled {
+    updated_group.last_sync = None;
+  }
+
+  {
+    let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    manager.update_group_internal(&updated_group).map_err(|e| {
+      serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": e.to_string() } })
+        .to_string()
+    })?;
+  }
+
+  let _ = events::emit("extensions-changed", ());
+
+  if enabled {
+    clear_config_tombstone(&app_handle, "extension_groups", &extension_group_id).await;
+
+    if let Some(scheduler) = super::get_global_scheduler() {
+      scheduler
+        .queue_extension_group_sync(extension_group_id)
+        .await;
+    }
+  }
+
+  Ok(())
+}
+
+/// Re-upload every sync-enabled entity under the current encryption state.
+/// Called after the user sets, changes, or clears their E2E password —
+/// existing remote bytes are still in the prior state, so without this they'd
+/// remain plaintext (or worse, undecryptable) until the next per-entity edit.
+///
+/// Order: profiles first (so the user can resume work as soon as profile sync
+/// completes), then proxies, groups, VPNs, extensions, extension groups.
+/// Running profiles' associated entities are deferred by 5s so the active
+/// browser session isn't disrupted mid-keystroke.
+///
+/// Progress is emitted via `e2e-rollover-progress` events with `{ stage, done, total }`.
+#[tauri::command]
+pub async fn rollover_encryption_for_all_entities(
+  app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+  let _ = events::emit("e2e-rollover-started", ());
+
+  let internal_error = |detail: String| {
+    serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": detail } }).to_string()
+  };
+  let engine = SyncEngine::create_from_settings(&app_handle)
+    .await
+    .map_err(internal_error)?;
+  let profile_manager = ProfileManager::instance();
+  let profiles = profile_manager
+    .list_profiles()
+    .map_err(|e| internal_error(format!("Failed to list profiles: {e}")))?;
+
+  let synced_profiles: Vec<_> = profiles
+    .iter()
+    .filter(|p| p.sync_mode != SyncMode::Disabled)
+    .collect();
+
+  if synced_profiles
+    .iter()
+    .any(|profile| profile.process_id.is_some())
+  {
+    return Err(serde_json::json!({ "code": "PROFILE_RUNNING" }).to_string());
+  }
+
+  let total_profiles = synced_profiles.len();
+  for (i, profile) in synced_profiles.iter().enumerate() {
+    let id_str = profile.id.to_string();
+    // Keep the old manifest present until the re-encrypted files are uploaded.
+    // Other devices must never interpret a missing manifest as an empty remote
+    // profile and repopulate it with files encrypted by the previous password.
+    let key_prefix = SyncEngine::get_team_key_prefix(profile).await;
+    engine
+      .upload_profile_metadata(&id_str, profile, &key_prefix)
+      .await
+      .map_err(|e| {
+        internal_error(format!(
+          "Failed to roll over profile metadata {id_str}: {e}"
+        ))
+      })?;
+    engine
+      .sync_profile_inner(&app_handle, profile, DiffBias::Auto, true)
+      .await
+      .map_err(|e| internal_error(format!("Failed to roll over profile {id_str}: {e}")))?;
+    let _ = events::emit(
+      "e2e-rollover-progress",
+      serde_json::json!({
+        "stage": "profiles",
+        "done": i + 1,
+        "total": total_profiles,
+      }),
+    );
+  }
+
+  let proxies = crate::proxy_manager::PROXY_MANAGER.get_stored_proxies();
+  let synced_proxies: Vec<_> = proxies.iter().filter(|p| p.sync_enabled).collect();
+  let total_proxies = synced_proxies.len();
+  for (i, proxy) in synced_proxies.iter().enumerate() {
+    engine
+      .upload_proxy(proxy)
+      .await
+      .map_err(|e| internal_error(format!("Failed to roll over proxy {}: {e}", proxy.id)))?;
+    let _ = events::emit(
+      "e2e-rollover-progress",
+      serde_json::json!({"stage": "proxies", "done": i + 1, "total": total_proxies}),
+    );
+  }
+
+  let groups = {
+    let gm = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+    gm.get_all_groups()
+      .map_err(|e| internal_error(format!("Failed to get groups: {e}")))?
+  };
+  let synced_groups: Vec<_> = groups.iter().filter(|g| g.sync_enabled).collect();
+  let total_groups = synced_groups.len();
+  for (i, group) in synced_groups.iter().enumerate() {
+    engine
+      .upload_group(group)
+      .await
+      .map_err(|e| internal_error(format!("Failed to roll over group {}: {e}", group.id)))?;
+    let _ = events::emit(
+      "e2e-rollover-progress",
+      serde_json::json!({"stage": "groups", "done": i + 1, "total": total_groups}),
+    );
+  }
+
+  let vpns = {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .list_configs()
+      .map_err(|e| internal_error(format!("Failed to list VPN configs: {e}")))?
+  };
+  let synced_vpns: Vec<_> = vpns.iter().filter(|v| v.sync_enabled).collect();
+  let total_vpns = synced_vpns.len();
+  for (i, config) in synced_vpns.iter().enumerate() {
+    engine
+      .upload_vpn(config)
+      .await
+      .map_err(|e| internal_error(format!("Failed to roll over VPN {}: {e}", config.id)))?;
+    let _ = events::emit(
+      "e2e-rollover-progress",
+      serde_json::json!({"stage": "vpns", "done": i + 1, "total": total_vpns}),
+    );
+  }
+
+  let extensions = {
+    let em = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    em.list_extensions()
+      .map_err(|e| internal_error(format!("Failed to list extensions: {e}")))?
+  };
+  let synced_exts: Vec<_> = extensions.iter().filter(|e| e.sync_enabled).collect();
+  let total_exts = synced_exts.len();
+  for (i, ext) in synced_exts.iter().enumerate() {
+    engine
+      .upload_extension(ext)
+      .await
+      .map_err(|e| internal_error(format!("Failed to roll over extension {}: {e}", ext.id)))?;
+    let _ = events::emit(
+      "e2e-rollover-progress",
+      serde_json::json!({"stage": "extensions", "done": i + 1, "total": total_exts}),
+    );
+  }
+
+  let ext_groups = {
+    let em = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    em.list_groups()
+      .map_err(|e| internal_error(format!("Failed to list extension groups: {e}")))?
+  };
+  let synced_ext_groups: Vec<_> = ext_groups.iter().filter(|g| g.sync_enabled).collect();
+  let total_eg = synced_ext_groups.len();
+  for (i, group) in synced_ext_groups.iter().enumerate() {
+    engine.upload_extension_group(group).await.map_err(|e| {
+      internal_error(format!(
+        "Failed to roll over extension group {}: {e}",
+        group.id
+      ))
+    })?;
+    let _ = events::emit(
+      "e2e-rollover-progress",
+      serde_json::json!({"stage": "extension_groups", "done": i + 1, "total": total_eg}),
+    );
+  }
+
+  let _ = events::emit("e2e-rollover-completed", ());
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn every_skip_leaves_a_final_row_status() {
+    assert_eq!(ProfileSyncOutcome::Completed.row_status(), "synced");
+    for busy in [
+      "profile is running remotely",
+      "profile is running locally",
+      "profile is locked elsewhere",
+      "remote manifest is not available yet",
+    ] {
+      assert_eq!(ProfileSyncOutcome::Skipped(busy).row_status(), "waiting");
+    }
+    for settled in [
+      "cross-OS profile",
+      "remote work was already pulled",
+      "team profile, self-hosted sync",
+      "the team role cannot add profiles",
+    ] {
+      assert_eq!(ProfileSyncOutcome::Skipped(settled).row_status(), "synced");
+    }
+  }
+
+  #[tokio::test]
+  async fn a_read_only_engine_takes_the_team_copy_of_any_change() {
+    let mut engine = SyncEngine::new("http://127.0.0.1:9".into(), "token".into());
+    assert!(engine.remote_wins(1, 2));
+    assert!(!engine.remote_wins(2, 1));
+    assert!(!engine.remote_wins(2, 2));
+
+    engine.read_only = true;
+    assert!(engine.remote_wins(2, 1));
+    assert!(!engine.remote_wins(2, 2));
+    // Nothing reaches the server: these would fail against the closed port.
+    let json = r#"{"id":"p1"}"#;
+    assert!(engine
+      .upload_config_json("proxies/p1.json", json, 2)
+      .await
+      .is_ok());
+    assert!(engine.delete_proxy("p1").await.is_ok());
+    assert!(engine.delete_profile("p1").await.is_ok());
+  }
+
+  #[test]
+  fn sync_calls_share_a_lock_only_for_the_same_profile() {
+    let first = profile_sync_lock("sync-lock-profile-1")
+      .try_lock_owned()
+      .unwrap();
+    assert!(profile_sync_lock("sync-lock-profile-1")
+      .try_lock_owned()
+      .is_err());
+    assert!(profile_sync_lock("sync-lock-profile-2")
+      .try_lock_owned()
+      .is_ok());
+    drop(first);
+    assert!(profile_sync_lock("sync-lock-profile-1")
+      .try_lock_owned()
+      .is_ok());
+  }
+
+  /// The whole of issue 534, at the only place the user ever sees it.
+  ///
+  /// A self-hosted server signs every presigned URL against the address it uses
+  /// for storage itself. In the documented compose file that is a Docker
+  /// service name, so the server is healthy, `/health` and `/readyz` are green,
+  /// and the client cannot open a single one of the URLs it is handed. The
+  /// reporters got a list of file names, no host and no setting, and there was
+  /// nothing in it to act on.
+  ///
+  /// The message has to carry three things: which files, which host refused
+  /// them, and which setting fixes it.
+  #[test]
+  fn a_transfer_failure_names_the_host_and_the_setting_that_fixes_it() {
+    // Exactly the text the transfer path now produces. The trailing host comes
+    // from `preflight::transport_reason_for`, which the two transfer call sites
+    // in `client.rs` use.
+    let cause = "connection failed: No such host is known. (os error 11001) \
+                 (storage host minio:9000)";
+    let failures = vec![
+      ("profile/Default/Cookies".to_string(), cause.to_string()),
+      ("profile/Default/Login Data".to_string(), cause.to_string()),
+      ("profile/Local State".to_string(), cause.to_string()),
+    ];
+
+    let message = critical_failure_message("upload", &failures);
+
+    assert!(
+      message.contains("minio:9000"),
+      "the reader has to learn which host refused the transfer: {message}"
+    );
+    assert!(
+      message.contains("S3_PUBLIC_ENDPOINT"),
+      "the setting that fixes it lives on the server, so the message has to \
+       name it: {message}"
+    );
+    assert!(
+      message.contains("profile/Default/Cookies"),
+      "the affected files still belong in the message: {message}"
+    );
+  }
+
+  /// The same guarantee, but driven through the real transfer path instead of a
+  /// hand-written cause string.
+  ///
+  /// The test above pins the message builder. This one pins the join: that an
+  /// upload which cannot reach its host actually produces a cause carrying that
+  /// host. Dropping back to a reason that omits the host, which is how this
+  /// shipped for months, breaks this test and not the one above.
+  ///
+  /// No server is involved. `.invalid` never resolves (RFC 2606), so the
+  /// failure is the real one, offline and deterministic.
+  #[tokio::test]
+  async fn an_unreachable_storage_host_survives_the_whole_way_to_the_message() {
+    let client = SyncClient::new("http://127.0.0.1:1".to_string(), "unused".to_string());
+    let presigned = "http://donut-storage.invalid:9000/bucket/profiles/p1/Cookies\
+                     ?X-Amz-Signature=deadbeef";
+
+    let error = client
+      .upload_bytes(presigned, b"payload", None)
+      .await
+      .expect_err("a host that cannot resolve must not report a successful upload");
+
+    let message = critical_failure_message(
+      "upload",
+      &[("profile/Default/Cookies".to_string(), error.to_string())],
+    );
+
+    assert!(
+      message.contains("donut-storage.invalid:9000"),
+      "the host has to survive from the transfer to the message: {message}"
+    );
+    assert!(
+      message.contains("S3_PUBLIC_ENDPOINT"),
+      "an unreachable storage host has one fix, and it is on the server: {message}"
+    );
+    assert!(
+      !message.contains("X-Amz-Signature"),
+      "the signature must never reach the message: {message}"
+    );
+  }
+
+  /// The hint is for a transfer that never connected. A server that answered
+  /// and refused is a different problem with a different fix, and pointing that
+  /// user at their storage endpoint would send them the wrong way.
+  #[test]
+  fn a_rejected_transfer_is_not_blamed_on_the_storage_endpoint() {
+    let failures = vec![(
+      "profile/Default/Cookies".to_string(),
+      "Upload failed with status 403 Forbidden: SignatureDoesNotMatch".to_string(),
+    )];
+
+    let message = critical_failure_message("upload", &failures);
+
+    assert!(message.contains("SignatureDoesNotMatch"), "{message}");
+    assert!(
+      !message.contains("S3_PUBLIC_ENDPOINT"),
+      "a 403 is not an unreachable host: {message}"
+    );
+  }
+
+  #[test]
+  fn test_critical_failure_message_carries_the_cause() {
+    // A self-hosted server that hands out unreachable presigned URLs fails
+    // every file with the same connect error. Naming only the files told the
+    // user nothing about why, which is what made this undiagnosable.
+    let failures = vec![
+      (
+        "Default/Cookies".to_string(),
+        "Failed to upload Default/Cookies after 3 retries: error sending request".to_string(),
+      ),
+      ("Local State".to_string(), "same".to_string()),
+    ];
+
+    let message = critical_failure_message("upload", &failures);
+    assert!(message.contains("Default/Cookies"));
+    assert!(message.contains("Local State"));
+    assert!(message.contains("Cause: Failed to upload Default/Cookies"));
+    assert!(message.contains("Sync aborted to prevent data loss."));
+  }
+
+  #[test]
+  fn test_critical_failure_message_collapses_long_lists() {
+    let failures: Vec<(String, String)> = (0..25)
+      .map(|i| (format!("file-{i}"), "connect error".to_string()))
+      .collect();
+
+    let message = critical_failure_message("download", &failures);
+    assert!(message.contains("file-0"));
+    assert!(message.contains(&format!("file-{}", MAX_LISTED_FAILURES - 1)));
+    assert!(!message.contains(&format!("file-{MAX_LISTED_FAILURES}")));
+    assert!(message.contains("(and 15 more)"));
+    assert!(message.contains("failed to download"));
+  }
+
+  #[test]
+  fn test_critical_failure_message_names_the_storage_endpoint_fix() {
+    // A self-hosted server that signs presigned URLs against a container-only
+    // host fails every transfer at connect while the server itself looks
+    // healthy. Naming the file and the socket error is not enough to find the
+    // setting that fixes it.
+    let failures = vec![(
+      "Default/Cookies".to_string(),
+      "Failed to upload Default/Cookies after 3 retries: connection failed: \
+       failed to lookup address information for minio"
+        .to_string(),
+    )];
+
+    let message = critical_failure_message("upload", &failures);
+    assert!(message.contains("S3_PUBLIC_ENDPOINT"), "{message}");
+    assert!(message.contains("could not be reached from this device"));
+    assert!(message.contains("Sync aborted to prevent data loss."));
+  }
+
+  #[test]
+  fn test_critical_failure_message_omits_the_hint_for_non_transport_causes() {
+    // A rejected signature or a full disk is not a routing problem, and
+    // pointing those users at S3_PUBLIC_ENDPOINT sends them the wrong way.
+    for cause in [
+      "Upload failed with status 403: SignatureDoesNotMatch",
+      "Upload failed with status 507: quota exceeded",
+      "No space left on device",
+    ] {
+      let failures = vec![("Default/Cookies".to_string(), cause.to_string())];
+      let message = critical_failure_message("upload", &failures);
+      assert!(
+        !message.contains("S3_PUBLIC_ENDPOINT"),
+        "hint must not fire for: {cause}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_tombstone_outranks_local() {
+    // No tombstone: the reconcile runs as before.
+    assert!(!tombstone_outranks_local(false, Some(500), 100));
+
+    // The delete happened after the local edit, so it wins and the entity is
+    // never re-uploaded. This is the resurrection loop's entry point.
+    assert!(tombstone_outranks_local(true, Some(500), 100));
+
+    // Local copy already gone (updated_at 0): nothing may be downloaded back.
+    assert!(tombstone_outranks_local(true, Some(500), 0));
+
+    // Same second resolves in favour of the delete.
+    assert!(tombstone_outranks_local(true, Some(500), 500));
+
+    // A local edit made strictly after the delete still wins (last-write-wins).
+    assert!(!tombstone_outranks_local(true, Some(500), 501));
+
+    // An unreadable write time fails closed.
+    assert!(tombstone_outranks_local(true, None, 501));
+  }
+
+  fn other_host_os() -> &'static str {
+    if crate::profile::types::get_host_os() == "windows" {
+      "macos"
+    } else {
+      "windows"
+    }
+  }
+
+  fn synced_profile(browser: &str, host_os: &str) -> BrowserProfile {
+    BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      browser: browser.to_string(),
+      host_os: Some(host_os.to_string()),
+      sync_mode: SyncMode::Regular,
+      ..BrowserProfile::default()
+    }
+  }
+
+  #[test]
+  fn a_wayfern_profile_from_another_os_syncs_its_browser_files() {
+    for os in ["macos", "windows", "linux"] {
+      assert!(
+        syncs_browser_files(&synced_profile("wayfern", os)),
+        "a Wayfern profile created on {os} must sync its data here"
+      );
+    }
+  }
+
+  #[test]
+  fn a_profile_bound_to_another_os_syncs_metadata_only() {
+    assert!(!syncs_browser_files(&synced_profile(
+      "camoufox",
+      other_host_os()
+    )));
+    assert!(syncs_browser_files(&synced_profile(
+      "camoufox",
+      &crate::profile::types::get_host_os()
+    )));
+  }
+
+  #[test]
+  fn a_profile_from_another_os_transfers_its_whole_directory() {
+    // A profile directory as Chromium on Windows leaves it: a raw key file,
+    // migrated network data, and the per-machine files sync never carries.
+    let source = tempfile::TempDir::new().unwrap();
+    let uuid_dir = source.path();
+    let data_dir = uuid_dir.join("profile");
+    let network_dir = data_dir.join("Default").join("Network");
+    fs::create_dir_all(&network_dir).unwrap();
+    fs::create_dir_all(data_dir.join("Default").join("Cache")).unwrap();
+    fs::write(data_dir.join("os_crypt_key"), [0x42u8; 32]).unwrap();
+    fs::write(data_dir.join("Local State"), b"{}").unwrap();
+    fs::write(data_dir.join("Default").join("Preferences"), b"{}").unwrap();
+    fs::write(network_dir.join("Cookies"), b"cookies").unwrap();
+    fs::write(network_dir.join("NetworkDataMigrated"), b"").unwrap();
+    fs::write(data_dir.join("SingletonLock"), b"host-1234").unwrap();
+    fs::write(data_dir.join("Default").join("LOCK"), b"").unwrap();
+    fs::write(data_dir.join("Default").join("Cache").join("data_0"), b"").unwrap();
+    fs::write(uuid_dir.join("metadata.json"), b"{}").unwrap();
+
+    let mut cache = HashCache::default();
+    let remote = generate_manifest("p", uuid_dir, &mut cache).unwrap();
+    let mut uploaded: Vec<&str> = remote.files.iter().map(|f| f.path.as_str()).collect();
+    uploaded.sort_unstable();
+    assert_eq!(
+      uploaded,
+      vec![
+        "profile/Default/Network/Cookies",
+        "profile/Default/Network/NetworkDataMigrated",
+        "profile/Default/Preferences",
+        "profile/Local State",
+        "profile/os_crypt_key",
+      ],
+      "every data file syncs and only the per-machine files stay behind"
+    );
+
+    // The machine on the other OS holds metadata alone; it pulls everything.
+    let target = tempfile::TempDir::new().unwrap();
+    fs::write(target.path().join("metadata.json"), b"{}").unwrap();
+    let mut target_cache = HashCache::default();
+    let local = generate_manifest("p", target.path(), &mut target_cache).unwrap();
+    let diff = compute_diff_with_bias(&local, Some(&remote), DiffBias::Auto);
+    assert_eq!(diff.files_to_download.len(), remote.files.len());
+    assert!(diff.files_to_upload.is_empty());
+    assert!(diff.files_to_delete_remote.is_empty());
+  }
+
+  #[test]
+  fn a_metadata_only_copy_from_another_os_awaits_its_first_download() {
+    let profiles_dir = tempfile::TempDir::new().unwrap();
+    let profile = synced_profile("wayfern", other_host_os());
+    let uuid_dir = profiles_dir.path().join(profile.id.to_string());
+    fs::create_dir_all(&uuid_dir).unwrap();
+    fs::write(uuid_dir.join("metadata.json"), b"{}").unwrap();
+    assert!(awaits_first_download(&profile, profiles_dir.path()));
+
+    // An empty directory tree is still nothing to launch on.
+    let data_dir = profile.get_profile_data_path(profiles_dir.path());
+    fs::create_dir_all(data_dir.join("Default")).unwrap();
+    assert!(awaits_first_download(&profile, profiles_dir.path()));
+
+    // Once any file is there, the launch goes ahead as for any profile.
+    fs::write(data_dir.join("Local State"), b"{}").unwrap();
+    assert!(!awaits_first_download(&profile, profiles_dir.path()));
+  }
+
+  #[test]
+  fn only_a_synced_profile_from_another_os_waits_for_a_download() {
+    let profiles_dir = tempfile::TempDir::new().unwrap();
+    // A new profile created here launches on an empty directory.
+    let local = synced_profile("wayfern", &crate::profile::types::get_host_os());
+    assert!(!awaits_first_download(&local, profiles_dir.path()));
+    // Without sync there is nothing to download.
+    let mut unsynced = synced_profile("wayfern", other_host_os());
+    unsynced.sync_mode = SyncMode::Disabled;
+    assert!(!awaits_first_download(&unsynced, profiles_dir.path()));
+    // A profile bound to another OS never launches here at all.
+    let bound = synced_profile("camoufox", other_host_os());
+    assert!(!awaits_first_download(&bound, profiles_dir.path()));
+  }
+
+  #[test]
+  fn test_rfc3339_secs() {
+    assert_eq!(rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(rfc3339_secs("2024-01-01T00:00:00Z"), Some(1_704_067_200));
+    // S3 returns sub-second precision and offsets other than Z.
+    assert_eq!(
+      rfc3339_secs("2024-01-01T01:00:00.500+01:00"),
+      Some(1_704_067_200)
+    );
+    assert_eq!(rfc3339_secs("not a date"), None);
+    // Pre-epoch cannot be a tombstone write time; treat it as unreadable.
+    assert_eq!(rfc3339_secs("1969-12-31T23:59:59Z"), None);
+  }
+
+  #[test]
+  fn test_is_safe_manifest_path() {
+    // Legitimate profile-relative paths are accepted.
+    assert!(is_safe_manifest_path("Local State"));
+    assert!(is_safe_manifest_path("Default/Cookies"));
+    assert!(is_safe_manifest_path("Default/Secure Preferences"));
+    assert!(is_safe_manifest_path(
+      "Default/Extensions/abc/1.0_0/manifest.json"
+    ));
+    assert!(is_safe_manifest_path("./Default/Preferences"));
+
+    // Traversal / absolute / escaping paths are rejected.
+    assert!(!is_safe_manifest_path(""));
+    assert!(!is_safe_manifest_path("../../../.zshrc"));
+    assert!(!is_safe_manifest_path("Default/../../evil"));
+    assert!(!is_safe_manifest_path(
+      "/Users/victim/Library/LaunchAgents/evil.plist"
+    ));
+    #[cfg(windows)]
+    assert!(!is_safe_manifest_path(r"C:\Windows\System32\evil.dll"));
+  }
+
+  #[test]
+  fn test_checkpoint_sqlite_wal_files() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+
+    // Create a SQLite database in WAL mode and insert data.
+    // Use std::mem::forget to prevent the connection destructor from running,
+    // which simulates a browser crash where WAL is not checkpointed.
+    {
+      let conn = rusqlite::Connection::open(&db_path).unwrap();
+      conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+      conn.pragma_update(None, "wal_autocheckpoint", "0").unwrap();
+      conn
+        .execute(
+          "CREATE TABLE cookies (id INTEGER PRIMARY KEY, value TEXT)",
+          [],
+        )
+        .unwrap();
+      conn
+        .execute(
+          "INSERT INTO cookies (value) VALUES ('session_token_123')",
+          [],
+        )
+        .unwrap();
+      // Leak the connection to prevent auto-checkpoint on drop
+      std::mem::forget(conn);
+    }
+
+    // Verify WAL file exists and has data
+    let wal_path = temp_dir.path().join("test.db-wal");
+    assert!(wal_path.exists(), "WAL file should exist");
+    let wal_size = fs::metadata(&wal_path).unwrap().len();
+    assert!(wal_size > 0, "WAL file should be non-empty");
+
+    // Run checkpoint
+    checkpoint_sqlite_wal_files(temp_dir.path());
+
+    // After checkpoint, WAL should be truncated (empty)
+    let wal_size_after = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+      wal_size_after, 0,
+      "WAL should be truncated after checkpoint"
+    );
+
+    // Verify data is still accessible from the main database
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let value: String = conn
+      .query_row("SELECT value FROM cookies WHERE id = 1", [], |row| {
+        row.get(0)
+      })
+      .unwrap();
+    assert_eq!(value, "session_token_123");
+  }
+
+  #[test]
+  fn test_checkpoint_handles_missing_db() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+
+    // Create a WAL file without a corresponding database
+    let wal_path = temp_dir.path().join("missing.db-wal");
+    fs::write(&wal_path, b"fake wal data").unwrap();
+
+    // Should not panic
+    checkpoint_sqlite_wal_files(temp_dir.path());
+  }
+
+  #[test]
+  fn test_checkpoint_skips_empty_wal() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+
+    // Create a database and checkpoint immediately (WAL is empty)
+    {
+      let conn = rusqlite::Connection::open(&db_path).unwrap();
+      conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+      conn
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+        .unwrap();
+    }
+
+    // Create an empty WAL file
+    let wal_path = temp_dir.path().join("test.db-wal");
+    fs::write(&wal_path, b"").unwrap();
+
+    // Should skip empty WAL without error
+    checkpoint_sqlite_wal_files(temp_dir.path());
+  }
+
+  #[test]
+  fn test_checkpoint_nested_directories() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let nested_dir = temp_dir.path().join("profile").join("Default");
+    fs::create_dir_all(&nested_dir).unwrap();
+
+    let db_path = nested_dir.join("Cookies");
+
+    // Create a database with WAL data, leak connection to simulate crash
+    {
+      let conn = rusqlite::Connection::open(&db_path).unwrap();
+      conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+      conn.pragma_update(None, "wal_autocheckpoint", "0").unwrap();
+      conn
+        .execute(
+          "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT)",
+          [],
+        )
+        .unwrap();
+      conn
+        .execute(
+          "INSERT INTO cookies VALUES ('.example.com', 'session', 'abc')",
+          [],
+        )
+        .unwrap();
+      std::mem::forget(conn);
+    }
+
+    let wal_path = nested_dir.join("Cookies-wal");
+    assert!(wal_path.exists());
+
+    // Checkpoint from the top-level directory
+    checkpoint_sqlite_wal_files(temp_dir.path());
+
+    // Verify data is in the main database
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+      .query_row("SELECT COUNT(*) FROM cookies", [], |row| row.get(0))
+      .unwrap();
+    assert_eq!(count, 1);
+  }
+}

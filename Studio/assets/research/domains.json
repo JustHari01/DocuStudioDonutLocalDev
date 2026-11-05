@@ -1,0 +1,377 @@
+{
+  "G-13": {
+    "name": "Máy công cụ và đo lường",
+    "evidence": [
+      "dung sai",
+      "độ thẳng",
+      "downtime",
+      "hiệu chuẩn",
+      "TCO"
+    ],
+    "keywords": [
+      "工作機械",
+      "精密測定",
+      "設備保全"
+    ],
+    "avoid": [
+      "invented factory results"
+    ],
+    "export_slug": "May cong cu va do luong"
+  },
+  "G-10": {
+    "name": "Đường sắt và hạ tầng",
+    "evidence": [
+      "bảo trì",
+      "khả năng phục hồi",
+      "đúng giờ",
+      "chi phí vòng đời"
+    ],
+    "keywords": [
+      "鉄道",
+      "車両保守",
+      "ライフサイクルコスト"
+    ],
+    "avoid": [
+      "unsupported safety statistics"
+    ],
+    "export_slug": "Duong sat va ha tang"
+  },
+  "G-09": {
+    "name": "Ô tô, hybrid và pin",
+    "evidence": [
+      "độ bền",
+      "điều kiện nhiệt",
+      "suy giảm",
+      "bảo hành"
+    ],
+    "keywords": [
+      "ハイブリッド",
+      "電池劣化",
+      "熱管理"
+    ],
+    "avoid": [
+      "uncontrolled brand comparisons"
+    ],
+    "export_slug": "O to hybrid va pin"
+  },
+  "G-12": {
+    "name": "Vật liệu và thiết bị bán dẫn",
+    "evidence": [
+      "độ tinh khiết",
+      "yield",
+      "độ ổn định giữa các lô"
+    ],
+    "keywords": [
+      "半導体素材",
+      "歩留まり",
+      "製造装置"
+    ],
+    "avoid": [
+      "invented confidential fab data"
+    ],
+    "export_slug": "Vat lieu va thiet bi ban dan"
+  },
+  "G-16": {
+    "name": "Linh kiện và chuỗi cung ứng",
+    "evidence": [
+      "chứng nhận",
+      "lead time",
+      "năng lực cung ứng",
+      "phụ tùng"
+    ],
+    "keywords": [
+      "部品",
+      "サプライチェーン",
+      "品質認証"
+    ],
+    "avoid": [
+      "unsupported supplier accusations"
+    ],
+    "export_slug": "Linh kien va chuoi cung ung"
+  },
+  "G-11": {
+    "name": "Cảng, sân bay và logistics",
+    "evidence": [
+      "bàn giao",
+      "nút thắt",
+      "thời gian chờ",
+      "phục hồi"
+    ],
+    "keywords": [
+      "物流",
+      "空港",
+      "港湾",
+      "引き継ぎ記録"
+    ],
+    "avoid": [
+      "invented incident reports"
+    ],
+    "export_slug": "Cang san bay va logistics"
+  },
+  "R-A6": {
+    "name": "Tiêu chuẩn và chứng nhận",
+    "evidence": [
+      "phạm vi",
+      "phương pháp thử",
+      "truy xuất"
+    ],
+    "keywords": [
+      "規格",
+      "認証",
+      "適合性評価"
+    ],
+    "avoid": [
+      "certification-scope confusion"
+    ],
+    "export_slug": "Tieu chuan va chung nhan",
+    "test_subject": "認証範囲",
+    "test_scene": "product conformity testing"
+  },
+  "R-B2": {
+    "name": "Thương hiệu, bảo hành và hậu mãi",
+    "evidence": [
+      "bảo hành",
+      "phụ tùng",
+      "thời gian sửa"
+    ],
+    "keywords": [
+      "保証範囲",
+      "補修部品",
+      "アフターサービス"
+    ],
+    "avoid": [
+      "fabricated warranty disputes"
+    ],
+    "export_slug": "Thuong hieu bao hanh va hau mai",
+    "test_subject": "補修部品",
+    "test_scene": "repair parts and after-sales service"
+  },
+  "R-B3": {
+    "name": "Bằng sáng chế và nguồn gốc công nghệ",
+    "evidence": [
+      "hồ sơ",
+      "ngày ưu tiên",
+      "yêu cầu bảo hộ"
+    ],
+    "keywords": [
+      "特許出願",
+      "優先日",
+      "先行技術"
+    ],
+    "avoid": [
+      "infringement claims from visual similarity"
+    ],
+    "export_slug": "Bang sang che va nguon goc cong nghe",
+    "test_subject": "特許出願",
+    "test_scene": "public patent drawing and prototype comparison"
+  },
+  "R-B4": {
+    "name": "Tri thức ngầm và monozukuri",
+    "evidence": [
+      "điều kiện",
+      "truyền kỹ năng",
+      "khả năng lặp"
+    ],
+    "keywords": [
+      "暗黙知",
+      "技能伝承",
+      "再現性"
+    ],
+    "avoid": [
+      "nationality stereotypes and secret recipes"
+    ],
+    "export_slug": "Tri thuc ngam va monozukuri",
+    "test_subject": "技能伝承",
+    "test_scene": "adult craft skill transfer"
+  },
+  "R-B5": {
+    "name": "Hợp đồng, đấu thầu và hợp tác quốc tế",
+    "evidence": [
+      "phạm vi",
+      "nghiệm thu",
+      "rủi ro"
+    ],
+    "keywords": [
+      "入札",
+      "契約範囲",
+      "リスク分担"
+    ],
+    "avoid": [
+      "invented contracts and diplomatic quotes"
+    ],
+    "export_slug": "Hop dong dau thau va hop tac quoc te",
+    "test_subject": "契約範囲",
+    "test_scene": "public project scope and handover"
+  },
+  "R-B6": {
+    "name": "Khủng hoảng và khả năng phục hồi hệ thống",
+    "evidence": [
+      "diễn tập",
+      "mốc khôi phục",
+      "chuỗi phụ thuộc"
+    ],
+    "keywords": [
+      "事業継続",
+      "復旧",
+      "冗長化"
+    ],
+    "avoid": [
+      "invented disaster claims"
+    ],
+    "export_slug": "Khung hoang va kha nang phuc hoi",
+    "test_subject": "事業継続",
+    "test_scene": "infrastructure recovery and backup supply"
+  },
+  "R-C1": {
+    "name": "Kỹ sư, chuyển giao và hệ sinh thái",
+    "evidence": [
+      "đào tạo",
+      "phối hợp",
+      "năng lực tổ chức"
+    ],
+    "keywords": [
+      "技術移転",
+      "人材育成",
+      "組織能力"
+    ],
+    "avoid": [
+      "invented poaching and salary claims"
+    ],
+    "export_slug": "Ky su chuyen giao va he sinh thai",
+    "test_subject": "技術移転",
+    "test_scene": "adult engineering team handoff"
+  },
+  "R-C2": {
+    "name": "Tài chính, ngoại hối và thanh khoản",
+    "evidence": [
+      "ngày số liệu",
+      "kỳ hạn",
+      "định nghĩa"
+    ],
+    "keywords": [
+      "為替相場",
+      "流動性",
+      "通貨スワップ"
+    ],
+    "avoid": [
+      "personal financial advice and panic"
+    ],
+    "export_slug": "Tai chinh ngoai hoi va thanh khoan",
+    "test_subject": "資金繰り",
+    "test_scene": "educational currency settlement timeline"
+  },
+  "R-C3": {
+    "name": "Ngân hàng, tín dụng và xếp hạng",
+    "evidence": [
+      "báo cáo",
+      "kỳ hạn",
+      "phạm vi hợp nhất"
+    ],
+    "keywords": [
+      "自己資本",
+      "信用リスク",
+      "格付け"
+    ],
+    "avoid": [
+      "bank-run rumors and personal advice"
+    ],
+    "export_slug": "Ngan hang tin dung va xep hang",
+    "test_subject": "信用リスク",
+    "test_scene": "educational balance-sheet maturity comparison"
+  },
+  "R-H3-01": {
+    "name": "Năng lượng mới và tài nguyên biển sâu",
+    "evidence": [
+      "điều kiện thử",
+      "quy mô",
+      "môi trường"
+    ],
+    "keywords": [
+      "太陽電池",
+      "海底資源",
+      "環境影響評価"
+    ],
+    "avoid": [
+      "commercial claims from laboratory results"
+    ],
+    "export_slug": "Nang luong moi va tai nguyen bien sau",
+    "test_subject": "太陽電池",
+    "test_scene": "solar module durability illustration"
+  },
+  "R-H3-02": {
+    "name": "Hàng không vũ trụ và thăm dò không gian",
+    "evidence": [
+      "trạng thái nhiệm vụ",
+      "kiểm thử",
+      "dữ liệu công khai"
+    ],
+    "keywords": [
+      "打ち上げ",
+      "軌道投入",
+      "探査機"
+    ],
+    "avoid": [
+      "invented mission milestones or telemetry"
+    ],
+    "export_slug": "Hang khong vu tru va tham do khong gian",
+    "test_subject": "地上試験",
+    "test_scene": "public spacecraft ground-test illustration"
+  },
+  "R-H3-03": {
+    "name": "HVAC, bơm nhiệt và thích ứng khí hậu",
+    "evidence": [
+      "điều kiện tải",
+      "theo mùa",
+      "cách nhiệt"
+    ],
+    "keywords": [
+      "ヒートポンプ",
+      "部分負荷",
+      "季節効率"
+    ],
+    "avoid": [
+      "energy savings from unmatched conditions"
+    ],
+    "export_slug": "HVAC bom nhiet va thich ung khi hau",
+    "test_subject": "部分負荷",
+    "test_scene": "heat-pump system operating-condition comparison"
+  },
+  "R-H3-04": {
+    "name": "Kỹ thuật hậu cần quốc phòng và cứu hộ",
+    "evidence": [
+      "tài liệu công khai",
+      "diễn tập",
+      "phạm vi hỗ trợ"
+    ],
+    "keywords": [
+      "災害派遣",
+      "輸送",
+      "共同訓練"
+    ],
+    "avoid": [
+      "weapon operation instructions or fabricated combat"
+    ],
+    "export_slug": "Hau can quoc phong va cuu ho",
+    "test_subject": "災害派遣",
+    "test_scene": "public humanitarian transport logistics illustration"
+  },
+  "R-H3-05": {
+    "name": "Nghệ thuật biểu diễn và công nghệ giải trí",
+    "evidence": [
+      "chương trình",
+      "quyền sử dụng",
+      "ngữ cảnh phản ứng"
+    ],
+    "keywords": [
+      "伝統芸能",
+      "演出",
+      "操作感"
+    ],
+    "avoid": [
+      "fabricated audience reactions and rights claims"
+    ],
+    "export_slug": "Nghe thuat bieu dien va cong nghe giai tri",
+    "test_subject": "伝統芸能",
+    "test_scene": "adult traditional instrument and performance staging"
+  }
+}

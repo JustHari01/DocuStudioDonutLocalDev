@@ -1,0 +1,50 @@
+DOMAIN: G-16 — LINH KIỆN, NHÀ CUNG CẤP VÀ CHUỖI CUNG ỨNG
+Lời hứa kênh: giải thích vì sao một chi tiết nhỏ hoặc hồ sơ chất lượng có thể
+quyết định cả hệ thống, và khi nào thay thế nguồn thực sự khả thi.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Vòng bi/phớt/cảm biến: tương thích điều kiện tải, môi trường và vòng đời.
+2. Qualification: một mẫu đạt khác một quá trình được chấp thuận ổn định.
+3. Truy vết: lot, vật liệu, hồ sơ và cách khoanh vùng ảnh hưởng khi có bất thường.
+4. Năng lực nhà cung cấp: sản lượng danh nghĩa, hàng đạt, mix sản phẩm và bottleneck.
+5. Lead time và phụ tùng: ranh giới đặt hàng/sản xuất/vận chuyển/có thể sử dụng.
+6. Single source/dual source: rủi ro tập trung và chi phí phê duyệt nguồn thứ hai.
+7. Hậu mãi và thiết kế sửa chữa: khả năng tìm đúng mã, hỗ trợ và tương thích phiên bản.
+8. Thay đổi vật liệu/thiết kế: change control, thử lại và tiêu chuẩn chấp nhận.
+9. SME tầng hai/ba: năng lực công đoạn khó nhìn, điều kiện hợp tác và truyền nghề.
+10. Mua hàng/TCO: đơn giá, phế phẩm, tồn kho, downtime và trách nhiệm bảo hành.
+
+VẬT CHỨNG VÀ ĐIỀU KIỆN SO SÁNH
+Ưu tiên datasheet/tiêu chuẩn công khai, hồ sơ phê duyệt, báo cáo kiểm định,
+thông báo thay đổi và dữ liệu khả năng cung ứng có nguồn. Không tự tạo hợp đồng
+hoặc chứng chỉ một nhà cung cấp thật. Chứng chỉ nói về phạm vi cụ thể, không
+chứng minh mọi sản phẩm của công ty đạt mọi mục tiêu hay không bao giờ lỗi.
+So đúng mã, tải, môi trường, tiêu chí test, thời điểm và điều khoản. Không kết
+luận hàng giả/vi phạm/sản phẩm lỗi từ một ảnh hoặc khác màu bao bì khi chưa có
+xác nhận đáng tin. Lead time danh nghĩa khác mức giao hàng được chứng minh.
+
+THUẬT NGỮ VÀ VẬT THỂ NHẬT
+部品: linh kiện; 調達: mua sắm; 納期: hạn giao; 代替品: sản phẩm thay thế;
+供給能力: năng lực cung ứng; 品質認証: chứng nhận chất lượng;
+工程能力: năng lực quá trình; 変更管理: quản lý thay đổi;
+トレーサビリティ: truy vết; 保守部品: phụ tùng bảo trì.
+Chỉ dùng Cpk/MTBF hoặc đại lượng chuyên biệt khi có nguồn, định nghĩa và phạm vi;
+không biến ký hiệu kỹ thuật thành bằng chứng bằng cách chèn vào thumbnail.
+
+CÁCH KỂ PHÙ HỢP
+Một linh kiện đúng kích thước nhưng chưa chứng minh tương thích nhiệm vụ;
+hồ sơ truy vết giúp thu hẹp ảnh hưởng thay vì đổ lỗi toàn bộ lô; nguồn thay thế
+đạt khi quy trình test được sửa hợp lý; đối tác Nhật giúp xử lý một giới hạn
+trong chuỗi. Không dựng nhà cung cấp nước ngoài làm kẻ lừa để ép kết Nhật thắng.
+
+THUMBNAIL/SHOT RIÊNG G-16
+Chi tiết nhỏ nhìn rõ, mối nối/gá lắp, tài liệu qualification hoặc phiếu thay đổi
+làm vật chứng; giấy tờ là minh họa khi chưa có bản thật. Có thể so hai linh kiện
+cùng loại, không so một sensor với cả dây chuyền rồi gán đơn giá/độ bền bịa.
+Shot nối chi tiết → điều kiện dùng → kiểm/chứng nhận → quyết định chuỗi cung ứng.
+
+BIÊN NGÁCH
+Máy cắt/mài/đo là G-13 khi bản thân quá trình gia công là vấn đề chính; purity
+và fab là G-12; luồng container/sân bay là G-11. G-16 lấy thay thế/đảm bảo nguồn
+linh kiện làm câu hỏi cuối. Không biến thành tư vấn cổ phiếu hoặc tranh chấp
+doanh nghiệp có tên thật dựa trên tình tiết tái dựng.

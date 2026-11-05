@@ -1,0 +1,5009 @@
+"use client";
+
+import {
+  flexRender,
+  type RowData,
+  type RowSelectionState,
+  type TableFeatures,
+  type ColumnVisibilityState as VisibilityState,
+} from "@tanstack/react-table";
+import {
+  type LegacyColumnDef as ColumnDef,
+  getCoreRowModel,
+  getSortedRowModel,
+  type LegacyRow as Row,
+  useLegacyTable as useReactTable,
+} from "@tanstack/react-table/legacy";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { invoke } from "@tauri-apps/api/core";
+import { emit, listen } from "@tauri-apps/api/event";
+import { AnimatePresence, motion } from "motion/react";
+import type { Dispatch, SetStateAction } from "react";
+import * as React from "react";
+import { useTranslation } from "react-i18next";
+import {
+  LuArrowDown,
+  LuArrowUp,
+  LuArrowUpDown,
+  LuCheck,
+  LuChevronDown,
+  LuCircleAlert,
+  LuCookie,
+  LuInfo,
+  LuLock,
+  LuMoon,
+  LuPlay,
+  LuPuzzle,
+  LuRefreshCw,
+  LuShuffle,
+  LuSlidersHorizontal,
+  LuSquare,
+  LuTrash2,
+  LuTriangleAlert,
+  LuUsers,
+  LuWifi,
+} from "react-icons/lu";
+import { BulkEditDialog } from "@/components/bulk-edit-dialog";
+import { CookieBotEnrolDialog } from "@/components/cookie-bot-enrol-dialog";
+import { CookieBotRunsDialog } from "@/components/cookie-bot-runs-dialog";
+import {
+  describeCadence,
+  enableProfileSync,
+  minutesToClock,
+  outcomeLabel,
+  type PreflightFix,
+  preflight,
+  preflightFixLabel,
+  preflightReason,
+  runStatusLabel,
+  StatusDot,
+  scheduleBlockedReason,
+  sessionPhaseLabel,
+  sessionTone,
+} from "@/components/cookie-bot-shared";
+import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialog";
+import {
+  ProfileGroupDragHandle,
+  useProfileGroupDrag,
+} from "@/components/profile-group-drag";
+import { ProfileHandoffStatus } from "@/components/profile-handoff-status";
+import {
+  ProfileBypassRulesDialog,
+  ProfileDnsBlocklistDialog,
+  ProfileInfoDialog,
+  ProfileLaunchHookDialog,
+} from "@/components/profile-info-dialog";
+import {
+  ProfileStatusChip,
+  ProfileStatusesDialog,
+} from "@/components/profile-statuses-dialog";
+import {
+  type FitColumn,
+  fitColumns,
+} from "@/components/profile-table/column-fit";
+import {
+  type ProfilesEmptyKind,
+  ProfilesEmptyState,
+} from "@/components/profile-table/empty-states";
+import {
+  LaunchControl,
+  LiveDot,
+} from "@/components/profile-table/launch-control";
+import { RowContextMenuContent } from "@/components/profile-table/row-context-menu";
+import { RowPresence } from "@/components/profile-table/row-presence";
+import {
+  RunningTrafficCell,
+  useTrafficPolling,
+} from "@/components/profile-table/traffic-cell";
+import { TrafficSnapshotStore } from "@/components/profile-table/traffic-snapshots";
+import { SaveTemplateDialog } from "@/components/save-template-dialog";
+import {
+  DATA_TABLE_CLASSES,
+  TableColumnResizer,
+  TableRowCheckbox,
+  TableSelectHeader,
+  TableViewControls,
+} from "@/components/table-controls";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+} from "@/components/ui/command";
+import { ContextMenu, ContextMenuTrigger } from "@/components/ui/context-menu";
+import { CopyToClipboard } from "@/components/ui/copy-to-clipboard";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { FOCUS_RING } from "@/components/ui/focus-ring";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { ProBadge } from "@/components/ui/pro-badge";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useBrowserState } from "@/hooks/use-browser-state";
+import { useCloudAuth } from "@/hooks/use-cloud-auth";
+import { cookieBotScopeFor, useCookieBot } from "@/hooks/use-cookie-bot";
+import { useMotionAllowed } from "@/hooks/use-motion-allowed";
+import { useProxyEvents } from "@/hooks/use-proxy-events";
+import { type ProxyHealth, useProxyHealth } from "@/hooks/use-proxy-health";
+import { useRemoteHandoff } from "@/hooks/use-remote-handoff";
+import { useScrollFade } from "@/hooks/use-scroll-fade";
+import { useSyncPasswordSet } from "@/hooks/use-sync-password";
+import { useTablePreferences } from "@/hooks/use-table-preferences";
+import { useTableKeyboard } from "@/hooks/use-table-tools";
+import { useTeamLocks } from "@/hooks/use-team-locks";
+import { confirmLeave } from "@/hooks/use-unsaved-changes";
+import { useVpnEvents } from "@/hooks/use-vpn-events";
+import { parseBackendError, translateBackendError } from "@/lib/backend-errors";
+import {
+  getBrowserDisplayName,
+  getOSDisplayName,
+  getOSIcon,
+  getProfileIcon,
+  isCrossOsProfile,
+} from "@/lib/browser-utils";
+import { type CoachAnchorId, tipAnchor } from "@/lib/coach-mark";
+import {
+  type CookieBotSchedule,
+  cancelCookieBotRun,
+  deleteCookieBotSchedule,
+  runCookieBotNow,
+} from "@/lib/cookie-bot";
+import { DNS_BLOCKLIST_LEVELS } from "@/lib/dns-blocklist-levels";
+import { canUseCookieBot } from "@/lib/entitlements";
+import { formatRelativeTime } from "@/lib/flag-utils";
+import {
+  MOTION_EASE_IN,
+  MOTION_EASE_OUT,
+  MOTION_SPRING,
+  MOTION_SPRING_POSITION,
+} from "@/lib/motion";
+import { isMacOS } from "@/lib/platform";
+import type { RemoteHandoffState } from "@/lib/remote-sessions";
+import { isKey } from "@/lib/shortcuts";
+import { resolveTableVisibility } from "@/lib/table-tools";
+import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
+import { cn } from "@/lib/utils";
+import type {
+  BrowserProfile,
+  ExtensionGroup,
+  LocationItem,
+  ProfileBotState,
+  ProfileStatus,
+  StoredProxy,
+  SyncSessionInfo,
+  VpnConfig,
+} from "@/types";
+import {
+  ACTION_BAR_BUTTON_CLASS,
+  DataTableActionBar,
+  DataTableActionBarAction,
+  DataTableActionBarSelection,
+  tableSelectionCounts,
+} from "./data-table-action-bar";
+import MultipleSelector, { type Option } from "./multiple-selector";
+import { ProxyCheckButton } from "./proxy-check-button";
+import { TrafficDetailsDialog } from "./traffic-details-dialog";
+import { Input } from "./ui/input";
+import { Skeleton } from "./ui/skeleton";
+
+declare module "@tanstack/table-core" {
+  interface ColumnMeta<
+    TFeatures extends TableFeatures,
+    TData extends RowData,
+    TValue,
+  > {
+    // Emit no width for this column so table-fixed hands it all remaining
+    // space. Checking columnDef.size alone can't express this: TanStack
+    // resolves an unspecified size to its 150px default.
+    flexWidth?: boolean;
+  }
+}
+
+// Stable table meta type to pass volatile state/handlers into TanStack Table without
+// causing column definitions to be recreated on every render.
+interface TableMeta {
+  t: (key: string, options?: Record<string, unknown>) => string;
+  /** Decorative motion may run (pointer user, no reduced motion). */
+  motionAllowed: boolean;
+  /** Profile id -> raw error of its last failed launch. */
+  launchErrors: Record<string, string>;
+  /** Measured route health of running profiles. */
+  proxyHealth: Map<string, ProxyHealth>;
+  openDetails: (
+    profile: BrowserProfile,
+    method: "pointer" | "keyboard",
+  ) => void;
+  startRename: (profile: BrowserProfile) => void;
+  launchRow: (profile: BrowserProfile) => void;
+  stopRow: (profile: BrowserProfile) => void;
+  selectedProfiles: string[];
+  selectedDragProfiles: BrowserProfile[];
+  canDragProfiles: (profiles: BrowserProfile[]) => boolean;
+  isClient: boolean;
+  runningProfiles: Set<string>;
+  launchingProfiles: Set<string>;
+  stoppingProfiles: Set<string>;
+  isUpdating: (browser: string) => boolean;
+  browserState: ReturnType<typeof useBrowserState>;
+
+  // Tags editor state
+  tagsOverrides: Record<string, string[]>;
+  allTags: string[];
+  openTagsEditorFor: string | null;
+  setAllTags: React.Dispatch<React.SetStateAction<string[]>>;
+  setOpenTagsEditorFor: React.Dispatch<React.SetStateAction<string | null>>;
+  setTagsOverrides: React.Dispatch<
+    React.SetStateAction<Record<string, string[]>>
+  >;
+
+  // Note editor state
+  noteOverrides: Record<string, string | null>;
+  openNoteEditorFor: string | null;
+  setOpenNoteEditorFor: React.Dispatch<React.SetStateAction<string | null>>;
+  setNoteOverrides: React.Dispatch<
+    React.SetStateAction<Record<string, string | null>>
+  >;
+
+  // Proxy selector state
+  openProxySelectorFor: string | null;
+  setOpenProxySelectorFor: React.Dispatch<React.SetStateAction<string | null>>;
+  proxyOverrides: Record<string, string | null>;
+  storedProxies: StoredProxy[];
+  /** The proxies a row's picker lists: the user's own, not cloud ones. */
+  pickableProxies: StoredProxy[];
+  handleProxySelection: (
+    profileId: string,
+    proxyId: string | null,
+  ) => void | Promise<void>;
+
+  // VPN selector state
+  vpnConfigs: VpnConfig[];
+  vpnOverrides: Record<string, string | null>;
+  handleVpnSelection: (
+    profileId: string,
+    vpnId: string | null,
+  ) => void | Promise<void>;
+
+  // Extension groups (for Ext column lookup)
+  extensionGroups: ExtensionGroup[];
+
+  profileStatuses: ProfileStatus[];
+  onManageStatuses: () => void;
+
+  // Click handlers for inline Ext / DNS cell editing
+  onAssignExtensionGroup?: (profileIds: string[]) => void;
+  setDnsBlocklistProfile: React.Dispatch<
+    React.SetStateAction<BrowserProfile | null>
+  >;
+
+  // Selection helpers
+
+  // Rename helpers
+  handleRename: () => void | Promise<void>;
+  setProfileToRename: React.Dispatch<
+    React.SetStateAction<BrowserProfile | null>
+  >;
+  setNewProfileName: React.Dispatch<React.SetStateAction<string>>;
+  setRenameError: React.Dispatch<React.SetStateAction<string | null>>;
+  profileToRename: BrowserProfile | null;
+  newProfileName: string;
+  isRenamingSaving: boolean;
+  renameError: string | null;
+
+  // Overflow actions
+  onAssignProfilesToGroup?: (profileIds: string[]) => void;
+  onConfigureWayfern?: (profile: BrowserProfile) => void;
+  onCloneProfile?: (profile: BrowserProfile) => void;
+  onCopyCookiesToProfile?: (profile: BrowserProfile) => void;
+  onOpenCookieManagement?: (profile: BrowserProfile) => void;
+
+  // Live traffic of running rows. A store, not state: a poll re-renders
+  // only the traffic cells whose numbers changed.
+  trafficStore: TrafficSnapshotStore;
+  onOpenTrafficDialog?: (profileId: string) => void;
+
+  // Sync
+  syncStatuses: Record<string, { status: string; error?: string }>;
+  onOpenProfileSyncDialog?: (profile: BrowserProfile) => void;
+  onToggleProfileSync?: (profile: BrowserProfile) => void;
+  crossOsUnlocked?: boolean;
+  syncUnlocked?: boolean;
+
+  // Country proxy creation (inline in proxy dropdown): the countries that
+  // have no proxy yet.
+  creatableCountries: LocationItem[];
+  canCreateLocationProxy: boolean;
+  loadCountries: () => Promise<void>;
+  handleCreateCountryProxy: (
+    profileId: string,
+    country: LocationItem,
+  ) => Promise<void>;
+
+  // Team locks
+  isProfileLockedByAnother: (profileId: string) => boolean;
+  getProfileLockEmail: (profileId: string) => string | undefined;
+
+  // Remote execution.
+  //
+  // `getRemoteHandoff` is the authoritative answer to "can this be opened
+  // here", read from the same store the backend gate reads. The team-lock cache
+  // above cannot serve it: it refreshes on a 30-second poll and says nothing at
+  // all about a session that has finished but whose work has not been pulled
+  // back yet.
+  getRemoteHandoff: (profileId: string) => RemoteHandoffState | null;
+
+  // Synchronizer
+  getProfileSyncInfo: (profileId: string) =>
+    | {
+        session: SyncSessionInfo;
+        isLeader: boolean;
+        failedAtUrl: string | null;
+      }
+    | undefined;
+  onLaunchWithSync: (profile: BrowserProfile) => void;
+
+  // Cookie Bot
+  cookieBotUnlocked: boolean;
+  /** Narrow container: the bot column shows its state mark without the label. */
+  cookieBotCompact: boolean;
+  getProfileBotState: (profileId: string) => ProfileBotState;
+  /** A run this desktop has just asked for, before the stream confirms it. */
+  botPendingProfiles: Set<string>;
+  /** A sync encryption password seals every synced profile for remote hosts. */
+  syncPasswordSet: boolean;
+  onBotEnrol: (profile: BrowserProfile) => void;
+  onBotEdit: (profile: BrowserProfile, schedule: CookieBotSchedule) => void;
+  onBotRunNow: (profile: BrowserProfile) => void;
+  onBotStopRun: (runId: string) => void;
+  onBotViewActivity: (profile: BrowserProfile) => void;
+  onBotUnenrol: (profile: BrowserProfile) => void;
+  /**
+   * Perform the repair a failed preflight names, or null when this surface has
+   * no way to reach it. A reason with no affordance is what the menu showed
+   * before: "No proxy or VPN · Attach a proxy" as inert label text that reads
+   * like a button and answers no click.
+   */
+  onBotFix: ((profile: BrowserProfile, fix: PreflightFix) => void) | null;
+}
+
+/**
+ * What a row can do right now. The launch button, the row menu, a
+ * double-click and Mod+Enter all read this, so they can never disagree.
+ */
+function getRowRuntime(profile: BrowserProfile, meta: TableMeta) {
+  const handoff = meta.getRemoteHandoff(profile.id);
+  // A profile open on the fleet IS running, and the control has to say so:
+  // it is the control that stops it, and stopping now reaches the remote
+  // browser rather than looking for a local process that was never there.
+  const isRunningRemotely = handoff === "running";
+  const isPendingRemotePull = handoff === "pending_sync";
+  const isRunning =
+    (meta.isClient && meta.runningProfiles.has(profile.id)) ||
+    isRunningRemotely;
+  const isLaunching = meta.launchingProfiles.has(profile.id);
+  const isStopping = meta.stoppingProfiles.has(profile.id);
+  const isLockedByAnother = meta.isProfileLockedByAnother(profile.id);
+  const isSyncing = meta.syncStatuses[profile.id]?.status === "syncing";
+  // A remote session holds the profile lock under a different holder than
+  // this device, so `isLockedByAnother` is true for the user's OWN remote
+  // session. That must not disable the control that stops it.
+  const canLaunch = isRunningRemotely
+    ? true
+    : meta.browserState.canLaunchProfile(profile) &&
+      !isPendingRemotePull &&
+      !isLockedByAnother &&
+      !isSyncing;
+  return {
+    isRunningRemotely,
+    isPendingRemotePull,
+    isRunning,
+    isLaunching,
+    isStopping,
+    isLockedByAnother,
+    canLaunch,
+    canToggle: canLaunch && !isLaunching && !isStopping,
+    isRuntimeLocked:
+      (meta.isClient && meta.runningProfiles.has(profile.id)) ||
+      isLaunching ||
+      isStopping,
+  };
+}
+
+/** Launches a stopped row or stops a running one, when it can. */
+function toggleRowRun(profile: BrowserProfile, meta: TableMeta) {
+  const runtime = getRowRuntime(profile, meta);
+  if (!runtime.canToggle) return;
+  if (runtime.isRunning) meta.stopRow(profile);
+  else meta.launchRow(profile);
+}
+
+/** A backend error as the person reads it; a plain string gets `fallback`. */
+function readableError(
+  t: TableMeta["t"],
+  error: unknown,
+  fallback: string,
+): string {
+  return parseBackendError(error)
+    ? translateBackendError(t as never, error)
+    : fallback;
+}
+
+/**
+ * Below this container width the bot column keeps its state mark but drops the
+ * "next run" label: an operator still sees at a glance which rows are enrolled
+ * and which are running, and the row menu stays reachable, without taking the
+ * width the name needs.
+ */
+const BOT_LABEL_WIDTH = 880;
+
+/** The name column keeps at least this much; other columns leave first. */
+const NAME_MIN_WIDTH = 220;
+
+/**
+ * The columns that always show: select (wide enough to show the browser or
+ * OS icon beside the checkbox), launch, sync and details.
+ */
+const SELECT_COLUMN_WIDTH = 56;
+const FIXED_COLUMNS_WIDTH = SELECT_COLUMN_WIDTH + 44 + 28 + 32;
+
+/**
+ * Optional columns, most expendable first, with their floor and their share
+ * of the container. The id, the note and the tags leave first: the details
+ * panel and the search reach them. DNS and status stay longest: they are the
+ * controls the onboarding tour and the tips point at. The proxy column stays:
+ * it is where a running row shows its traffic.
+ */
+const FIT_COLUMNS: FitColumn[] = [
+  { id: "profileId", floor: 100, pct: 0 },
+  { id: "note", floor: 80, pct: 0.1 },
+  { id: "tags", floor: 100, pct: 0.12 },
+  { id: "ext", floor: 95, pct: 0.11 },
+  { id: "dns", floor: 95, pct: 0.11 },
+  { id: "state", floor: 90, pct: 0.1 },
+  { id: "bot", floor: 84, pct: 0.09 },
+  { id: "proxy", floor: 110, pct: 0.13, pinned: true },
+];
+
+/** Rows animate on sort, filter and group changes only while in view. */
+const MAX_ANIMATED_ROWS = 30;
+
+/** Bulk enrolments of this size or larger are confirmed, as run and stop are. */
+const BULK_ENROL_CONFIRM_THRESHOLD = 10;
+
+/**
+ * Run statuses that mean the browser never came up.
+ *
+ * `POST /cookie-bot/runs` answers 202 with the run row it recorded, so a
+ * refusal — no capacity, no sites, a profile someone else has open — arrives as
+ * a successful response carrying a terminal status.
+ */
+const RUN_DID_NOT_START = new Set(["skipped", "failed", "cancelled"]);
+
+interface SyncStatusDot {
+  color: string;
+  tooltip: string;
+  animate: boolean;
+  encrypted: boolean;
+}
+
+/** Formatted last-sync times: formatting a date per row per render is slow. */
+const syncTimeLabels = new Map<number, string>();
+
+function formatSyncTime(seconds: number): string {
+  let label = syncTimeLabels.get(seconds);
+  if (label === undefined) {
+    if (syncTimeLabels.size > 1000) syncTimeLabels.clear();
+    label = new Date(seconds * 1000).toLocaleString();
+    syncTimeLabels.set(seconds, label);
+  }
+  return label;
+}
+
+function getProfileSyncStatusDot(
+  profile: BrowserProfile,
+  liveStatus:
+    | "syncing"
+    | "waiting"
+    | "synced"
+    | "error"
+    | "disabled"
+    | undefined,
+  t: (key: string, options?: Record<string, unknown>) => string,
+  errorMessage?: string,
+): SyncStatusDot | null {
+  const encrypted = profile.sync_mode === "Encrypted";
+  const status =
+    liveStatus ??
+    (profile.sync_mode && profile.sync_mode !== "Disabled"
+      ? "synced"
+      : "disabled");
+
+  switch (status) {
+    case "syncing":
+      return {
+        color: "bg-warning",
+        tooltip: t("profileTable.syncTooltipSyncing"),
+        animate: true,
+        encrypted,
+      };
+    case "waiting":
+      return {
+        color: "bg-warning",
+        tooltip: t("profileTable.syncTooltipCloseToSync"),
+        animate: false,
+        encrypted,
+      };
+    case "synced":
+      return {
+        color: "bg-success",
+        tooltip: profile.last_sync
+          ? t("profileTable.syncTooltipSyncedAt", {
+              time: formatSyncTime(profile.last_sync),
+            })
+          : t("profileTable.syncTooltipSynced"),
+        animate: false,
+        encrypted,
+      };
+    case "error":
+      // The backend now sends error codes; an older plain English string
+      // stays out of the UI and reads as the generic line.
+      return {
+        color: "bg-destructive",
+        tooltip:
+          errorMessage && parseBackendError(errorMessage)
+            ? t("profileTable.syncTooltipErrorWith", {
+                error: translateBackendError(t as never, errorMessage),
+              })
+            : t("profileTable.syncTooltipError"),
+        animate: false,
+        encrypted,
+      };
+    case "disabled":
+      if (profile.last_sync) {
+        return {
+          color: "bg-muted-foreground",
+          tooltip: t("profileTable.syncTooltipDisabledWithLast", {
+            time: formatRelativeTime(profile.last_sync),
+          }),
+          animate: false,
+          encrypted: false,
+        };
+      }
+      return null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * An unset value in a row. A faint dash keeps a long table calm; the
+ * label stays for screen readers, and an editable cell names its action
+ * while the pointer is over it.
+ */
+function EmptyCellValue({
+  label,
+  hint,
+}: {
+  label: string;
+  hint?: string | null;
+}) {
+  return (
+    <span className="flex min-w-0 flex-1 truncate text-sm text-muted-foreground">
+      <span
+        aria-hidden="true"
+        className={cn("opacity-50", hint && "group-hover/cell:hidden")}
+      >
+        —
+      </span>
+      {hint && (
+        <span
+          aria-hidden="true"
+          className="hidden truncate group-hover/cell:inline"
+        >
+          {hint}
+        </span>
+      )}
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
+
+/** Names an editable cell's control for screen readers: "Tags for X: ". */
+function CellLabel({ text }: { text: string }) {
+  return <span className="sr-only">{`${text}: `}</span>;
+}
+
+// Inline extension-group dropdown for the Ext column. Matches the
+// proxy column's Popover-style picker — no nested dialog.
+function ExtCell({
+  profile,
+  meta,
+}: {
+  profile: BrowserProfile;
+  meta: TableMeta;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const groupId = profile.extension_group_id ?? null;
+  const group = groupId
+    ? meta.extensionGroups.find((g) => g.id === groupId)
+    : undefined;
+  const label = group?.name ?? meta.t("profiles.table.none");
+
+  const onPick = async (nextId: string | null) => {
+    setIsSaving(true);
+    try {
+      await invoke("assign_extension_group_to_profile", {
+        profileId: profile.id,
+        extensionGroupId: nextId,
+      });
+    } catch (err) {
+      showErrorToast(translateBackendError(meta.t as never, err));
+    } finally {
+      setIsSaving(false);
+      setOpen(false);
+    }
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          disabled={isSaving}
+          className={cn(
+            "flex h-6 w-full items-center rounded-md px-2 text-left text-sm transition-colors duration-100 hover:bg-foreground/6 disabled:opacity-50",
+            FOCUS_RING,
+          )}
+        >
+          <CellLabel
+            text={meta.t("profileTable.aria.extensionGroup", {
+              name: profile.name,
+            })}
+          />
+          {group ? (
+            <span className="flex-1 truncate" title={label}>
+              {group.name}
+            </span>
+          ) : (
+            <EmptyCellValue label={label} />
+          )}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-56 p-0" align="start">
+        <Command>
+          <CommandInput placeholder={meta.t("profiles.table.extSearch")} />
+          <CommandList>
+            <CommandEmpty>{meta.t("profiles.table.extEmpty")}</CommandEmpty>
+            <CommandGroup>
+              <CommandItem
+                value="__default__"
+                onSelect={() => {
+                  void onPick(null);
+                }}
+              >
+                {groupId === null && <LuCheck className="mr-2 size-3.5" />}
+                <span className={groupId === null ? "" : "ml-5"}>
+                  {meta.t("profiles.table.none")}
+                </span>
+              </CommandItem>
+              {meta.extensionGroups.map((g) => (
+                <CommandItem
+                  key={g.id}
+                  value={g.name}
+                  onSelect={() => {
+                    void onPick(g.id);
+                  }}
+                >
+                  {groupId === g.id && <LuCheck className="mr-2 size-3.5" />}
+                  <span className={groupId === g.id ? "" : "ml-5"}>
+                    {g.name}
+                  </span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** The column headers a feature tip can point at. */
+const COLUMN_ANCHORS: Partial<Record<string, CoachAnchorId>> = {
+  state: "column-state",
+  proxy: "column-proxy",
+  ext: "column-ext",
+  dns: "column-dns",
+};
+
+function columnAnchor(columnId: string) {
+  const anchor = COLUMN_ANCHORS[columnId];
+  return anchor ? tipAnchor(anchor) : {};
+}
+
+// Inline DNS blocklist dropdown — same Popover/Command pattern as Ext.
+function DnsCell({
+  profile,
+  meta,
+}: {
+  profile: BrowserProfile;
+  meta: TableMeta;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const level = profile.dns_blocklist ?? null;
+  const LEVELS = DNS_BLOCKLIST_LEVELS;
+  const currentLabel =
+    level === null
+      ? null
+      : (LEVELS.find((l) => l.value === level)?.labelKey ?? null);
+
+  const onPick = async (nextLevel: string | null) => {
+    setIsSaving(true);
+    try {
+      await invoke("update_profile_dns_blocklist", {
+        profileId: profile.id,
+        dnsBlocklist: nextLevel,
+      });
+    } catch (err) {
+      showErrorToast(translateBackendError(meta.t as never, err));
+    } finally {
+      setIsSaving(false);
+      setOpen(false);
+    }
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          {...tipAnchor("row-dns")}
+          disabled={isSaving}
+          className={cn(
+            "flex h-6 w-full items-center rounded-md px-2 text-left text-sm transition-colors duration-100 hover:bg-foreground/6 disabled:opacity-50",
+            FOCUS_RING,
+          )}
+          title={
+            level
+              ? meta.t("profiles.table.dnsLevel", { level })
+              : meta.t("dnsBlocklist.none")
+          }
+        >
+          <CellLabel
+            text={meta.t("profileTable.aria.dns", { name: profile.name })}
+          />
+          {currentLabel ? (
+            <span className="flex-1 truncate">{meta.t(currentLabel)}</span>
+          ) : (
+            <EmptyCellValue label={meta.t("dnsBlocklist.none")} />
+          )}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-48 p-0" align="start">
+        <Command>
+          <CommandList>
+            <CommandGroup>
+              <CommandItem
+                value="__none__"
+                onSelect={() => {
+                  void onPick(null);
+                }}
+              >
+                {level === null && <LuCheck className="mr-2 size-3.5" />}
+                <span className={level === null ? "" : "ml-5"}>
+                  {meta.t("dnsBlocklist.none")}
+                </span>
+              </CommandItem>
+              {LEVELS.map((l) => (
+                <CommandItem
+                  key={l.value}
+                  value={l.value}
+                  onSelect={() => {
+                    void onPick(l.value);
+                  }}
+                >
+                  {level === l.value && <LuCheck className="mr-2 size-3.5" />}
+                  <span className={level === l.value ? "" : "ml-5"}>
+                    {meta.t(l.labelKey)}
+                  </span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+// Inline status dropdown, same Popover/Command pattern as DNS. A status is a
+// label, so it stays editable while the profile runs.
+function StatusCell({
+  profile,
+  meta,
+}: {
+  profile: BrowserProfile;
+  meta: TableMeta;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const current =
+    meta.profileStatuses.find((status) => status.id === profile.status_id) ??
+    null;
+
+  const onPick = async (statusId: string | null) => {
+    setIsSaving(true);
+    try {
+      await invoke("set_profiles_status", {
+        profileIds: [profile.id],
+        statusId,
+      });
+    } catch (error) {
+      showErrorToast(translateBackendError(meta.t as never, error));
+    } finally {
+      setIsSaving(false);
+      setOpen(false);
+    }
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-slot="profile-status-cell"
+          disabled={isSaving}
+          className={cn(
+            "flex h-6 w-full min-w-0 items-center rounded-md px-2 text-left text-sm transition-colors duration-100 hover:bg-foreground/6 disabled:opacity-50",
+            FOCUS_RING,
+          )}
+        >
+          <CellLabel
+            text={meta.t("profileTable.aria.status", { name: profile.name })}
+          />
+          {current ? (
+            <ProfileStatusChip status={current} />
+          ) : (
+            <EmptyCellValue label={meta.t("profileStatuses.none")} />
+          )}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-52 p-0" align="start">
+        <Command>
+          {meta.profileStatuses.length > 8 && (
+            <CommandInput placeholder={meta.t("profileStatuses.search")} />
+          )}
+          <CommandList>
+            <CommandEmpty>{meta.t("profileStatuses.noMatch")}</CommandEmpty>
+            <CommandGroup>
+              <CommandItem value="__none__" onSelect={() => void onPick(null)}>
+                {current === null && <LuCheck className="mr-2 size-3.5" />}
+                <span className={current === null ? "" : "ml-5"}>
+                  {meta.t("profileStatuses.none")}
+                </span>
+              </CommandItem>
+              {meta.profileStatuses.map((status) => (
+                <CommandItem
+                  key={status.id}
+                  value={`${status.name} ${status.id}`}
+                  onSelect={() => void onPick(status.id)}
+                >
+                  {current?.id === status.id && (
+                    <LuCheck className="mr-2 size-3.5" />
+                  )}
+                  <span
+                    className={
+                      current?.id === status.id ? "min-w-0" : "ml-5 min-w-0"
+                    }
+                  >
+                    <ProfileStatusChip status={status} />
+                  </span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+            <CommandSeparator />
+            <CommandGroup>
+              <CommandItem
+                value="__manage__"
+                onSelect={() => {
+                  setOpen(false);
+                  meta.onManageStatuses();
+                }}
+              >
+                <span className="ml-5">{meta.t("profileStatuses.manage")}</span>
+              </CommandItem>
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/**
+ * The first eight characters of the profile's UUID: the whole first group of a
+ * v4, which is also the prefix `id:` searches on, so what the row shows can be
+ * pasted straight back into the search box. The clipboard gets the FULL id —
+ * the only thing it is for is the REST and MCP APIs, which take nothing less.
+ */
+function ProfileIdCell({
+  profile,
+  meta,
+}: {
+  profile: BrowserProfile;
+  meta: TableMeta;
+}) {
+  return (
+    <div className="flex h-7 w-full items-center gap-1">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex-1 truncate font-mono text-[11px] text-muted-foreground select-text">
+            {profile.id.slice(0, 8)}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="font-mono text-[11px]">
+          {profile.id}
+        </TooltipContent>
+      </Tooltip>
+      <CopyToClipboard
+        text={profile.id}
+        variant="subtle"
+        className="row-reveal size-6 rounded-md"
+        successMessage={meta.t("toasts.success.copied")}
+      />
+    </div>
+  );
+}
+
+const TagsCell = React.memo<{
+  profile: BrowserProfile;
+  isDisabled: boolean;
+  tagsOverrides: Record<string, string[]>;
+  allTags: string[];
+  setAllTags: React.Dispatch<React.SetStateAction<string[]>>;
+  openTagsEditorFor: string | null;
+  setOpenTagsEditorFor: React.Dispatch<React.SetStateAction<string | null>>;
+  setTagsOverrides: React.Dispatch<
+    React.SetStateAction<Record<string, string[]>>
+  >;
+}>(
+  ({
+    profile,
+    isDisabled,
+    tagsOverrides,
+    allTags,
+    setAllTags,
+    openTagsEditorFor,
+    setOpenTagsEditorFor,
+    setTagsOverrides,
+  }) => {
+    const { t: translate } = useTranslation();
+    const effectiveTags: string[] = Object.hasOwn(tagsOverrides, profile.id)
+      ? tagsOverrides[profile.id]
+      : (profile.tags ?? []);
+
+    const valueOptions: Option[] = React.useMemo(
+      () => effectiveTags.map((t) => ({ value: t, label: t })),
+      [effectiveTags],
+    );
+    const allOptions: Option[] = React.useMemo(
+      () => allTags.map((t) => ({ value: t, label: t })),
+      [allTags],
+    );
+
+    const onTagsChange = React.useCallback(
+      async (newTagsRaw: string[]) => {
+        // Dedupe tags
+        const seen = new Set<string>();
+        const newTags: string[] = [];
+        for (const t of newTagsRaw) {
+          if (!seen.has(t)) {
+            seen.add(t);
+            newTags.push(t);
+          }
+        }
+        const before = effectiveTags;
+        setTagsOverrides((prev) => ({ ...prev, [profile.id]: newTags }));
+        try {
+          await invoke<BrowserProfile>("update_profile_tags", {
+            profileId: profile.id,
+            tags: newTags,
+          });
+          setAllTags((prev) => {
+            const next = new Set(prev);
+            for (const t of newTags) next.add(t);
+            return Array.from(next).sort();
+          });
+        } catch (error) {
+          setTagsOverrides((prev) => ({ ...prev, [profile.id]: before }));
+          showErrorToast(translateBackendError(translate as never, error));
+        }
+      },
+      [profile.id, effectiveTags, setTagsOverrides, setAllTags, translate],
+    );
+
+    const handleChange = React.useCallback(
+      async (opts: Option[]) => {
+        const newTagsRaw = opts.map((o) => o.value);
+        await onTagsChange(newTagsRaw);
+      },
+      [onTagsChange],
+    );
+
+    const containerRef = React.useRef<HTMLDivElement | null>(null);
+    const editorRef = React.useRef<HTMLDivElement | null>(null);
+    const [visibleCount, setVisibleCount] = React.useState<number>(
+      effectiveTags.length,
+    );
+    const [isFocused, setIsFocused] = React.useState(false);
+
+    React.useLayoutEffect(() => {
+      // Only measure when not editing this profile's tags
+      if (openTagsEditorFor === profile.id) return;
+      const container = containerRef.current;
+      if (!container) return;
+
+      let timeoutId: number | undefined;
+      const compute = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        timeoutId = window.setTimeout(() => {
+          const available = container.clientWidth;
+          if (available <= 0) return;
+          const canvas = document.createElement("canvas");
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          const style = window.getComputedStyle(container);
+          const font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+          ctx.font = font;
+          const padding = 16;
+          const gap = 4;
+          let used = 0;
+          let count = 0;
+          for (let i = 0; i < effectiveTags.length; i++) {
+            const text = effectiveTags[i];
+            const width = Math.ceil(ctx.measureText(text).width) + padding;
+            const remaining = effectiveTags.length - (i + 1);
+            let extra = 0;
+            if (remaining > 0) {
+              const plusText = `+${remaining}`;
+              extra = Math.ceil(ctx.measureText(plusText).width) + padding;
+            }
+            const nextUsed =
+              used +
+              (used > 0 ? gap : 0) +
+              width +
+              (remaining > 0 ? gap + extra : 0);
+            if (nextUsed <= available) {
+              used += (used > 0 ? gap : 0) + width;
+              count = i + 1;
+            } else {
+              break;
+            }
+          }
+          setVisibleCount(count);
+        }, 16); // Debounce with RAF timing
+      };
+      compute();
+      const ro = new ResizeObserver(compute);
+      ro.observe(container);
+      return () => {
+        ro.disconnect();
+        if (timeoutId) clearTimeout(timeoutId);
+      };
+    }, [effectiveTags, openTagsEditorFor, profile.id]);
+
+    React.useEffect(() => {
+      if (openTagsEditorFor !== profile.id) return;
+      const handleClick = (e: MouseEvent) => {
+        const target = e.target as Node | null;
+        if (
+          editorRef.current &&
+          target &&
+          !editorRef.current.contains(target)
+        ) {
+          setOpenTagsEditorFor(null);
+        }
+      };
+      document.addEventListener("mousedown", handleClick);
+      return () => {
+        document.removeEventListener("mousedown", handleClick);
+      };
+    }, [openTagsEditorFor, profile.id, setOpenTagsEditorFor]);
+
+    React.useEffect(() => {
+      if (openTagsEditorFor === profile.id && editorRef.current) {
+        // Focus the inner input of MultipleSelector on open
+        const inputEl = editorRef.current.querySelector("input");
+        if (inputEl) {
+          inputEl.focus();
+        }
+      }
+    }, [openTagsEditorFor, profile.id]);
+
+    if (openTagsEditorFor !== profile.id) {
+      const hiddenCount = Math.max(0, effectiveTags.length - visibleCount);
+      const ButtonContent = (
+        <button
+          type="button"
+          ref={containerRef as unknown as React.RefObject<HTMLButtonElement>}
+          className={cn(
+            "group/cell flex h-6 w-full cursor-pointer items-center gap-1 overflow-hidden rounded-md border-none bg-transparent px-2 py-1 transition-colors duration-100",
+            FOCUS_RING,
+            isDisabled
+              ? "cursor-not-allowed opacity-60"
+              : "cursor-pointer hover:bg-foreground/6",
+          )}
+          onClick={() => {
+            if (!isDisabled) setOpenTagsEditorFor(profile.id);
+          }}
+        >
+          <CellLabel
+            text={translate("profileTable.aria.tags", { name: profile.name })}
+          />
+          {effectiveTags.slice(0, visibleCount).map((t) => (
+            <Badge key={t} variant="soft" className="px-2 py-0 text-xs">
+              {t}
+            </Badge>
+          ))}
+          {effectiveTags.length === 0 && (
+            <EmptyCellValue
+              hint={
+                isDisabled ? null : translate("profileTable.addTagsPlaceholder")
+              }
+              label={translate("profileTable.noTags")}
+            />
+          )}
+          {hiddenCount > 0 && (
+            <Badge
+              variant="soft"
+              className="px-1.5 py-0 text-xs text-muted-foreground"
+            >
+              +{hiddenCount}
+            </Badge>
+          )}
+        </button>
+      );
+
+      return (
+        <div className="h-6 w-full cursor-pointer">
+          <Tooltip>
+            <TooltipTrigger asChild>{ButtonContent}</TooltipTrigger>
+            {hiddenCount > 0 && (
+              <TooltipContent className="max-w-[320px]">
+                <div className="flex flex-wrap gap-1">
+                  {effectiveTags.map((t) => (
+                    <Badge key={t} variant="soft" className="px-2 py-0 text-xs">
+                      {t}
+                    </Badge>
+                  ))}
+                </div>
+              </TooltipContent>
+            )}
+          </Tooltip>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={cn(
+          "relative h-6 w-full",
+          isDisabled && "pointer-events-none opacity-60",
+        )}
+      >
+        <div
+          ref={editorRef}
+          className="absolute top-0 left-0 z-50 min-h-6 w-40 rounded-md bg-popover shadow-md"
+        >
+          <MultipleSelector
+            value={valueOptions}
+            options={allOptions}
+            onChange={(opts) => void handleChange(opts)}
+            creatable
+            selectFirstItem={false}
+            placeholder={
+              effectiveTags.length === 0
+                ? translate("profileTable.addTagsPlaceholder")
+                : ""
+            }
+            className={cn(
+              "border-0! bg-transparent focus-within:ring-0! focus-within:ring-offset-0!",
+              "[&_div:first-child]:border-0! [&_div:first-child]:ring-0! [&_div:first-child]:focus-within:ring-0!",
+              "[&_div:first-child]:min-h-6! [&_div:first-child]:px-2! [&_div:first-child]:py-1!",
+              "[&_div:first-child>div]:h-6! [&_div:first-child>div]:items-center",
+              "[&_input]:mt-0! [&_input]:ml-0! [&_input]:px-0!",
+              !isFocused && "[&_div:first-child>div]:justify-center",
+            )}
+            badgeClassName="shrink-0"
+            inputProps={{
+              className: "!py-0 text-sm caret-current !ml-0 !mt-0 !px-0",
+              onKeyDown: (e) => {
+                if (e.key === "Escape") setOpenTagsEditorFor(null);
+              },
+              onFocus: () => {
+                setIsFocused(true);
+              },
+              onBlur: () => {
+                setIsFocused(false);
+              },
+            }}
+          />
+        </div>
+      </div>
+    );
+  },
+);
+
+TagsCell.displayName = "TagsCell";
+
+const NonHoverableTooltip = React.memo<{
+  children: React.ReactNode;
+  content: React.ReactNode;
+  sideOffset?: number;
+  alignOffset?: number;
+  horizontalOffset?: number;
+}>(
+  ({
+    children,
+    content,
+    sideOffset = 4,
+    alignOffset = 0,
+    horizontalOffset = 0,
+  }) => {
+    const [isOpen, setIsOpen] = React.useState(false);
+
+    return (
+      <Tooltip open={isOpen} onOpenChange={setIsOpen}>
+        <TooltipTrigger
+          asChild
+          onMouseEnter={() => {
+            setIsOpen(true);
+          }}
+          onMouseLeave={() => {
+            setIsOpen(false);
+          }}
+        >
+          {children}
+        </TooltipTrigger>
+        <TooltipContent
+          sideOffset={sideOffset}
+          alignOffset={alignOffset}
+          arrowOffset={horizontalOffset}
+          onPointerEnter={(e) => {
+            e.preventDefault();
+          }}
+          onPointerLeave={() => {
+            setIsOpen(false);
+          }}
+          className="pointer-events-none"
+          style={
+            horizontalOffset !== 0
+              ? { transform: `translateX(${horizontalOffset}px)` }
+              : undefined
+          }
+        >
+          {content}
+        </TooltipContent>
+      </Tooltip>
+    );
+  },
+);
+
+NonHoverableTooltip.displayName = "NonHoverableTooltip";
+
+// CSS-truncated text whose tooltip only appears when the text actually
+// overflows its column (measured on hover, so it tracks live resizes).
+const OverflowTooltipText = React.memo<{
+  text: string;
+  className?: string;
+}>(({ text, className }) => {
+  const textRef = React.useRef<HTMLSpanElement | null>(null);
+  const [isOverflowing, setIsOverflowing] = React.useState(false);
+
+  return (
+    <Tooltip
+      onOpenChange={(open) => {
+        if (!open) return;
+        const el = textRef.current;
+        if (el) setIsOverflowing(el.scrollWidth > el.clientWidth);
+      }}
+    >
+      <TooltipTrigger asChild>
+        <span
+          ref={textRef}
+          className={cn("block max-w-full min-w-0 truncate", className)}
+        >
+          {text}
+        </span>
+      </TooltipTrigger>
+      {isOverflowing && <TooltipContent>{text}</TooltipContent>}
+    </Tooltip>
+  );
+});
+
+OverflowTooltipText.displayName = "OverflowTooltipText";
+
+/**
+ * A row's proxy and VPN list. Its own component so the list is built only
+ * while the popover shows, not on every render of every row.
+ */
+function ProxyPicker({
+  profileId,
+  meta,
+  selectedId,
+  proxyId,
+  vpnId,
+}: {
+  profileId: string;
+  meta: TableMeta;
+  /** The assigned proxy or VPN, or null. */
+  selectedId: string | null;
+  /** The assigned proxy when no VPN overrides it. */
+  proxyId: string | null;
+  vpnId: string | null;
+}) {
+  const { t } = meta;
+  return (
+    <Command>
+      <CommandInput
+        placeholder={
+          meta.canCreateLocationProxy
+            ? t("createProfile.proxy.searchWithCountries")
+            : t("createProfile.proxy.search")
+        }
+        onFocus={() => {
+          if (meta.canCreateLocationProxy) void meta.loadCountries();
+        }}
+      />
+      <CommandList>
+        <CommandEmpty>{t("createProfile.proxy.notFound")}</CommandEmpty>
+        <CommandGroup>
+          <CommandItem
+            value="__none__"
+            onSelect={() => void meta.handleProxySelection(profileId, null)}
+          >
+            <LuCheck
+              className={cn(
+                "mr-2 size-4",
+                selectedId === null ? "opacity-100" : "opacity-0",
+              )}
+            />
+            {t("common.labels.none")}
+          </CommandItem>
+          {meta.pickableProxies.map((proxy) => (
+            <CommandItem
+              key={proxy.id}
+              value={proxy.name}
+              onSelect={() =>
+                void meta.handleProxySelection(profileId, proxy.id)
+              }
+            >
+              <LuCheck
+                className={cn(
+                  "mr-2 size-4",
+                  proxyId === proxy.id ? "opacity-100" : "opacity-0",
+                )}
+              />
+              {proxy.name}
+            </CommandItem>
+          ))}
+        </CommandGroup>
+        {meta.vpnConfigs.length > 0 && (
+          <CommandGroup heading={t("profileTable.vpnsHeading")}>
+            {meta.vpnConfigs.map((vpn) => (
+              <CommandItem
+                key={vpn.id}
+                value={`vpn-${vpn.name}`}
+                onSelect={() => void meta.handleVpnSelection(profileId, vpn.id)}
+              >
+                <LuCheck
+                  className={cn(
+                    "mr-2 size-4",
+                    vpnId === vpn.id ? "opacity-100" : "opacity-0",
+                  )}
+                />
+                <Badge
+                  variant="soft"
+                  className="mr-1 px-1 py-0 text-[11px] leading-tight"
+                >
+                  WG
+                </Badge>
+                {vpn.name}
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
+        {meta.canCreateLocationProxy && meta.creatableCountries.length > 0 && (
+          <CommandGroup heading={t("profileTable.createByCountryHeading")}>
+            {meta.creatableCountries.map((country) => (
+              <CommandItem
+                key={`country-${country.code}`}
+                value={`create-${country.name}`}
+                onSelect={() =>
+                  void meta.handleCreateCountryProxy(profileId, country)
+                }
+              >
+                <span className="mr-2 size-4" />+ {country.name}
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
+      </CommandList>
+    </Command>
+  );
+}
+
+// Must be rendered inside a <Popover>; the tooltip shows the full assignment
+// name only when it is truncated in the cell.
+const ProxyCellTrigger = React.memo<{
+  profileName: string;
+  displayName: string;
+  hasAssignment: boolean;
+  vpnBadge: string | null;
+  isDisabled: boolean;
+}>(({ profileName, displayName, hasAssignment, vpnBadge, isDisabled }) => {
+  const { t } = useTranslation();
+  const textRef = React.useRef<HTMLSpanElement | null>(null);
+  const [isOverflowing, setIsOverflowing] = React.useState(false);
+
+  return (
+    <Tooltip
+      onOpenChange={(open) => {
+        if (!open) return;
+        const el = textRef.current;
+        if (el) setIsOverflowing(el.scrollWidth > el.clientWidth);
+      }}
+    >
+      <TooltipTrigger asChild>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            disabled={isDisabled}
+            aria-label={t("profileTable.aria.proxy", {
+              name: profileName,
+              value: displayName,
+            })}
+            className={cn(
+              "flex h-6 max-w-full min-w-0 items-center gap-1.5 rounded-md border-none bg-transparent px-2 py-1 text-left transition-colors duration-100",
+              FOCUS_RING,
+              isDisabled
+                ? "cursor-not-allowed opacity-60"
+                : "cursor-pointer hover:bg-foreground/6",
+            )}
+          >
+            {vpnBadge && (
+              <Badge
+                variant="soft"
+                className="shrink-0 px-1 py-0 text-[11px] leading-tight"
+              >
+                {vpnBadge}
+              </Badge>
+            )}
+            {hasAssignment ? (
+              <span ref={textRef} className="min-w-0 truncate text-sm">
+                {displayName}
+              </span>
+            ) : (
+              <EmptyCellValue label={displayName} />
+            )}
+          </button>
+        </PopoverTrigger>
+      </TooltipTrigger>
+      {hasAssignment && isOverflowing && (
+        <TooltipContent>{displayName}</TooltipContent>
+      )}
+    </Tooltip>
+  );
+});
+
+ProxyCellTrigger.displayName = "ProxyCellTrigger";
+
+const NoteCell = React.memo<{
+  profile: BrowserProfile;
+  isDisabled: boolean;
+  noteOverrides: Record<string, string | null>;
+  openNoteEditorFor: string | null;
+  setOpenNoteEditorFor: React.Dispatch<React.SetStateAction<string | null>>;
+  setNoteOverrides: React.Dispatch<
+    React.SetStateAction<Record<string, string | null>>
+  >;
+}>(
+  ({
+    profile,
+    isDisabled,
+    noteOverrides,
+    openNoteEditorFor,
+    setOpenNoteEditorFor,
+    setNoteOverrides,
+  }) => {
+    const { t } = useTranslation();
+    const effectiveNote: string | null = Object.hasOwn(
+      noteOverrides,
+      profile.id,
+    )
+      ? noteOverrides[profile.id]
+      : (profile.note ?? null);
+
+    const onNoteChange = React.useCallback(
+      async (newNote: string | null) => {
+        const trimmedNote = newNote?.trim() ?? null;
+        const before = effectiveNote;
+        if (trimmedNote === (before?.trim() ?? null)) return;
+        setNoteOverrides((prev) => ({ ...prev, [profile.id]: trimmedNote }));
+        try {
+          await invoke<BrowserProfile>("update_profile_note", {
+            profileId: profile.id,
+            note: trimmedNote,
+          });
+        } catch (error) {
+          setNoteOverrides((prev) => ({ ...prev, [profile.id]: before }));
+          showErrorToast(translateBackendError(t as never, error));
+        }
+      },
+      [profile.id, effectiveNote, setNoteOverrides, t],
+    );
+
+    const editorRef = React.useRef<HTMLDivElement | null>(null);
+    const textareaRef = React.useRef<HTMLTextAreaElement | null>(null);
+    const [noteValue, setNoteValue] = React.useState(effectiveNote ?? "");
+
+    // Update local state when effective note changes (from outside)
+    React.useEffect(() => {
+      if (openNoteEditorFor !== profile.id) {
+        setNoteValue(effectiveNote ?? "");
+      }
+    }, [effectiveNote, openNoteEditorFor, profile.id]);
+
+    // Auto-resize textarea on open
+    React.useEffect(() => {
+      if (openNoteEditorFor === profile.id && textareaRef.current) {
+        const textarea = textareaRef.current;
+        textarea.style.height = "auto";
+        textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+      }
+    }, [openNoteEditorFor, profile.id]);
+
+    const handleTextareaChange = React.useCallback(
+      (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+        const newValue = e.target.value;
+        setNoteValue(newValue);
+        // Auto-resize
+        const textarea = e.target;
+        textarea.style.height = "auto";
+        textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+      },
+      [],
+    );
+
+    React.useEffect(() => {
+      if (openNoteEditorFor !== profile.id) return;
+      const handleClick = (e: MouseEvent) => {
+        const target = e.target as Node | null;
+        if (
+          editorRef.current &&
+          target &&
+          !editorRef.current.contains(target)
+        ) {
+          const currentValue = textareaRef.current?.value ?? "";
+          void onNoteChange(currentValue);
+          setOpenNoteEditorFor(null);
+        }
+      };
+      document.addEventListener("mousedown", handleClick);
+      return () => {
+        document.removeEventListener("mousedown", handleClick);
+      };
+    }, [openNoteEditorFor, profile.id, setOpenNoteEditorFor, onNoteChange]);
+
+    React.useEffect(() => {
+      if (openNoteEditorFor === profile.id && textareaRef.current) {
+        textareaRef.current.focus();
+        // Move cursor to end
+        const len = textareaRef.current.value.length;
+        textareaRef.current.setSelectionRange(len, len);
+      }
+    }, [openNoteEditorFor, profile.id]);
+
+    const displayNote = effectiveNote ?? "";
+    const showTooltip = displayNote.length > 0;
+
+    if (openNoteEditorFor !== profile.id) {
+      return (
+        <div className="min-h-6 w-full">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={cn(
+                  "group/cell flex min-h-6 w-full min-w-0 items-center rounded-md border-none bg-transparent px-2 py-1 text-left transition-colors duration-100",
+                  FOCUS_RING,
+                  isDisabled
+                    ? "cursor-not-allowed opacity-60"
+                    : "cursor-pointer hover:bg-foreground/6",
+                )}
+                onClick={() => {
+                  if (!isDisabled) {
+                    setNoteValue(effectiveNote ?? "");
+                    setOpenNoteEditorFor(profile.id);
+                  }
+                }}
+              >
+                <CellLabel
+                  text={t("profileTable.aria.note", { name: profile.name })}
+                />
+                {effectiveNote ? (
+                  <span className="block w-full truncate text-sm">
+                    {displayNote}
+                  </span>
+                ) : (
+                  <EmptyCellValue
+                    hint={isDisabled ? null : t("profiles.note.placeholder")}
+                    label={t("profiles.note.empty")}
+                  />
+                )}
+              </button>
+            </TooltipTrigger>
+            {showTooltip && (
+              <TooltipContent className="max-w-[320px]">
+                <p className="wrap-break-word whitespace-pre-wrap">
+                  {effectiveNote ?? t("profiles.note.empty")}
+                </p>
+              </TooltipContent>
+            )}
+          </Tooltip>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={cn(
+          "relative w-full",
+          isDisabled && "pointer-events-none opacity-60",
+        )}
+      >
+        <div
+          ref={editorRef}
+          className="absolute top-[-15px] -left-px z-50 min-h-6 w-60 rounded-md border bg-popover shadow-md"
+        >
+          <textarea
+            ref={textareaRef}
+            value={noteValue}
+            onChange={handleTextareaChange}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setNoteValue(effectiveNote ?? "");
+                setOpenNoteEditorFor(null);
+              } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                void onNoteChange(noteValue);
+                setOpenNoteEditorFor(null);
+              }
+            }}
+            onBlur={() => {
+              void onNoteChange(noteValue);
+              setOpenNoteEditorFor(null);
+            }}
+            placeholder={t("profiles.note.placeholder")}
+            aria-label={t("profileTable.aria.note", { name: profile.name })}
+            className="max-h-[200px] min-h-6 w-full resize-none border-0 bg-transparent px-2 py-1 text-sm focus:ring-0 focus:outline-none"
+            style={{
+              overflow: "auto",
+            }}
+            rows={1}
+          />
+        </div>
+      </div>
+    );
+  },
+);
+
+NoteCell.displayName = "NoteCell";
+
+/** `HH:MM` of the server's own next-run instant, in this machine's locale. */
+function formatNextRun(schedule: CookieBotSchedule): string | null {
+  if (!schedule.next_run_at) return null;
+  const date = new Date(schedule.next_run_at);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/**
+ * One row's Cookie Bot state, and the row's bot actions.
+ *
+ * The whole cell is the menu trigger. A dedicated kebab would cost another
+ * column of width in a table that is already dense, and the state mark is
+ * exactly the thing an operator reaches for when they want to change it. The
+ * dot, the tone and the phase wording all come from the shared status
+ * vocabulary, so a run cannot read one way here and another on the Cookie Bot
+ * page.
+ */
+const BotCell = React.memo<{
+  profile: BrowserProfile;
+  meta: TableMeta;
+}>(({ profile, meta }) => {
+  // Own `t` rather than `meta.t`: the shared status helpers take a real
+  // `TFunction`, and every other cell in this file resolves it the same way.
+  const { t } = useTranslation();
+  const { schedule, liveSession } = meta.getProfileBotState(profile.id);
+  const check = preflight(profile, meta.syncPasswordSet);
+  const isPending = meta.botPendingProfiles.has(profile.id);
+  const isLive = liveSession !== null;
+  const nextRun = schedule ? formatNextRun(schedule) : null;
+
+  // The server computes "why tonight would be refused" on every read, precisely
+  // so a detached proxy is visible in the afternoon rather than announcing
+  // itself as a skipped run at 02:00. Dropping it left a broken enrolment
+  // showing a healthy dot and a next-run time it could never keep.
+  const blockedReason = schedule ? scheduleBlockedReason(t, schedule) : null;
+
+  // `provisioning` is a transfer in progress — the one meaning the app already
+  // reserves a pulsing dot for. Nothing else pulses.
+  const isPreparing = liveSession?.state === "provisioning" || isPending;
+  const tone = liveSession
+    ? sessionTone(liveSession)
+    : isPending
+      ? "warning"
+      : schedule
+        ? schedule.enabled && !blockedReason
+          ? "muted"
+          : "warning"
+        : null;
+
+  const label = isPending
+    ? t("cookieBot.status.provisioning")
+    : liveSession
+      ? sessionPhaseLabel(t, liveSession)
+      : schedule
+        ? !schedule.enabled
+          ? t("cookieBot.state.paused")
+          : (blockedReason ?? nextRun ?? t("cookieBot.state.enrolled"))
+        : "—";
+
+  const summary = schedule
+    ? blockedReason
+      ? t("cookieBot.state.blocked", { reason: blockedReason })
+      : t("cookieBot.state.summary", {
+          cadence: describeCadence(t, schedule.days_mask),
+          time: minutesToClock(schedule.run_at_minute),
+        })
+    : check.eligible
+      ? t("cookieBot.state.notEnrolled")
+      : // The repair is its own menu item when this surface can reach it, so
+        // the label stays a statement instead of looking like a second button.
+        [
+          preflightReason(t, check),
+          meta.onBotFix ? null : preflightFixLabel(t, check.fix),
+        ]
+          .filter(Boolean)
+          .join(" · ");
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label={t("cookieBot.state.rowMenu", { name: profile.name })}
+          className="flex h-6 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2 text-left transition-colors duration-100 hover:bg-foreground/6"
+        >
+          {tone ? (
+            <StatusDot tone={tone} pulse={isPreparing} className="size-1.5" />
+          ) : (
+            <span aria-hidden="true" className="size-1.5 shrink-0" />
+          )}
+          {!meta.cookieBotCompact && (
+            <span
+              className={cn(
+                "min-w-0 truncate text-xs tabular-nums",
+                isLive || isPending
+                  ? "text-foreground"
+                  : "text-muted-foreground",
+              )}
+            >
+              {label}
+            </span>
+          )}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-56">
+        <DropdownMenuLabel className="font-normal text-muted-foreground">
+          {summary}
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {schedule ? (
+          <>
+            <DropdownMenuItem
+              onClick={() => {
+                meta.onBotEdit(profile, schedule);
+              }}
+            >
+              {t("cookieBot.actions.editSchedule")}
+            </DropdownMenuItem>
+            {liveSession?.run_id ? (
+              <DropdownMenuItem
+                onClick={() => {
+                  if (liveSession.run_id) {
+                    meta.onBotStopRun(liveSession.run_id);
+                  }
+                }}
+              >
+                {t("cookieBot.running.stop")}
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem
+                disabled={isLive || isPending}
+                onClick={() => {
+                  meta.onBotRunNow(profile);
+                }}
+              >
+                {t("cookieBot.actions.runNow")}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem
+              onClick={() => {
+                meta.onBotViewActivity(profile);
+              }}
+            >
+              {t("cookieBot.actions.viewActivity")}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              variant="destructive"
+              onClick={() => {
+                meta.onBotUnenrol(profile);
+              }}
+            >
+              {t("cookieBot.schedule.unenrol")}
+            </DropdownMenuItem>
+          </>
+        ) : (
+          <>
+            {!check.eligible && check.fix && meta.onBotFix && (
+              <DropdownMenuItem
+                onClick={() => {
+                  meta.onBotFix?.(profile, check.fix as PreflightFix);
+                }}
+              >
+                {preflightFixLabel(t, check.fix)}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem
+              disabled={!check.eligible}
+              onClick={() => {
+                meta.onBotEnrol(profile);
+              }}
+            >
+              {t("cookieBot.actions.enrol")}
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+});
+
+BotCell.displayName = "BotCell";
+
+type CellProps = (
+  rowId: string,
+  columnId: string,
+) => {
+  "data-table-column": string;
+  tabIndex: number;
+  onFocus: () => void;
+};
+
+/**
+ * One table row. Memoized: it re-renders when its profile, the table meta,
+ * its selection, focus, motion or the column layout change, and never for
+ * a parent render that changed none of them.
+ */
+const ProfileTableRow = React.memo(function ProfileTableRow({
+  ref,
+  row,
+  meta,
+  rowIndex,
+  rowHeight,
+  selected,
+  inspected,
+  moving,
+  crossOsTitle,
+  cellPropsRef,
+  columnWidth,
+  sizing,
+  layoutDependency,
+  riseKind,
+  riseIndex,
+  flashAt,
+  fades,
+}: {
+  ref?: React.Ref<HTMLTableRowElement>;
+  row: Row<BrowserProfile>;
+  meta: TableMeta;
+  rowIndex: number;
+  rowHeight: number;
+  selected: boolean;
+  inspected: boolean;
+  moving: boolean;
+  crossOsTitle: string | undefined;
+  /**
+   * The column of the table's one tab stop, when it is in this row. Read by
+   * the memo only: the cells take their tab stop from `cellPropsRef`.
+   */
+  activeColumn: string | null;
+  cellPropsRef: React.RefObject<CellProps>;
+  /** The visible column ids, read by the memo: a change redraws the cells. */
+  columnsKey: string;
+  columnWidth: (id: string, sizePx: number) => string;
+  sizing: Record<string, number>;
+  layoutDependency: string;
+  /** Set only in the moment rows enter after a load or an order change. */
+  riseKind: "load" | "change" | null;
+  riseIndex: number;
+  /** Set while a new profile's row flashes once. */
+  flashAt: number | null;
+  fades: (id: string) => boolean;
+}) {
+  const rise =
+    riseKind === "load"
+      ? riseIndex < 8
+        ? {
+            initial: { opacity: 0.6, y: 4 },
+            duration: 0.2,
+            delay: riseIndex * 0.02,
+          }
+        : null
+      : riseKind === "change"
+        ? {
+            initial: { opacity: 0.5, y: 4 },
+            duration: 0.14,
+            delay: Math.min(riseIndex * 0.015, 0.15),
+          }
+        : null;
+  const flashing = flashAt !== null;
+  return (
+    <RowPresence ref={ref} fades={() => fades(row.id)}>
+      {(rowRef) => (
+        <motion.tr
+          ref={rowRef}
+          data-slot="table-row"
+          role="row"
+          aria-rowindex={rowIndex + 2}
+          aria-selected={selected}
+          data-table-row={row.id}
+          data-profile-id={row.id}
+          data-inspected={inspected ? "true" : undefined}
+          data-moving={moving ? "true" : undefined}
+          data-state={selected ? "selected" : undefined}
+          title={crossOsTitle}
+          style={{ height: `${rowHeight}px` }}
+          className={cn(
+            "transition-colors data-[motion-pop-id]:table data-[motion-pop-id]:table-fixed",
+            DATA_TABLE_CLASSES.row,
+            "overflow-visible",
+            crossOsTitle !== undefined && "opacity-60",
+          )}
+          layout="position"
+          layoutDependency={layoutDependency}
+          initial={rise ? rise.initial : false}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{
+            duration: rise?.duration ?? 0,
+            delay: rise?.delay ?? 0,
+            ease: MOTION_EASE_OUT,
+            layout: MOTION_SPRING_POSITION,
+          }}
+          onDoubleClick={(event) => {
+            const target = event.target as HTMLElement;
+            const control = target.closest(
+              'button, a, input, textarea, [role="checkbox"], [role="combobox"], [role="button"]',
+            );
+            if (control && !control.hasAttribute("data-row-name")) return;
+            window.getSelection()?.removeAllRanges();
+            toggleRowRun(row.original, meta);
+          }}
+        >
+          {row.getVisibleCells().map((cell, columnIndex) => (
+            <TableCell
+              key={cell.id}
+              role="gridcell"
+              aria-colindex={columnIndex + 1}
+              {...cellPropsRef.current(row.id, cell.column.id)}
+              className={cn(
+                DATA_TABLE_CLASSES.cell,
+                "overflow-visible",
+                flashing && "relative",
+              )}
+              style={{
+                width:
+                  cell.column.columnDef.meta?.flexWidth &&
+                  !sizing[cell.column.id]
+                    ? undefined
+                    : columnWidth(cell.column.id, cell.column.getSize()),
+              }}
+            >
+              {flashing && (
+                <motion.span
+                  key={flashAt}
+                  aria-hidden="true"
+                  data-slot="profile-row-flash"
+                  className="pointer-events-none absolute inset-0 rounded-[inherit] bg-primary/12"
+                  initial={{ opacity: 1 }}
+                  animate={{ opacity: 0 }}
+                  transition={{ duration: 0.9, ease: MOTION_EASE_OUT }}
+                />
+              )}
+              {flexRender(cell.column.columnDef.cell, cell.getContext())}
+            </TableCell>
+          ))}
+        </motion.tr>
+      )}
+    </RowPresence>
+  );
+});
+
+interface ProfilesDataTableProps {
+  filterControls?: React.ReactNode;
+  onClearFilters?: () => void;
+  profiles: BrowserProfile[];
+  allProfiles?: BrowserProfile[];
+  onLaunchProfile: (profile: BrowserProfile) => void | Promise<unknown>;
+  onKillProfile: (profile: BrowserProfile) => void | Promise<void>;
+  onCloneProfile: (profile: BrowserProfile) => void | Promise<void>;
+  onDeleteProfile: (profile: BrowserProfile) => void | Promise<void>;
+  onRenameProfile: (profileId: string, newName: string) => Promise<void>;
+  onConfigureWayfern: (profile: BrowserProfile) => void;
+  onCopyCookiesToProfile?: (profile: BrowserProfile) => void;
+  onOpenCookieManagement?: (profile: BrowserProfile) => void;
+  runningProfiles: Set<string>;
+  /**
+   * Loaded by the page rather than here, because the search filter resolves
+   * `ext:` to a group name and needs the same list. One invoke, one listener.
+   */
+  extensionGroups: ExtensionGroup[];
+  /** Loaded by the page for the same reason: `state:` resolves to names. */
+  profileStatuses?: ProfileStatus[];
+  isUpdating: (browser: string) => boolean;
+  onDeleteSelectedProfiles: (profileIds: string[]) => Promise<void>;
+  onAssignProfilesToGroup: (profileIds: string[]) => void;
+  /** Opens proxy assignment for a specific set of profiles. */
+  onAssignProfilesToProxy?: (profileIds: string[]) => void;
+  selectedGroupId: string | null;
+  selectedProfiles: string[];
+  onSelectedProfilesChange: Dispatch<SetStateAction<string[]>>;
+  onBulkDelete?: () => void;
+  onBulkGroupAssignment?: () => void;
+  onBulkProxyAssignment?: () => void;
+  onBulkProxyDistribution?: () => void;
+  onBulkCopyCookies?: () => void;
+  onBulkRun?: () => void;
+  onBulkStop?: () => void;
+  bulkActionsUnlocked?: boolean;
+  onBulkExtensionGroupAssignment?: () => void;
+  onAssignExtensionGroup?: (profileIds: string[]) => void;
+  onOpenProfileSyncDialog?: (profile: BrowserProfile) => void;
+  onToggleProfileSync?: (profile: BrowserProfile) => void;
+  crossOsUnlocked?: boolean;
+  syncUnlocked?: boolean;
+  getProfileSyncInfo?: (profileId: string) =>
+    | {
+        session: SyncSessionInfo;
+        isLeader: boolean;
+        failedAtUrl: string | null;
+      }
+    | undefined;
+  onLaunchWithSync?: (profile: BrowserProfile) => void;
+  onSetPassword?: (profile: BrowserProfile) => void;
+  onChangePassword?: (profile: BrowserProfile) => void;
+  onRemovePassword?: (profile: BrowserProfile) => void;
+  /**
+   * When provided, the info dialog is controlled by the parent. Allows the
+   * command palette in page.tsx to open the dialog directly without lifting
+   * every other piece of internal table state.
+   */
+  infoDialogProfile?: BrowserProfile | null;
+  infoOpenMethod?: "pointer" | "keyboard";
+  onInfoOpenMethodChange?: (method: "pointer" | "keyboard") => void;
+  onInfoDialogProfileChange?: (profile: BrowserProfile | null) => void;
+  /** Initial data load in flight — renders skeleton rows instead of "empty". */
+  isLoading?: boolean;
+  /** True when the app has zero profiles overall (not just a filtered view). */
+  showOnboardingEmptyState?: boolean;
+  onCreateProfile?: () => void;
+  onImportProfiles?: () => void;
+  /** Profile id -> raw error of its last failed launch. */
+  launchErrors?: Record<string, string>;
+  /** Opens profile creation with the selected group preset. */
+  onCreateProfileInGroup?: () => void;
+  /** Opens a picker that moves existing profiles into the selected group. */
+  onMoveProfilesHere?: () => void;
+  onBulkEnableSync?: () => void;
+  onDuplicateProfile?: (profile: BrowserProfile) => void;
+  onLockProfile?: (profile: BrowserProfile) => void;
+  onRunRemote?: (profile: BrowserProfile) => void;
+}
+
+const EMPTY_LAUNCH_ERRORS: Record<string, string> = {};
+
+const EMPTY_STATUSES: ProfileStatus[] = [];
+
+export function ProfilesDataTable({
+  filterControls,
+  onClearFilters,
+  profiles,
+  allProfiles = profiles,
+  onLaunchProfile,
+  onKillProfile,
+  onCloneProfile,
+  onDeleteProfile,
+  onRenameProfile,
+  onConfigureWayfern,
+  onCopyCookiesToProfile,
+  onOpenCookieManagement,
+  runningProfiles,
+  extensionGroups,
+  profileStatuses = EMPTY_STATUSES,
+  isUpdating,
+  onAssignProfilesToGroup,
+  onAssignProfilesToProxy,
+  selectedProfiles,
+  onSelectedProfilesChange,
+  onBulkDelete,
+  onBulkGroupAssignment,
+  onBulkProxyAssignment,
+  onBulkProxyDistribution,
+  onBulkCopyCookies,
+  onBulkRun,
+  onBulkStop,
+  bulkActionsUnlocked = false,
+  onBulkExtensionGroupAssignment,
+  onAssignExtensionGroup,
+  onOpenProfileSyncDialog,
+  onToggleProfileSync,
+  crossOsUnlocked = false,
+  syncUnlocked = false,
+  getProfileSyncInfo,
+  onLaunchWithSync,
+  onSetPassword,
+  onChangePassword,
+  onRemovePassword,
+  infoDialogProfile,
+  infoOpenMethod,
+  onInfoOpenMethodChange,
+  onInfoDialogProfileChange,
+  isLoading = false,
+  showOnboardingEmptyState = false,
+  onCreateProfile,
+  onImportProfiles,
+  launchErrors = EMPTY_LAUNCH_ERRORS,
+  onCreateProfileInGroup,
+  onMoveProfilesHere,
+  onBulkEnableSync,
+  onDuplicateProfile,
+  onLockProfile,
+  onRunRemote,
+  onDeleteSelectedProfiles,
+  selectedGroupId,
+}: ProfilesDataTableProps) {
+  const { t } = useTranslation();
+  const motionAllowed = useMotionAllowed();
+  const proxyHealth = useProxyHealth();
+  const profileDrag = useProfileGroupDrag();
+  const [internalInfoOpenMethod, setInternalInfoOpenMethod] = React.useState<
+    "pointer" | "keyboard"
+  >("pointer");
+  const view = useTablePreferences("profiles");
+  const sorting = view.preferences.sorting;
+
+  const rowSelection = React.useMemo<RowSelectionState>(
+    () => Object.fromEntries(selectedProfiles.map((id) => [id, true])),
+    [selectedProfiles],
+  );
+  const handleRowSelectionChange = React.useCallback(
+    (updater: React.SetStateAction<RowSelectionState>) => {
+      onSelectedProfilesChange((previous) => {
+        const selection = Object.fromEntries(
+          previous.map((id) => [id, true as const]),
+        );
+        const next =
+          typeof updater === "function" ? updater(selection) : updater;
+        return Object.keys(next).filter((id) => next[id]);
+      });
+    },
+    [onSelectedProfilesChange],
+  );
+  const [profileToRename, setProfileToRename] =
+    React.useState<BrowserProfile | null>(null);
+  const [newProfileName, setNewProfileName] = React.useState("");
+  const [renameError, setRenameError] = React.useState<string | null>(null);
+  const [isRenamingSaving, setIsRenamingSaving] = React.useState(false);
+  const renameContainerRef = React.useRef<HTMLDivElement | null>(null);
+  const [profileToDelete, setProfileToDelete] =
+    React.useState<BrowserProfile | null>(null);
+  const [isDeleting, setIsDeleting] = React.useState(false);
+  const [internalInfoDialogProfile, setInternalInfoDialogProfile] =
+    React.useState<BrowserProfile | null>(null);
+  const isInfoDialogControlled = onInfoDialogProfileChange !== undefined;
+  const profileForInfoDialog = isInfoDialogControlled
+    ? (infoDialogProfile ?? null)
+    : internalInfoDialogProfile;
+  const setProfileForInfoDialog = React.useCallback(
+    (p: BrowserProfile | null) => {
+      if (isInfoDialogControlled) {
+        onInfoDialogProfileChange?.(p);
+      } else {
+        setInternalInfoDialogProfile(p);
+      }
+    },
+    [isInfoDialogControlled, onInfoDialogProfileChange],
+  );
+  React.useEffect(() => {
+    if (
+      profileForInfoDialog &&
+      !allProfiles.some((profile) => profile.id === profileForInfoDialog.id)
+    ) {
+      setProfileForInfoDialog(null);
+    }
+  }, [allProfiles, profileForInfoDialog, setProfileForInfoDialog]);
+  const [bypassRulesProfile, setBypassRulesProfile] =
+    React.useState<BrowserProfile | null>(null);
+  const [statusesDialogOpen, setStatusesDialogOpen] = React.useState(false);
+  const [bulkEditOpen, setBulkEditOpen] = React.useState(false);
+  const [templateProfile, setTemplateProfile] =
+    React.useState<BrowserProfile | null>(null);
+  const [dnsBlocklistProfile, setDnsBlocklistProfile] =
+    React.useState<BrowserProfile | null>(null);
+  const [launchHookProfile, setLaunchHookProfile] =
+    React.useState<BrowserProfile | null>(null);
+  const [launchingProfiles, setLaunchingProfiles] = React.useState<Set<string>>(
+    new Set(),
+  );
+  const [stoppingProfiles, setStoppingProfiles] = React.useState<Set<string>>(
+    new Set(),
+  );
+
+  const { storedProxies } = useProxyEvents();
+  const { vpnConfigs } = useVpnEvents();
+  const { user } = useCloudAuth();
+  const { isProfileLocked, getLockInfo } = useTeamLocks(user?.id);
+  // Which profiles cannot be opened on this computer, and why. Event-driven and
+  // read from the backend's own gate, so the button state and the refusal the
+  // backend would give can never disagree.
+  const { handoffFor } = useRemoteHandoff();
+
+  // Cookie Bot. Enrolments and live runs both live server-side, so the table
+  // reads them from the shared store rather than from BrowserProfile.
+  const cookieBotUnlocked = canUseCookieBot(user);
+  const {
+    scheduleFor,
+    liveSessionFor,
+    refresh: refreshCookieBotState,
+  } = useCookieBot(cookieBotUnlocked, cookieBotScopeFor(user));
+  const [botPendingProfiles, setBotPendingProfiles] = React.useState<
+    Set<string>
+  >(new Set());
+  const syncPasswordSet = useSyncPasswordSet();
+  const [botScheduleDialog, setBotScheduleDialog] = React.useState<{
+    profiles: BrowserProfile[];
+    existing: CookieBotSchedule | null;
+  } | null>(null);
+  const [botRunsProfile, setBotRunsProfile] =
+    React.useState<BrowserProfile | null>(null);
+  const [botUnenrolProfile, setBotUnenrolProfile] =
+    React.useState<BrowserProfile | null>(null);
+  const [isUnenrolling, setIsUnenrolling] = React.useState(false);
+  const [pendingBulkEnrol, setPendingBulkEnrol] = React.useState<
+    BrowserProfile[] | null
+  >(null);
+
+  // Content columns grow proportionally with the container but never drop
+  // below the compact-layout floor; the name column takes the remainder.
+  // Computed in px from the observed container width because fixed table
+  // layout ignores max()/calc() column widths.
+  const [containerWidth, setContainerWidth] = React.useState(0);
+
+  const [proxyOverrides, setProxyOverrides] = React.useState<
+    Record<string, string | null>
+  >({});
+  const [vpnOverrides, setVpnOverrides] = React.useState<
+    Record<string, string | null>
+  >({});
+  const [tagsOverrides, setTagsOverrides] = React.useState<
+    Record<string, string[]>
+  >({});
+  const [allTags, setAllTags] = React.useState<string[]>([]);
+  const [openTagsEditorFor, setOpenTagsEditorFor] = React.useState<
+    string | null
+  >(null);
+  const [openProxySelectorFor, setOpenProxySelectorFor] = React.useState<
+    string | null
+  >(null);
+  const [noteOverrides, setNoteOverrides] = React.useState<
+    Record<string, string | null>
+  >({});
+  const [openNoteEditorFor, setOpenNoteEditorFor] = React.useState<
+    string | null
+  >(null);
+  const [trafficStore] = React.useState(() => new TrafficSnapshotStore());
+  const [trafficDialogProfile, setTrafficDialogProfile] = React.useState<{
+    id: string;
+    name?: string;
+  } | null>(null);
+  const [syncStatuses, setSyncStatuses] = React.useState<
+    Record<string, { status: string; error?: string }>
+  >({});
+
+  // Country proxy creation state (for inline proxy creation in dropdown)
+  const [countries, setCountries] = React.useState<LocationItem[]>([]);
+  const [countriesLoaded, setCountriesLoaded] = React.useState(false);
+
+  const canCreateLocationProxy = false;
+
+  const loadCountries = React.useCallback(async () => {
+    if (countriesLoaded || !canCreateLocationProxy) return;
+    try {
+      const data = await invoke<LocationItem[]>("cloud_get_countries");
+      setCountries(data);
+      setCountriesLoaded(true);
+    } catch (e) {
+      console.error("Failed to load countries:", e);
+    }
+  }, [countriesLoaded]);
+
+  const loadAllTags = React.useCallback(async () => {
+    try {
+      const tags = await invoke<string[]>("get_all_tags");
+      setAllTags(tags);
+    } catch (error) {
+      console.error("Failed to load tags:", error);
+    }
+  }, []);
+
+  /**
+   * Shows a new proxy or VPN at once and puts the old one back when the
+   * backend refuses, with the reason in a toast.
+   */
+  const applyRouteChange = React.useCallback(
+    async (
+      profileId: string,
+      next: { proxyId: string | null; vpnId: string | null },
+      save: () => Promise<unknown>,
+    ) => {
+      const profile = allProfiles.find((item) => item.id === profileId);
+      const before = {
+        proxy: Object.hasOwn(proxyOverrides, profileId)
+          ? proxyOverrides[profileId]
+          : (profile?.proxy_id ?? null),
+        vpn: Object.hasOwn(vpnOverrides, profileId)
+          ? vpnOverrides[profileId]
+          : (profile?.vpn_id ?? null),
+      };
+      setProxyOverrides((prev) => ({ ...prev, [profileId]: next.proxyId }));
+      setVpnOverrides((prev) => ({ ...prev, [profileId]: next.vpnId }));
+      setOpenProxySelectorFor(null);
+      try {
+        await save();
+        await emit("profile-updated");
+      } catch (error) {
+        setProxyOverrides((prev) => ({ ...prev, [profileId]: before.proxy }));
+        setVpnOverrides((prev) => ({ ...prev, [profileId]: before.vpn }));
+        showErrorToast(translateBackendError(t as never, error));
+      }
+    },
+    [allProfiles, proxyOverrides, vpnOverrides, t],
+  );
+
+  const handleProxySelection = React.useCallback(
+    (profileId: string, proxyId: string | null) =>
+      applyRouteChange(profileId, { proxyId, vpnId: null }, () =>
+        invoke("update_profile_proxy", { profileId, proxyId }),
+      ),
+    [applyRouteChange],
+  );
+
+  const handleVpnSelection = React.useCallback(
+    (profileId: string, vpnId: string | null) =>
+      applyRouteChange(profileId, { proxyId: null, vpnId }, () =>
+        invoke("update_profile_vpn", { profileId, vpnId }),
+      ),
+    [applyRouteChange],
+  );
+
+  const handleCreateCountryProxy = React.useCallback(
+    async (profileId: string, country: LocationItem) => {
+      try {
+        await invoke("create_cloud_location_proxy", {
+          name: country.name,
+          country: country.code,
+          region: null,
+          city: null,
+          isp: null,
+        });
+        await emit("stored-proxies-changed");
+        // Wait briefly for proxy list to update, then find and assign the new proxy
+        await new Promise((r) => setTimeout(r, 200));
+        const updatedProxies =
+          await invoke<StoredProxy[]>("get_stored_proxies");
+        const newProxy = updatedProxies.find(
+          (p: StoredProxy) =>
+            p.is_cloud_derived && p.geo_country === country.code,
+        );
+        if (newProxy) {
+          await handleProxySelection(profileId, newProxy.id);
+        }
+        setOpenProxySelectorFor(null);
+      } catch (error) {
+        showErrorToast(translateBackendError(t as never, error));
+      }
+    },
+    [handleProxySelection, t],
+  );
+
+  const getProfileBotState = React.useCallback(
+    (profileId: string): ProfileBotState => ({
+      schedule: scheduleFor(profileId),
+      liveSession: liveSessionFor(profileId),
+    }),
+    [scheduleFor, liveSessionFor],
+  );
+
+  const handleBotEnrol = React.useCallback((profile: BrowserProfile) => {
+    setBotScheduleDialog({ profiles: [profile], existing: null });
+  }, []);
+
+  const handleBotEdit = React.useCallback(
+    (profile: BrowserProfile, schedule: CookieBotSchedule) => {
+      setBotScheduleDialog({ profiles: [profile], existing: schedule });
+    },
+    [],
+  );
+
+  const handleBotViewActivity = React.useCallback((profile: BrowserProfile) => {
+    setBotRunsProfile(profile);
+  }, []);
+
+  const handleBotFix = React.useCallback(
+    (profile: BrowserProfile, fix: PreflightFix) => {
+      if (fix === "proxy") {
+        onAssignProfilesToProxy?.([profile.id]);
+        return;
+      }
+      if (fix === "syncSettings") {
+        onOpenProfileSyncDialog?.(profile);
+        return;
+      }
+      void enableProfileSync(profile.id).catch((error: unknown) => {
+        showErrorToast(
+          parseBackendError(error)
+            ? translateBackendError(t as never, error)
+            : t("cookieBot.preflight.fixFailed"),
+        );
+      });
+    },
+    [onAssignProfilesToProxy, onOpenProfileSyncDialog, t],
+  );
+
+  // Null rather than a no-op when nothing is wired: the menu then states the
+  // reason without offering a repair it cannot perform.
+  const botFixHandler =
+    onAssignProfilesToProxy || onOpenProfileSyncDialog ? handleBotFix : null;
+
+  const handleBotRunNow = React.useCallback(
+    async (profile: BrowserProfile) => {
+      // Held locally until the stream reports the session: the run is real the
+      // moment the command returns, and a row that still looks idle invites a
+      // second click that would spend a second hour.
+      setBotPendingProfiles((prev) => new Set(prev).add(profile.id));
+      try {
+        const started = await runCookieBotNow(profile.id);
+        // 202, not 200: the route answers with a RECORDED run, and a run that
+        // could not get a host comes back already terminal, carrying an
+        // `outcome_code`, rather than as an HTTP error. Treating every 2xx as
+        // "started" told a user their run had begun on a night when no Windows
+        // host was free, and the only trace was a row in a history panel they
+        // had to go and open.
+        if (RUN_DID_NOT_START.has(started.run.status)) {
+          showErrorToast(
+            t("cookieBot.actions.runNotStarted", {
+              reason:
+                outcomeLabel(t as never, started.run.outcome_code) ??
+                runStatusLabel(t as never, started.run.status),
+            }),
+          );
+        } else {
+          showSuccessToast(t("cookieBot.actions.runStarted"));
+        }
+        await refreshCookieBotState();
+      } catch (error) {
+        showErrorToast(translateBackendError(t as never, error));
+      } finally {
+        setBotPendingProfiles((prev) => {
+          const next = new Set(prev);
+          next.delete(profile.id);
+          return next;
+        });
+      }
+    },
+    [refreshCookieBotState, t],
+  );
+
+  const handleBotStopRun = React.useCallback(
+    async (runId: string) => {
+      try {
+        await cancelCookieBotRun(runId);
+        showSuccessToast(t("cookieBot.running.stopped"));
+        await refreshCookieBotState();
+      } catch (error) {
+        showErrorToast(translateBackendError(t as never, error));
+      }
+    },
+    [refreshCookieBotState, t],
+  );
+
+  const handleBotUnenrol = React.useCallback(async () => {
+    if (!botUnenrolProfile) return;
+    setIsUnenrolling(true);
+    try {
+      await deleteCookieBotSchedule(botUnenrolProfile.id);
+      showSuccessToast(t("cookieBot.schedule.unenrolled"));
+      setBotUnenrolProfile(null);
+      await refreshCookieBotState();
+    } catch (error) {
+      showErrorToast(translateBackendError(t as never, error));
+    } finally {
+      setIsUnenrolling(false);
+    }
+  }, [botUnenrolProfile, refreshCookieBotState, t]);
+
+  const handleBulkCookieBotEnrol = React.useCallback(() => {
+    const targets = profiles.filter((p) => selectedProfiles.includes(p.id));
+    if (targets.length === 0) return;
+    const eligible = targets.filter(
+      (p) => preflight(p, syncPasswordSet).eligible,
+    );
+    // Same guard as bulk run: an action that can touch nothing says so instead
+    // of opening a dialog whose only outcome is a refusal.
+    if (eligible.length === 0) {
+      showErrorToast(t("cookieBot.actionBar.noneEligible"));
+      return;
+    }
+    // Ten or more is the threshold bulk run and stop already use, and enrolling
+    // is the heavier commitment of the three: each row books a nightly job
+    // against a shared budget.
+    if (eligible.length >= BULK_ENROL_CONFIRM_THRESHOLD) {
+      setPendingBulkEnrol(targets);
+      return;
+    }
+    setBotScheduleDialog({ profiles: targets, existing: null });
+  }, [profiles, selectedProfiles, syncPasswordSet, t]);
+
+  // Use shared browser state hook
+  const browserState = useBrowserState(
+    profiles,
+    runningProfiles,
+    isUpdating,
+    launchingProfiles,
+    stoppingProfiles,
+  );
+
+  // Listen for sync status events
+  React.useEffect(() => {
+    if (!browserState.isClient) return;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        unlisten = await listen<{
+          profile_id: string;
+          status: string;
+          error?: string;
+        }>("profile-sync-status", (event) => {
+          const { profile_id, status, error } = event.payload;
+          setSyncStatuses((prev) =>
+            prev[profile_id]?.status === status &&
+            prev[profile_id]?.error === error
+              ? prev
+              : { ...prev, [profile_id]: { status, error } },
+          );
+        });
+      } catch (error) {
+        console.error("Failed to listen for sync status events:", error);
+      }
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [browserState.isClient]);
+
+  // Live traffic of running rows, polled into a store the traffic cells
+  // read: a tick never re-renders the table.
+  const runningProfileIds = React.useMemo(
+    () => Array.from(runningProfiles).sort(),
+    [runningProfiles],
+  );
+  useTrafficPolling(trafficStore, runningProfileIds, browserState.isClient);
+
+  // Clear launching/stopping spinners when backend reports running status changes
+  React.useEffect(() => {
+    if (!browserState.isClient) return;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        unlisten = await listen<{ id: string; is_running: boolean }>(
+          "profile-running-changed",
+          (event) => {
+            const { id } = event.payload;
+            // Clear launching state for this profile if present
+            setLaunchingProfiles((prev) => {
+              if (!prev.has(id)) return prev;
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+            // Clear stopping state for this profile if present
+            setStoppingProfiles((prev) => {
+              if (!prev.has(id)) return prev;
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+          },
+        );
+      } catch (error) {
+        console.error("Failed to listen for profile running changes:", error);
+      }
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [browserState.isClient]);
+
+  // Keep stored proxies up-to-date by listening for changes emitted elsewhere in the app
+  React.useEffect(() => {
+    if (!browserState.isClient) return;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        unlisten = await listen("stored-proxies-changed", () => {
+          // Also refresh tags on profile updates
+          void loadAllTags();
+        });
+      } catch (_err) {
+        // Best-effort only
+      }
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [browserState.isClient, loadAllTags]);
+
+  // A running browser keeps the name it launched with, so close any inline
+  // rename that was open when the profile entered a runtime transition.
+  React.useEffect(() => {
+    if (!profileToRename) return;
+
+    const profileId = profileToRename.id;
+    const isRuntimeLocked =
+      (browserState.isClient && runningProfiles.has(profileId)) ||
+      launchingProfiles.has(profileId) ||
+      stoppingProfiles.has(profileId);
+
+    if (isRuntimeLocked) {
+      setProfileToRename(null);
+      setNewProfileName("");
+      setRenameError(null);
+    }
+  }, [
+    profileToRename,
+    runningProfiles,
+    launchingProfiles,
+    stoppingProfiles,
+    browserState.isClient,
+  ]);
+
+  // A search keeps the selection; only profiles that no longer exist leave.
+  React.useLayoutEffect(() => {
+    const existing = new Set(allProfiles.map((profile) => profile.id));
+    onSelectedProfilesChange((prev) =>
+      prev.every((id) => existing.has(id))
+        ? prev
+        : prev.filter((id) => existing.has(id)),
+    );
+  }, [allProfiles, onSelectedProfilesChange]);
+
+  const launchRow = React.useCallback(
+    async (profile: BrowserProfile) => {
+      setLaunchingProfiles((prev) => new Set(prev).add(profile.id));
+      try {
+        await onLaunchProfile(profile);
+      } catch {
+        // The page reports a failed launch; the row only drops its ring.
+      } finally {
+        // The running state is tracked separately via profile-running-changed.
+        setLaunchingProfiles((prev) => {
+          const next = new Set(prev);
+          next.delete(profile.id);
+          return next;
+        });
+      }
+    },
+    [onLaunchProfile],
+  );
+
+  const stopRow = React.useCallback(
+    async (profile: BrowserProfile) => {
+      const syncInfo = getProfileSyncInfo?.(profile.id);
+      if (syncInfo) {
+        try {
+          if (syncInfo.isLeader) {
+            // Stopping the leader stops every follower with it.
+            await invoke("stop_sync_session", {
+              sessionId: syncInfo.session.id,
+            });
+          } else {
+            await invoke("remove_sync_follower", {
+              sessionId: syncInfo.session.id,
+              followerProfileId: profile.id,
+            });
+          }
+        } catch (error) {
+          showErrorToast(translateBackendError(t as never, error));
+        }
+        return;
+      }
+      setStoppingProfiles((prev) => new Set(prev).add(profile.id));
+      try {
+        await onKillProfile(profile);
+      } catch {
+        // The page reports a failed stop; the row goes back to running.
+        setStoppingProfiles((prev) => {
+          const next = new Set(prev);
+          next.delete(profile.id);
+          return next;
+        });
+      }
+    },
+    [getProfileSyncInfo, onKillProfile, t],
+  );
+
+  const startRename = React.useCallback((profile: BrowserProfile) => {
+    setProfileToRename(profile);
+    setNewProfileName(profile.name);
+    setRenameError(null);
+  }, []);
+
+  // Read through a ref so `openDetails`, and with it the table meta, stays
+  // the same while the panel switches profiles.
+  const shownInfoProfileRef = React.useRef(profileForInfoDialog);
+  shownInfoProfileRef.current = profileForInfoDialog;
+  const openDetails = React.useCallback(
+    (profile: BrowserProfile, method: "pointer" | "keyboard") => {
+      void (async () => {
+        const shown = shownInfoProfileRef.current;
+        // Switching rows unmounts the panel's draft: ask first.
+        if (shown && shown.id !== profile.id && !(await confirmLeave())) {
+          return;
+        }
+        setInternalInfoOpenMethod(method);
+        onInfoOpenMethodChange?.(method);
+        setProfileForInfoDialog(profile);
+      })();
+    },
+    [onInfoOpenMethodChange, setProfileForInfoDialog],
+  );
+
+  const handleRename = React.useCallback(async () => {
+    if (!profileToRename || !newProfileName.trim()) return;
+
+    try {
+      setIsRenamingSaving(true);
+      await onRenameProfile(profileToRename.id, newProfileName.trim());
+      setProfileToRename(null);
+      setNewProfileName("");
+      setRenameError(null);
+    } catch (error) {
+      setRenameError(
+        error instanceof Error
+          ? error.message
+          : t("errors.renameProfileFailed", { error: String(error) }),
+      );
+    } finally {
+      setIsRenamingSaving(false);
+    }
+  }, [profileToRename, newProfileName, onRenameProfile, t]);
+
+  // Cancel inline rename on outside click
+  React.useEffect(() => {
+    if (!profileToRename) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (
+        target &&
+        renameContainerRef.current &&
+        !renameContainerRef.current.contains(target)
+      ) {
+        setProfileToRename(null);
+        setNewProfileName("");
+        setRenameError(null);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [profileToRename]);
+
+  const handleDelete = async () => {
+    if (!profileToDelete) return;
+
+    setIsDeleting(true);
+    // Minimum loading time for visual feedback
+    const minLoadingTime = new Promise((r) => setTimeout(r, 300));
+    try {
+      await Promise.all([onDeleteProfile(profileToDelete), minLoadingTime]);
+      setProfileToDelete(null);
+    } catch (error) {
+      console.error("Failed to delete profile:", error);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  React.useEffect(() => {
+    if (browserState.isClient) {
+      void loadAllTags();
+    }
+  }, [browserState.isClient, loadAllTags]);
+
+  // Build table meta from volatile state so columns can stay stable
+  const selectedDragProfiles = React.useMemo(() => {
+    const ids = new Set(selectedProfiles);
+    return allProfiles.filter((profile) => ids.has(profile.id));
+  }, [allProfiles, selectedProfiles]);
+  const profilesById = React.useMemo(
+    () => new Map(allProfiles.map((profile) => [profile.id, profile])),
+    [allProfiles],
+  );
+  const canDragProfiles = React.useCallback(
+    (targets: BrowserProfile[]) => {
+      return (
+        browserState.isClient &&
+        targets.length > 0 &&
+        targets.every((captured) => {
+          const profile = profilesById.get(captured.id);
+          return (
+            profile !== undefined &&
+            profile.process_id == null &&
+            !runningProfiles.has(profile.id) &&
+            !launchingProfiles.has(profile.id) &&
+            !stoppingProfiles.has(profile.id) &&
+            !isCrossOsProfile(profile) &&
+            !isProfileLocked(profile.id) &&
+            !handoffFor(profile.id)
+          );
+        })
+      );
+    },
+    [
+      browserState.isClient,
+      profilesById,
+      runningProfiles,
+      launchingProfiles,
+      stoppingProfiles,
+      isProfileLocked,
+      handoffFor,
+    ],
+  );
+  // Computed once per list, not per row.
+  const pickableProxies = React.useMemo(
+    () =>
+      storedProxies.filter(
+        (proxy) => !proxy.is_cloud_managed && !proxy.is_cloud_derived,
+      ),
+    [storedProxies],
+  );
+  const creatableCountries = React.useMemo(
+    () =>
+      countries.filter(
+        (country) =>
+          !storedProxies.some(
+            (proxy) =>
+              proxy.is_cloud_derived && proxy.geo_country === country.code,
+          ),
+      ),
+    [countries, storedProxies],
+  );
+  // Callbacks in the meta that read props through a ref: a parent that
+  // passes a new function on each render must not re-render every row.
+  const latestRef = React.useRef({ profiles, onLaunchWithSync });
+  latestRef.current = { profiles, onLaunchWithSync };
+  const openTrafficDialog = React.useCallback((profileId: string) => {
+    const profile = latestRef.current.profiles.find((p) => p.id === profileId);
+    setTrafficDialogProfile({ id: profileId, name: profile?.name });
+  }, []);
+  const launchWithSync = React.useCallback((profile: BrowserProfile) => {
+    latestRef.current.onLaunchWithSync?.(profile);
+  }, []);
+  const cookieBotCompact =
+    containerWidth > 0 && containerWidth < BOT_LABEL_WIDTH;
+  const tableMeta = React.useMemo<TableMeta>(
+    () => ({
+      t,
+      motionAllowed,
+      launchErrors,
+      proxyHealth,
+      openDetails,
+      startRename,
+      launchRow: (profile: BrowserProfile) => {
+        void launchRow(profile);
+      },
+      stopRow: (profile: BrowserProfile) => {
+        void stopRow(profile);
+      },
+      selectedProfiles,
+      selectedDragProfiles,
+      canDragProfiles,
+      isClient: browserState.isClient,
+      runningProfiles,
+      launchingProfiles,
+      stoppingProfiles,
+      isUpdating,
+      browserState,
+
+      // Tags editor state
+      tagsOverrides,
+      allTags,
+      openTagsEditorFor,
+      setAllTags,
+      setOpenTagsEditorFor,
+      setTagsOverrides,
+
+      // Note editor state
+      noteOverrides,
+      openNoteEditorFor,
+      setOpenNoteEditorFor,
+      setNoteOverrides,
+
+      // Proxy selector state
+      openProxySelectorFor,
+      setOpenProxySelectorFor,
+      proxyOverrides,
+      storedProxies,
+      pickableProxies,
+      handleProxySelection,
+
+      // VPN selector state
+      vpnConfigs,
+      vpnOverrides,
+      handleVpnSelection,
+
+      // Extension groups
+      extensionGroups,
+      onAssignExtensionGroup,
+      setDnsBlocklistProfile,
+
+      profileStatuses,
+      onManageStatuses: () => setStatusesDialogOpen(true),
+
+      // Rename helpers
+      handleRename,
+      setProfileToRename,
+      setNewProfileName,
+      setRenameError,
+      profileToRename,
+      newProfileName,
+      isRenamingSaving,
+      renameError,
+
+      // Overflow actions
+      onAssignProfilesToGroup,
+      onCloneProfile: onCloneProfile
+        ? (profile: BrowserProfile) => {
+            void onCloneProfile(profile);
+          }
+        : undefined,
+      onConfigureWayfern,
+      onCopyCookiesToProfile,
+      onOpenCookieManagement,
+
+      trafficStore,
+      onOpenTrafficDialog: openTrafficDialog,
+
+      // Sync
+      syncStatuses,
+      onOpenProfileSyncDialog,
+      onToggleProfileSync,
+      crossOsUnlocked,
+      syncUnlocked,
+
+      // Country proxy creation
+      creatableCountries,
+      canCreateLocationProxy,
+      loadCountries,
+      handleCreateCountryProxy,
+
+      // Team locks
+      isProfileLockedByAnother: isProfileLocked,
+      getProfileLockEmail: (profileId: string) =>
+        getLockInfo(profileId)?.lockedByEmail,
+
+      // Remote execution
+      getRemoteHandoff: handoffFor,
+
+      // Synchronizer
+      getProfileSyncInfo: getProfileSyncInfo ?? (() => undefined),
+      onLaunchWithSync: launchWithSync,
+
+      // Cookie Bot
+      cookieBotUnlocked,
+      cookieBotCompact,
+      getProfileBotState,
+      botPendingProfiles,
+      syncPasswordSet,
+      onBotEnrol: handleBotEnrol,
+      onBotEdit: handleBotEdit,
+      onBotRunNow: (profile: BrowserProfile) => {
+        void handleBotRunNow(profile);
+      },
+      onBotStopRun: (runId: string) => {
+        void handleBotStopRun(runId);
+      },
+      onBotViewActivity: handleBotViewActivity,
+      onBotUnenrol: setBotUnenrolProfile,
+      onBotFix: botFixHandler,
+    }),
+    [
+      t,
+      motionAllowed,
+      launchErrors,
+      proxyHealth,
+      openDetails,
+      startRename,
+      launchRow,
+      stopRow,
+      selectedProfiles,
+      selectedDragProfiles,
+      canDragProfiles,
+      browserState.isClient,
+      runningProfiles,
+      launchingProfiles,
+      stoppingProfiles,
+      isUpdating,
+      browserState,
+      tagsOverrides,
+      allTags,
+      openTagsEditorFor,
+      noteOverrides,
+      openNoteEditorFor,
+      openProxySelectorFor,
+      proxyOverrides,
+      storedProxies,
+      pickableProxies,
+      handleProxySelection,
+      vpnConfigs,
+      vpnOverrides,
+      handleVpnSelection,
+      extensionGroups,
+      onAssignExtensionGroup,
+      handleRename,
+      profileToRename,
+      newProfileName,
+      isRenamingSaving,
+      trafficStore,
+      openTrafficDialog,
+      renameError,
+      onAssignProfilesToGroup,
+      onCloneProfile,
+      onConfigureWayfern,
+      onCopyCookiesToProfile,
+      onOpenCookieManagement,
+      syncStatuses,
+      onOpenProfileSyncDialog,
+      onToggleProfileSync,
+      crossOsUnlocked,
+      syncUnlocked,
+      creatableCountries,
+      loadCountries,
+      handleCreateCountryProxy,
+      isProfileLocked,
+      getLockInfo,
+      handoffFor,
+      getProfileSyncInfo,
+      launchWithSync,
+      cookieBotUnlocked,
+      cookieBotCompact,
+      getProfileBotState,
+      botPendingProfiles,
+      syncPasswordSet,
+      handleBotEnrol,
+      handleBotEdit,
+      handleBotRunNow,
+      handleBotStopRun,
+      handleBotViewActivity,
+      botFixHandler,
+      profileStatuses,
+    ],
+  );
+
+  const columns: ColumnDef<BrowserProfile>[] = React.useMemo(
+    () => [
+      {
+        id: "select",
+        header: ({ table }) => <TableSelectHeader table={table} />,
+        cell: ({ row, table }) => {
+          const profile = row.original;
+          const crossOs = isCrossOsProfile(profile);
+          const os = profile.host_os || profile.wayfern_config?.os || "";
+          const Icon = crossOs ? getOSIcon(os) : getProfileIcon(profile);
+          const message = crossOs
+            ? t("crossOs.viewOnly", { os: getOSDisplayName(os) })
+            : getBrowserDisplayName(profile.browser);
+          return (
+            <NonHoverableTooltip
+              content={<p>{message}</p>}
+              sideOffset={4}
+              horizontalOffset={8}
+            >
+              <span className="block">
+                <TableRowCheckbox
+                  table={table}
+                  row={row}
+                  icon={Icon ? <Icon className="size-4" /> : undefined}
+                />
+              </span>
+            </NonHoverableTooltip>
+          );
+        },
+        enableSorting: false,
+        enableHiding: false,
+        enableResizing: false,
+        size: SELECT_COLUMN_WIDTH,
+      },
+      {
+        id: "actions",
+        size: 44,
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+          const runtime = getRowRuntime(profile, meta);
+          const lockEmail = meta.getProfileLockEmail(profile.id);
+          const tooltipContent = runtime.isRunningRemotely
+            ? meta.t("profiles.remote.runningTooltip")
+            : runtime.isPendingRemotePull
+              ? meta.t("profiles.remote.pendingSyncTooltip")
+              : runtime.isLockedByAnother
+                ? meta.t("sync.team.cannotLaunchLocked", { email: lockEmail })
+                : meta.browserState.getLaunchTooltipContent(profile);
+
+          const syncInfo = meta.getProfileSyncInfo(profile.id);
+          const isLeader = syncInfo?.isLeader === true;
+          const isFollower = syncInfo?.isLeader === false;
+          const isDesynced = isFollower && syncInfo.failedAtUrl != null;
+          const stopTooltip = isLeader
+            ? meta.t("profiles.synchronizer.stopLeader")
+            : isFollower
+              ? meta.t("profiles.synchronizer.stopFollower", {
+                  leaderName: syncInfo.session.leader_profile_name ?? "",
+                })
+              : tooltipContent;
+
+          return (
+            <div className="flex items-center gap-2">
+              {isDesynced && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <LuTriangleAlert className="size-4 text-warning-text" />
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {meta.t("profiles.synchronizer.desyncedTooltip", {
+                      url: syncInfo?.failedAtUrl ?? "",
+                    })}
+                  </TooltipContent>
+                </Tooltip>
+              )}
+              <LaunchControl
+                profileId={profile.id}
+                profileName={profile.name}
+                isRunning={runtime.isRunning}
+                isLaunching={runtime.isLaunching}
+                isStopping={runtime.isStopping}
+                canLaunch={runtime.canLaunch}
+                isFollower={isFollower}
+                tooltip={runtime.isRunning ? stopTooltip : tooltipContent}
+                onLaunch={() => meta.launchRow(profile)}
+                onStop={() => meta.stopRow(profile)}
+              />
+            </div>
+          );
+        },
+      },
+      {
+        // Hidden, sort-only column so profiles can be sorted by creation date
+        // without showing a Created column in the table. Kept
+        // hidden via columnVisibility; sorting still works on hidden columns.
+        id: "created_at",
+        accessorFn: (row) => row.created_at ?? 0,
+        enableSorting: true,
+        enableHiding: true,
+        sortingFn: "basic",
+        header: () => null,
+        cell: () => null,
+      },
+      {
+        accessorKey: "name",
+        // The only column without a fixed width: table-fixed hands it all
+        // remaining space as the window grows or shrinks.
+        meta: { flexWidth: true },
+        // The Name header doubles as the sort control: clicking opens a menu to
+        // sort by name (A–Z / Z–A) or by creation date (newest / oldest), so
+        // creation-date sorting needs no visible column.
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          const sort = table.options.state?.sorting?.[0];
+          const isActive = (id: string, desc: boolean) =>
+            sort?.id === id && !!sort.desc === desc;
+          return (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="subtle"
+                  className="-ml-1.5 h-6 justify-start gap-1 rounded-md px-1.5 text-left text-xs font-medium"
+                >
+                  {meta.t("common.labels.name")}
+                  {isActive("name", false) ? (
+                    <LuArrowUp className="size-3" />
+                  ) : isActive("name", true) ? (
+                    <LuArrowDown className="size-3" />
+                  ) : (
+                    <LuArrowUpDown className="size-3 opacity-60" />
+                  )}
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem
+                  onClick={() =>
+                    table.setSorting([{ id: "name", desc: false }])
+                  }
+                >
+                  {isActive("name", false) && (
+                    <LuCheck className="mr-2 size-3.5" />
+                  )}
+                  {meta.t("profiles.sort.nameAsc")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => table.setSorting([{ id: "name", desc: true }])}
+                >
+                  {isActive("name", true) && (
+                    <LuCheck className="mr-2 size-3.5" />
+                  )}
+                  {meta.t("profiles.sort.nameDesc")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() =>
+                    table.setSorting([{ id: "created_at", desc: true }])
+                  }
+                >
+                  {isActive("created_at", true) && (
+                    <LuCheck className="mr-2 size-3.5" />
+                  )}
+                  {meta.t("profiles.sort.newest")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() =>
+                    table.setSorting([{ id: "created_at", desc: false }])
+                  }
+                >
+                  {isActive("created_at", false) && (
+                    <LuCheck className="mr-2 size-3.5" />
+                  )}
+                  {meta.t("profiles.sort.oldest")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          );
+        },
+        enableSorting: true,
+        sortingFn: "alphanumeric",
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original as BrowserProfile;
+          const rawName: string = row.getValue("name");
+          const name = getBrowserDisplayName(rawName);
+          const runtime = getRowRuntime(profile, meta);
+          const isCrossOsBlocked = isCrossOsProfile(profile);
+          const isEditing =
+            meta.profileToRename?.id === profile.id &&
+            !runtime.isRuntimeLocked &&
+            !isCrossOsBlocked;
+
+          if (isEditing) {
+            return (
+              <div
+                ref={renameContainerRef}
+                className="relative overflow-visible"
+              >
+                <Input
+                  autoFocus
+                  aria-label={meta.t("profileTable.aria.rename", {
+                    name: profile.name,
+                  })}
+                  value={meta.newProfileName}
+                  onChange={(e) => {
+                    meta.setNewProfileName(e.target.value);
+                    if (meta.renameError) meta.setRenameError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      void meta.handleRename();
+                    } else if (e.key === "Escape") {
+                      meta.setProfileToRename(null);
+                      meta.setNewProfileName("");
+                      meta.setRenameError(null);
+                    }
+                  }}
+                  onBlur={() => {
+                    if (
+                      meta.newProfileName.trim().length > 0 &&
+                      meta.newProfileName.trim() !== profile.name
+                    ) {
+                      void meta.handleRename();
+                    } else {
+                      meta.setProfileToRename(null);
+                      meta.setNewProfileName("");
+                      meta.setRenameError(null);
+                    }
+                  }}
+                  className="h-6 w-full max-w-full min-w-0 border-0 px-2 py-1 text-sm leading-none font-medium shadow-none focus-visible:ring-0"
+                />
+              </div>
+            );
+          }
+
+          const lockedEmail = meta.getProfileLockEmail(profile.id);
+          const isLocked = meta.isProfileLockedByAnother(profile.id);
+          const dragProfiles = meta.selectedProfiles.includes(profile.id)
+            ? meta.selectedDragProfiles
+            : [profile];
+          const canDrag = () => meta.canDragProfiles(dragProfiles);
+          const launchError = meta.launchErrors[profile.id];
+          const launchErrorText = launchError
+            ? readableError(
+                meta.t,
+                launchError,
+                meta.t("appFeedback.launch.failed"),
+              )
+            : null;
+
+          return (
+            <div className="-ml-1 flex max-w-full min-w-0 items-center gap-0.5">
+              <ProfileGroupDragHandle
+                profile={profile}
+                profiles={dragProfiles}
+                disabled={!canDrag()}
+                canMove={meta.canDragProfiles}
+                onChooseGroup={() =>
+                  meta.onAssignProfilesToGroup?.(
+                    dragProfiles.map((target) => target.id),
+                  )
+                }
+              />
+              <button
+                type="button"
+                data-row-name
+                className={cn(
+                  "mr-auto flex h-6 max-w-full min-w-0 cursor-pointer items-center gap-1.5 overflow-hidden rounded-md border-none bg-transparent px-2 py-1 text-left transition-colors duration-100 hover:bg-foreground/6",
+                  FOCUS_RING,
+                )}
+                onClick={(event) =>
+                  meta.openDetails(
+                    profile,
+                    event.detail === 0 ? "keyboard" : "pointer",
+                  )
+                }
+              >
+                <OverflowTooltipText
+                  text={name}
+                  className="text-left leading-none font-medium"
+                />
+                {runtime.isRunning && <LiveDot />}
+              </button>
+              {launchErrorText && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      data-slot="profile-launch-error"
+                      aria-label={meta.t("profileTable.aria.launchError", {
+                        error: launchErrorText,
+                      })}
+                      className={cn(
+                        "grid size-5 shrink-0 cursor-pointer place-items-center rounded-md text-destructive-text hover:bg-destructive/10",
+                        FOCUS_RING,
+                      )}
+                      onClick={(event) =>
+                        meta.openDetails(
+                          profile,
+                          event.detail === 0 ? "keyboard" : "pointer",
+                        )
+                      }
+                    >
+                      <motion.span
+                        className="grid place-items-center"
+                        initial={meta.motionAllowed ? { scale: 0.6 } : false}
+                        animate={{ scale: 1 }}
+                        transition={MOTION_SPRING.snappy}
+                      >
+                        <LuCircleAlert className="size-3.5" />
+                      </motion.span>
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-80">
+                    {launchErrorText}
+                  </TooltipContent>
+                </Tooltip>
+              )}
+              <ProfileHandoffStatus
+                profileId={profile.id}
+                state={meta.getRemoteHandoff(profile.id)}
+                syncStatus={meta.syncStatuses[profile.id]}
+                compact
+                onOpenSync={
+                  meta.onOpenProfileSyncDialog
+                    ? () => meta.onOpenProfileSyncDialog?.(profile)
+                    : undefined
+                }
+              />
+              {isLocked && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <LuLock className="size-3 text-muted-foreground" />
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {meta.t("sync.team.profileLocked", { email: lockedEmail })}
+                  </TooltipContent>
+                </Tooltip>
+              )}
+            </div>
+          );
+        },
+      },
+      {
+        id: "profileId",
+        size: 100,
+        enableSorting: false,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profiles.table.profileId");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          return <ProfileIdCell profile={row.original} meta={meta} />;
+        },
+      },
+      {
+        id: "state",
+        size: 100,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profileStatuses.column");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          return <StatusCell profile={row.original} meta={meta} />;
+        },
+      },
+      {
+        id: "tags",
+        size: 100,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profileTable.tagsHeader");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+          const isDisabled = isCrossOsProfile(profile);
+
+          return (
+            <TagsCell
+              profile={profile}
+              isDisabled={isDisabled}
+              tagsOverrides={meta.tagsOverrides ?? {}}
+              allTags={meta.allTags ?? []}
+              setAllTags={meta.setAllTags}
+              openTagsEditorFor={meta.openTagsEditorFor ?? null}
+              setOpenTagsEditorFor={meta.setOpenTagsEditorFor}
+              setTagsOverrides={meta.setTagsOverrides}
+            />
+          );
+        },
+      },
+      {
+        id: "note",
+        size: 80,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profileTable.noteHeader");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+          const isDisabled = isCrossOsProfile(profile);
+
+          return (
+            <NoteCell
+              profile={profile}
+              isDisabled={isDisabled}
+              noteOverrides={meta.noteOverrides ?? {}}
+              openNoteEditorFor={meta.openNoteEditorFor ?? null}
+              setOpenNoteEditorFor={meta.setOpenNoteEditorFor}
+              setNoteOverrides={meta.setNoteOverrides}
+            />
+          );
+        },
+      },
+      {
+        id: "proxy",
+        size: 110,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profiles.table.proxy");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+          const isCrossOs = isCrossOsProfile(profile);
+          const isCrossOsBlocked = isCrossOs;
+          const isRunning =
+            meta.isClient && meta.runningProfiles.has(profile.id);
+          const isLaunching = meta.launchingProfiles.has(profile.id);
+          const isStopping = meta.stoppingProfiles.has(profile.id);
+          const isDisabled =
+            isRunning || isLaunching || isStopping || isCrossOsBlocked;
+
+          const hasProxyOverride = Object.hasOwn(
+            meta.proxyOverrides,
+            profile.id,
+          );
+          const effectiveProxyId = hasProxyOverride
+            ? meta.proxyOverrides[profile.id]
+            : (profile.proxy_id ?? null);
+          const effectiveProxy = effectiveProxyId
+            ? (meta.storedProxies.find((p) => p.id === effectiveProxyId) ??
+              null)
+            : null;
+
+          const hasVpnOverride = Object.hasOwn(meta.vpnOverrides, profile.id);
+          const effectiveVpnId = hasVpnOverride
+            ? meta.vpnOverrides[profile.id]
+            : (profile.vpn_id ?? null);
+          const effectiveVpn = effectiveVpnId
+            ? (meta.vpnConfigs.find((v) => v.id === effectiveVpnId) ?? null)
+            : null;
+
+          const hasAssignment = Boolean(effectiveProxy || effectiveVpn);
+          const displayName = effectiveVpn
+            ? effectiveVpn.name
+            : effectiveProxy
+              ? effectiveProxy.name
+              : meta.t("profiles.table.none");
+          const vpnBadge = effectiveVpn ? "WG" : null;
+          const isSelectorOpen = meta.openProxySelectorFor === profile.id;
+          const selectedId = effectiveVpnId ?? effectiveProxyId ?? null;
+
+          // A running row shows its live traffic; the route name moves into
+          // the tooltip.
+          if (isRunning) {
+            return (
+              <RunningTrafficCell
+                key={profile.id}
+                profileId={profile.id}
+                profileName={profile.name}
+                store={meta.trafficStore}
+                routeName={hasAssignment ? displayName : null}
+                health={meta.proxyHealth.get(profile.id)}
+                onOpen={() => meta.onOpenTrafficDialog?.(profile.id)}
+              />
+            );
+          }
+
+          return (
+            <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+              <Popover
+                open={isSelectorOpen}
+                onOpenChange={(open) => {
+                  meta.setOpenProxySelectorFor(open ? profile.id : null);
+                }}
+              >
+                <ProxyCellTrigger
+                  profileName={profile.name}
+                  displayName={displayName}
+                  hasAssignment={hasAssignment}
+                  vpnBadge={vpnBadge}
+                  isDisabled={isDisabled}
+                />
+
+                {!isDisabled && (
+                  <PopoverContent
+                    className="w-[240px] p-0"
+                    align="end"
+                    sideOffset={8}
+                  >
+                    <ProxyPicker
+                      profileId={profile.id}
+                      meta={meta}
+                      selectedId={selectedId}
+                      proxyId={effectiveVpn ? null : effectiveProxyId}
+                      vpnId={effectiveVpnId}
+                    />
+                  </PopoverContent>
+                )}
+              </Popover>
+              {effectiveProxy && !effectiveVpn && !isDisabled && (
+                <ProxyCheckButton proxy={effectiveProxy} />
+              )}
+            </div>
+          );
+        },
+      },
+      {
+        id: "ext",
+        size: 95,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profiles.table.ext");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+          return <ExtCell profile={profile} meta={meta} />;
+        },
+      },
+      {
+        id: "dns",
+        size: 95,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profiles.table.dns");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+          return <DnsCell profile={profile} meta={meta} />;
+        },
+      },
+      {
+        id: "bot",
+        size: 84,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          if (meta.cookieBotCompact) return null;
+          return meta.t("profiles.table.bot");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          return <BotCell profile={row.original} meta={meta} />;
+        },
+      },
+      {
+        id: "sync",
+        header: "",
+        size: 28,
+        cell: ({ row, table }) => {
+          const profile = row.original;
+          const meta = table.options.meta as TableMeta;
+          const syncEntry = meta.syncStatuses[profile.id];
+          const liveStatus = syncEntry?.status as
+            | "syncing"
+            | "waiting"
+            | "synced"
+            | "error"
+            | "disabled"
+            | undefined;
+
+          const dot = getProfileSyncStatusDot(
+            profile,
+            liveStatus,
+            meta.t,
+            syncEntry?.error,
+          );
+          if (!dot) return null;
+
+          return (
+            <div className="flex h-9 w-full items-center justify-center">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    data-slot="profile-sync-status"
+                    aria-label={meta.t("profileTable.aria.sync", {
+                      name: profile.name,
+                      status: dot.tooltip,
+                    })}
+                    className={cn(
+                      "grid size-6 cursor-pointer place-items-center rounded-md transition-colors duration-100 hover:bg-foreground/6",
+                      FOCUS_RING,
+                    )}
+                    onClick={() => meta.onOpenProfileSyncDialog?.(profile)}
+                  >
+                    {dot.encrypted ? (
+                      <LuLock
+                        aria-hidden="true"
+                        className={cn(
+                          "size-3",
+                          dot.color.replace("bg-", "text-"),
+                          dot.animate && "animate-pulse",
+                        )}
+                      />
+                    ) : (
+                      <span
+                        aria-hidden="true"
+                        className={cn(
+                          "size-2 rounded-full",
+                          dot.color,
+                          dot.animate && "animate-pulse",
+                        )}
+                      />
+                    )}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>{dot.tooltip}</TooltipContent>
+              </Tooltip>
+            </div>
+          );
+        },
+      },
+      {
+        id: "settings",
+        size: 32,
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+
+          return (
+            <div className="flex h-9 w-full items-center justify-end">
+              <Button
+                variant="subtle"
+                className="size-7 rounded-md p-0"
+                data-slot="profile-inspect-trigger"
+                data-profile-id={profile.id}
+                {...tipAnchor("row-inspect")}
+                disabled={!meta.isClient}
+                onClick={(event) =>
+                  meta.openDetails(
+                    profile,
+                    event.detail === 0 ? "keyboard" : "pointer",
+                  )
+                }
+              >
+                <span className="sr-only">
+                  {meta.t("profileTable.aria.details", { name: profile.name })}
+                </span>
+                <LuInfo className="size-4" />
+              </Button>
+            </div>
+          );
+        },
+      },
+    ],
+    [t],
+  );
+
+  // Optional columns leave the table, most expendable first, until the name
+  // keeps NAME_MIN_WIDTH; their data stays reachable in the details panel.
+  // Visibility (not CSS hiding) so table-fixed reclaims the width. Before the
+  // first measurement `bot` and `profileId` stay hidden: an unentitled account
+  // must never see a paid column, and the id must not flash into a narrow
+  // table, not even for one frame.
+  const columnFit = React.useMemo(() => {
+    if (containerWidth <= 0) return null;
+    const choices = view.preferences.visibility;
+    const sizing = view.preferences.sizing;
+    const compactBot = containerWidth < BOT_LABEL_WIDTH;
+    const candidates: FitColumn[] = [];
+    for (const column of FIT_COLUMNS) {
+      if (column.id === "bot" && !cookieBotUnlocked) continue;
+      if (choices[column.id] === false) continue;
+      // The bot column has two shapes: a labelled state at full width, a
+      // bare 28px mark when the table is narrow.
+      const shaped =
+        column.id === "bot" && compactBot
+          ? { ...column, floor: 28, pct: 0 }
+          : column;
+      const resized = sizing[column.id];
+      candidates.push({
+        ...shaped,
+        ...(resized ? { floor: resized, pct: 0 } : {}),
+        pinned: shaped.pinned || choices[column.id] === true,
+      });
+    }
+    return fitColumns(
+      containerWidth,
+      FIXED_COLUMNS_WIDTH,
+      candidates,
+      NAME_MIN_WIDTH,
+    );
+  }, [
+    containerWidth,
+    cookieBotUnlocked,
+    view.preferences.visibility,
+    view.preferences.sizing,
+  ]);
+  const columnVisibility = React.useMemo<VisibilityState>(
+    () => ({
+      created_at: false,
+      ...(columnFit ? columnFit.visible : { bot: false, profileId: false }),
+    }),
+    [columnFit],
+  );
+
+  const columnLabels = React.useMemo(
+    () => [
+      { id: "name", label: t("common.labels.name"), hideable: false },
+      { id: "created_at", label: t("search.fields.created"), hideable: false },
+      { id: "profileId", label: t("profiles.table.profileId") },
+      { id: "state", label: t("profileStatuses.column") },
+      { id: "tags", label: t("profileTable.tagsHeader") },
+      { id: "note", label: t("profileTable.noteHeader") },
+      { id: "proxy", label: t("profiles.table.proxy") },
+      { id: "ext", label: t("profiles.table.ext") },
+      { id: "dns", label: t("profiles.table.dns") },
+      ...(cookieBotUnlocked
+        ? [{ id: "bot", label: t("profiles.table.bot") }]
+        : []),
+    ],
+    [t, cookieBotUnlocked],
+  );
+  const configuredColumns = React.useMemo<ColumnDef<BrowserProfile>[]>(
+    () =>
+      columns.map((column) => {
+        const id =
+          column.id ??
+          ("accessorKey" in column ? String(column.accessorKey) : "");
+        const fixed = ["select", "actions", "settings", "sync", "bot"].includes(
+          id,
+        );
+        const accessor = (row: BrowserProfile) => {
+          if (id === "tags") return (row.tags ?? []).join(", ");
+          if (id === "note") return row.note ?? "";
+          if (id === "proxy")
+            return (
+              storedProxies.find((proxy) => proxy.id === row.proxy_id)?.name ??
+              vpnConfigs.find((vpn) => vpn.id === row.vpn_id)?.name ??
+              ""
+            );
+          if (id === "ext")
+            return (
+              extensionGroups.find(
+                (group) => group.id === row.extension_group_id,
+              )?.name ?? ""
+            );
+          if (id === "dns") return row.dns_blocklist ?? "";
+          if (id === "state")
+            return (
+              profileStatuses.find((status) => status.id === row.status_id)
+                ?.name ?? ""
+            );
+          return row.id;
+        };
+        return {
+          ...column,
+          id,
+          enableResizing: !fixed && id !== "created_at",
+          minSize: fixed ? column.size : 48,
+          maxSize: 1600,
+          ...([
+            "state",
+            "tags",
+            "note",
+            "proxy",
+            "ext",
+            "dns",
+            "profileId",
+          ].includes(id)
+            ? {
+                accessorFn: accessor,
+                enableSorting: true,
+                sortingFn: "alphanumeric" as const,
+              }
+            : {}),
+        };
+      }),
+    [columns, storedProxies, vpnConfigs, extensionGroups, profileStatuses],
+  );
+
+  const table = useReactTable({
+    data: profiles,
+    columns: configuredColumns,
+    state: {
+      sorting,
+      rowSelection,
+      columnVisibility: resolveTableVisibility(
+        columnVisibility,
+        view.preferences.visibility,
+        ["select", "actions", "name", "settings"],
+        cookieBotUnlocked ? ["created_at"] : ["created_at", "bot"],
+      ),
+      columnSizing: view.preferences.sizing,
+    },
+    onSortingChange: view.setSorting,
+    onColumnSizingChange: view.setSizing,
+    columnResizeMode: "onChange",
+    onRowSelectionChange: handleRowSelectionChange,
+    onColumnVisibilityChange: view.setVisibility,
+    // Every row is selectable: bulk stop acts on running rows, bulk run on
+    // stopped ones, and each action counts the rows it applies to.
+    enableRowSelection: true,
+    getSortedRowModel: getSortedRowModel(),
+    getCoreRowModel: getCoreRowModel(),
+    getRowId: (row) => row.id,
+    meta: tableMeta,
+  });
+
+  const scrollParentRef = React.useRef<HTMLDivElement | null>(null);
+  const workspaceRef = React.useRef<HTMLDivElement | null>(null);
+  const [inspectorLayout, setInspectorLayout] = React.useState(false);
+  React.useEffect(() => {
+    const element = workspaceRef.current;
+    if (!element) return;
+    const update = () => setInspectorLayout(element.clientWidth >= 1200);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  // The closed inspector slides out for 120ms. Motion may decorate that exit,
+  // never perform it: when a stalled clock never ends it, a fresh presence
+  // drops the ghost after 200ms.
+  const [inspectorPresence, setInspectorPresence] = React.useState(0);
+  const inspectorWasOpen = React.useRef(false);
+  React.useEffect(() => {
+    if (profileForInfoDialog) {
+      inspectorWasOpen.current = true;
+      return;
+    }
+    if (!inspectorWasOpen.current) return;
+    inspectorWasOpen.current = false;
+    const timer = window.setTimeout(
+      () => setInspectorPresence((value) => value + 1),
+      200,
+    );
+    return () => window.clearTimeout(timer);
+  }, [profileForInfoDialog]);
+  const columnWidth = React.useCallback(
+    (id: string, sizePx: number) => {
+      const resized = view.preferences.sizing[id];
+      if (resized) return `${resized}px`;
+      const fitted = columnFit?.widths[id];
+      if (fitted) return `${fitted}px`;
+      return `${FIT_COLUMNS.find((column) => column.id === id)?.floor ?? sizePx}px`;
+    },
+    [columnFit, view.preferences.sizing],
+  );
+  const sortedRows = table.getRowModel().rows;
+  useScrollFade(scrollParentRef);
+
+  React.useEffect(() => {
+    const el = scrollParentRef.current;
+    if (!el) return;
+    const update = () => {
+      setContainerWidth(Math.round(el.clientWidth / 8) * 8);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+    };
+  }, []);
+
+  // The virtual row estimate must match the selected row height.
+  const ROW_HEIGHT = view.preferences.density === "comfortable" ? 48 : 36;
+
+  const rowVirtualizer = useVirtualizer({
+    count: sortedRows.length,
+    getScrollElement: () => scrollParentRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 8,
+  });
+
+  const measuredRowHeight = React.useRef(ROW_HEIGHT);
+  React.useEffect(() => {
+    if (measuredRowHeight.current !== ROW_HEIGHT) {
+      measuredRowHeight.current = ROW_HEIGHT;
+      rowVirtualizer.measure();
+    }
+  }, [ROW_HEIGHT, rowVirtualizer]);
+
+  const keyboard = useTableKeyboard(table, {
+    scrollToIndex: (index) =>
+      rowVirtualizer.scrollToIndex(index, { align: "auto" }),
+    edit: (rowId, columnId) => {
+      if (columnId !== "name") return false;
+      const profile = profilesById.get(rowId);
+      if (
+        !profile ||
+        isCrossOsProfile(profile) ||
+        getRowRuntime(profile, tableMeta).isRuntimeLocked
+      )
+        return true;
+      startRename(profile);
+      return true;
+    },
+  });
+
+  /**
+   * Moves profiles to the Trash: the selection when there is one, else the
+   * given row. Running rows stay; the page refuses them anyway.
+   */
+  const trashProfiles = React.useCallback(
+    (focused: BrowserProfile | undefined, onlyFocused = false) => {
+      const ids =
+        !onlyFocused && selectedProfiles.length > 0
+          ? selectedProfiles
+          : focused
+            ? [focused.id]
+            : [];
+      const targets = ids
+        .map((id) => profilesById.get(id))
+        .filter((profile): profile is BrowserProfile => {
+          if (!profile) return false;
+          const runtime = getRowRuntime(profile, tableMeta);
+          return !runtime.isRuntimeLocked && !runtime.isRunningRemotely;
+        });
+      if (targets.length === 0) return;
+      // The Trash takes a profile back with Undo; an ephemeral profile is
+      // deleted for good, so it alone still asks first.
+      if (targets.length === 1) {
+        if (targets[0].ephemeral) setProfileToDelete(targets[0]);
+        else void onDeleteProfile(targets[0]);
+      } else if (targets.some((profile) => profile.ephemeral) && onBulkDelete) {
+        onBulkDelete();
+        return;
+      } else {
+        void onDeleteSelectedProfiles(targets.map((profile) => profile.id));
+      }
+      if (ids === selectedProfiles) onSelectedProfilesChange([]);
+    },
+    [
+      selectedProfiles,
+      profilesById,
+      tableMeta,
+      onDeleteProfile,
+      onDeleteSelectedProfiles,
+      onSelectedProfilesChange,
+      onBulkDelete,
+    ],
+  );
+
+  const menuOpenedByKeyboard = React.useRef(false);
+
+  // Row keys on top of the cell navigation of useTableKeyboard: Space
+  // selects, Delete trashes, Mod+Enter launches or stops, Mod+A selects all,
+  // Enter on the name opens details, Shift+F10 or the Menu key opens the
+  // row menu.
+  const handleTableKeyDown = (event: React.KeyboardEvent<HTMLTableElement>) => {
+    const target = event.target as HTMLElement;
+    const editable = target.matches(
+      'input, textarea, select, [contenteditable="true"]',
+    );
+    if (editable || event.altKey) {
+      keyboard.onKeyDown(event);
+      return;
+    }
+    const rowId =
+      target.closest<HTMLElement>("[data-table-row]")?.dataset.tableRow;
+    const profile = rowId ? profilesById.get(rowId) : undefined;
+    const cell = target.closest<HTMLElement>("[data-table-column]");
+    const onCell = cell !== null && cell === target;
+    const mod = isMacOS() ? event.metaKey : event.ctrlKey;
+
+    if (
+      profile &&
+      (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))
+    ) {
+      event.preventDefault();
+      menuOpenedByKeyboard.current = true;
+      const rect = target.getBoundingClientRect();
+      target.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: rect.left + Math.min(24, rect.width / 2),
+          clientY: rect.bottom,
+        }),
+      );
+      return;
+    }
+    if (
+      mod &&
+      !event.shiftKey &&
+      isKey(event) &&
+      event.key.toLowerCase() === "a"
+    ) {
+      event.preventDefault();
+      onSelectedProfilesChange(sortedRows.map((row) => row.id));
+      return;
+    }
+    if (mod && event.key === "Enter" && profile) {
+      event.preventDefault();
+      toggleRowRun(profile, tableMeta);
+      return;
+    }
+    if (profile && !mod && !event.shiftKey) {
+      if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        trashProfiles(profile);
+        return;
+      }
+      if (onCell && event.key === " ") {
+        event.preventDefault();
+        onSelectedProfilesChange((prev) =>
+          prev.includes(profile.id)
+            ? prev.filter((id) => id !== profile.id)
+            : [...prev, profile.id],
+        );
+        return;
+      }
+      if (
+        onCell &&
+        event.key === "Enter" &&
+        cell?.dataset.tableColumn === "name"
+      ) {
+        event.preventDefault();
+        openDetails(profile, "keyboard");
+        return;
+      }
+    }
+    keyboard.onKeyDown(event);
+  };
+
+  // The row menu. One menu serves every row: the right-clicked row names
+  // the profile it acts on.
+  const [menuProfileId, setMenuProfileId] = React.useState<string | null>(null);
+  const menuProfile = menuProfileId
+    ? (profilesById.get(menuProfileId) ?? null)
+    : null;
+  const menuKeepsFocus = React.useRef(false);
+  const inlineEditorOpen = Boolean(
+    profileToRename || openNoteEditorFor || openTagsEditorFor,
+  );
+  const duplicateProfile =
+    onDuplicateProfile ??
+    (onCloneProfile
+      ? (profile: BrowserProfile) => {
+          void onCloneProfile(profile);
+        }
+      : undefined);
+  const menuActions = (() => {
+    if (!menuProfile) return null;
+    const runtime = getRowRuntime(menuProfile, tableMeta);
+    const crossOs = isCrossOsProfile(menuProfile);
+    return {
+      isRunning: runtime.isRunning,
+      canToggleRun: runtime.canToggle,
+      canRename: !runtime.isRuntimeLocked && !crossOs,
+      canTrash: !runtime.isRuntimeLocked && !runtime.isRunningRemotely,
+      onToggleRun: () => toggleRowRun(menuProfile, tableMeta),
+      onOpenDetails: () =>
+        openDetails(
+          menuProfile,
+          menuOpenedByKeyboard.current ? "keyboard" : "pointer",
+        ),
+      onRename: () => {
+        menuKeepsFocus.current = true;
+        startRename(menuProfile);
+      },
+      onDuplicate: duplicateProfile
+        ? () => duplicateProfile(menuProfile)
+        : undefined,
+      onMoveToGroup: onAssignProfilesToGroup
+        ? () => onAssignProfilesToGroup([menuProfile.id])
+        : undefined,
+      onRunRemote: onRunRemote ? () => onRunRemote(menuProfile) : undefined,
+      onLockNow: onLockProfile ? () => onLockProfile(menuProfile) : undefined,
+      onTrash: () => trashProfiles(menuProfile, true),
+    };
+  })();
+
+  const groupIsEmpty =
+    Boolean(selectedGroupId) &&
+    selectedGroupId !== "__all__" &&
+    !allProfiles.some((profile) => profile.group_id === selectedGroupId);
+  const emptyKind: ProfilesEmptyKind = showOnboardingEmptyState
+    ? "onboarding"
+    : groupIsEmpty
+      ? "group"
+      : "filtered";
+
+  // How many selected rows each bulk action applies to.
+  const bulkCounts = React.useMemo(() => {
+    let run = 0;
+    let stop = 0;
+    for (const profile of selectedDragProfiles) {
+      const runtime = getRowRuntime(profile, tableMeta);
+      if (runtime.isLaunching || runtime.isStopping) continue;
+      if (runtime.isRunning) stop += 1;
+      else run += 1;
+    }
+    return { run, stop };
+  }, [selectedDragProfiles, tableMeta]);
+
+  // Row motion. Rows slide to their new place when the order changes (sort,
+  // filter, group, a row added or removed), never on scroll; rows that come
+  // into view with the change rise in. The first rows after the skeletons
+  // grow out of them.
+  const rowOrderKey = React.useMemo(
+    () => sortedRows.map((row) => row.id).join(","),
+    [sortedRows],
+  );
+  const sawSkeletonRef = React.useRef(false);
+  const hadRowsRef = React.useRef(false);
+  if (isLoading && sortedRows.length === 0) sawSkeletonRef.current = true;
+  const entrance = React.useMemo(() => {
+    const kind: "load" | "change" | null = !rowOrderKey
+      ? null
+      : hadRowsRef.current
+        ? "change"
+        : sawSkeletonRef.current
+          ? "load"
+          : null;
+    return { kind, at: performance.now() };
+  }, [rowOrderKey]);
+  React.useEffect(() => {
+    if (rowOrderKey) hadRowsRef.current = true;
+  }, [rowOrderKey]);
+  const entranceKind =
+    motionAllowed &&
+    entrance.kind !== null &&
+    performance.now() - entrance.at < 300
+      ? entrance.kind
+      : null;
+  const allIds = React.useMemo(
+    () => new Set(allProfiles.map((profile) => profile.id)),
+    [allProfiles],
+  );
+  const allIdsRef = React.useRef(allIds);
+  allIdsRef.current = allIds;
+  const motionAllowedRef = React.useRef(motionAllowed);
+  motionAllowedRef.current = motionAllowed;
+
+  // A profile that appears after the first load (created, imported, back
+  // from the Trash) is scrolled to and flashes once.
+  const knownIdsRef = React.useRef<Set<string> | null>(null);
+  const [flash, setFlash] = React.useState<{ id: string; at: number } | null>(
+    null,
+  );
+  React.useEffect(() => {
+    if (isLoading) return;
+    const known = knownIdsRef.current;
+    if (!known) {
+      knownIdsRef.current = new Set(allProfiles.map((profile) => profile.id));
+      return;
+    }
+    const fresh = allProfiles.filter((profile) => !known.has(profile.id));
+    for (const profile of fresh) known.add(profile.id);
+    if (fresh.length > 0) {
+      setFlash({ id: fresh[fresh.length - 1].id, at: Date.now() });
+    }
+  }, [allProfiles, isLoading]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: runs once per new profile
+  React.useEffect(() => {
+    if (!flash) return;
+    const index = sortedRows.findIndex((row) => row.id === flash.id);
+    if (index >= 0) rowVirtualizer.scrollToIndex(index, { align: "auto" });
+    const timer = window.setTimeout(() => setFlash(null), 1000);
+    return () => window.clearTimeout(timer);
+  }, [flash]);
+
+  const minimumWidth =
+    Object.keys(view.preferences.sizing).length ||
+    Object.values(view.preferences.visibility).some(Boolean)
+      ? table
+          .getVisibleLeafColumns()
+          .reduce(
+            (total, column) =>
+              total +
+              (column.id === "name" && !view.preferences.sizing.name
+                ? NAME_MIN_WIDTH
+                : parseFloat(columnWidth(column.id, column.getSize()))),
+            0,
+          )
+      : undefined;
+
+  // What the memoized rows read. A row re-renders only when one of its own
+  // props changes: a parent render with the same data leaves it alone.
+  const cellPropsRef = React.useRef(keyboard.cellProps);
+  cellPropsRef.current = keyboard.cellProps;
+  const visibleColumnIds = table
+    .getVisibleLeafColumns()
+    .map((column) => column.id);
+  const visibleColumnsKey = visibleColumnIds.join(",");
+  const rowFades = React.useCallback(
+    (id: string) => motionAllowedRef.current && !allIdsRef.current.has(id),
+    [],
+  );
+
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const totalSize = rowVirtualizer.getTotalSize();
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom =
+    virtualRows.length > 0
+      ? totalSize - virtualRows[virtualRows.length - 1].end
+      : 0;
+
+  return (
+    <>
+      <div className="mb-3 flex shrink-0 flex-wrap items-start justify-between gap-2">
+        {filterControls}
+        <TableViewControls table={table} view={view} labels={columnLabels} />
+      </div>
+      <div
+        ref={workspaceRef}
+        data-slot="profile-workspace"
+        className="relative flex min-h-0 min-w-0 flex-1 gap-3"
+      >
+        <div
+          ref={scrollParentRef}
+          className={cn(
+            "scroll-fade relative min-h-0 min-w-0 flex-1 overflow-auto",
+            tableSelectionCounts(table).selected > 0 &&
+              "pb-[calc(var(--table-action-bar-height,56px)+32px)]",
+          )}
+          style={
+            {
+              // Sticky table header is 32px tall (h-8); shift the top
+              // fade band below it so the header stays fully opaque and
+              // only body rows fade as they scroll past.
+              "--scroll-fade-top-offset": "32px",
+            } as React.CSSProperties
+          }
+        >
+          <Table
+            ref={keyboard.tableRef}
+            role="grid"
+            aria-label={t("profiles.title")}
+            aria-rowcount={sortedRows.length + 1}
+            aria-colcount={table.getVisibleLeafColumns().length}
+            onKeyDown={handleTableKeyDown}
+            onKeyDownCapture={keyboard.onKeyDownCapture}
+            className={DATA_TABLE_CLASSES.table}
+            style={{ minWidth: minimumWidth, width: minimumWidth }}
+            containerClassName="overflow-visible"
+          >
+            <TableHeader
+              className={cn(DATA_TABLE_CLASSES.header, "overflow-visible")}
+            >
+              {table.getHeaderGroups().map((headerGroup) => (
+                <TableRow
+                  key={headerGroup.id}
+                  className={cn(
+                    DATA_TABLE_CLASSES.headerRow,
+                    "overflow-visible",
+                  )}
+                >
+                  {headerGroup.headers.map((header) => {
+                    return (
+                      <TableHead
+                        key={header.id}
+                        role="columnheader"
+                        {...columnAnchor(header.column.id)}
+                        aria-sort={
+                          header.column.getIsSorted() === "asc"
+                            ? "ascending"
+                            : header.column.getIsSorted() === "desc"
+                              ? "descending"
+                              : undefined
+                        }
+                        className={DATA_TABLE_CLASSES.head}
+                        style={{
+                          width:
+                            header.column.columnDef.meta?.flexWidth &&
+                            !view.preferences.sizing[header.column.id]
+                              ? undefined
+                              : columnWidth(
+                                  header.column.id,
+                                  header.column.getSize(),
+                                ),
+                        }}
+                      >
+                        {header.isPlaceholder
+                          ? null
+                          : flexRender(
+                              header.column.columnDef.header,
+                              header.getContext(),
+                            )}
+                        <TableColumnResizer
+                          header={header}
+                          label={
+                            columnLabels.find(
+                              (column) => column.id === header.column.id,
+                            )?.label ?? ""
+                          }
+                          disabled={!view.loaded}
+                        />
+                      </TableHead>
+                    );
+                  })}
+                </TableRow>
+              ))}
+            </TableHeader>
+            <ContextMenu
+              onOpenChange={(open) => {
+                // The profile stays set so the menu can play its exit.
+                if (!open) menuOpenedByKeyboard.current = false;
+              }}
+            >
+              <ContextMenuTrigger asChild disabled={inlineEditorOpen}>
+                <TableBody
+                  className="overflow-visible"
+                  onContextMenu={(event) => {
+                    const rowId = (
+                      event.target as HTMLElement
+                    ).closest<HTMLElement>("[data-table-row]")?.dataset
+                      .tableRow;
+                    if (!rowId) {
+                      event.preventDefault();
+                      return;
+                    }
+                    if (event.isTrusted) menuOpenedByKeyboard.current = false;
+                    setMenuProfileId(rowId);
+                  }}
+                >
+                  {sortedRows.length === 0 ? (
+                    isLoading ? (
+                      Array.from({ length: 8 }, (_, i) => (
+                        <TableRow
+                          key={`skeleton-${i}`}
+                          className={DATA_TABLE_CLASSES.row}
+                          style={{ height: `${ROW_HEIGHT}px` }}
+                        >
+                          <TableCell
+                            colSpan={table.getVisibleLeafColumns().length}
+                            className="py-0"
+                          >
+                            <div className="flex items-center gap-3">
+                              <Skeleton className="size-7 shrink-0 rounded-md" />
+                              <Skeleton
+                                className="h-3"
+                                style={{ width: `${30 + ((i * 17) % 40)}%` }}
+                              />
+                              <div className="flex-1" />
+                              <Skeleton className="h-3 w-16" />
+                              <Skeleton className="h-3 w-10" />
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    ) : (
+                      <TableRow className={DATA_TABLE_CLASSES.row}>
+                        <TableCell
+                          colSpan={table.getVisibleLeafColumns().length}
+                          className="py-16"
+                        >
+                          <ProfilesEmptyState
+                            kind={emptyKind}
+                            onCreateProfile={onCreateProfile}
+                            onImportProfiles={onImportProfiles}
+                            onClearFilters={onClearFilters}
+                            onCreateProfileInGroup={onCreateProfileInGroup}
+                            onMoveProfilesHere={onMoveProfilesHere}
+                          />
+                        </TableCell>
+                      </TableRow>
+                    )
+                  ) : (
+                    <>
+                      {paddingTop > 0 && (
+                        <tr
+                          aria-hidden="true"
+                          tabIndex={-1}
+                          style={{ height: `${paddingTop}px` }}
+                        >
+                          <td colSpan={table.getVisibleLeafColumns().length} />
+                        </tr>
+                      )}
+                      <AnimatePresence mode="popLayout" initial={false}>
+                        {virtualRows.map((virtualRow) => {
+                          const row = sortedRows[virtualRow.index];
+                          const rowIsCrossOs = isCrossOsProfile(row.original);
+                          const crossOsTitle = rowIsCrossOs
+                            ? t("crossOs.viewOnly", {
+                                os: getOSDisplayName(
+                                  row.original.host_os ||
+                                    row.original.wayfern_config?.os ||
+                                    "",
+                                ),
+                              })
+                            : undefined;
+                          const range = rowVirtualizer.range;
+                          const viewIndex =
+                            virtualRow.index - (range?.startIndex ?? 0);
+                          const animated =
+                            motionAllowed &&
+                            range !== null &&
+                            virtualRow.index >= range.startIndex &&
+                            virtualRow.index <= range.endIndex &&
+                            viewIndex < MAX_ANIMATED_ROWS;
+                          const riseKind = animated ? entranceKind : null;
+                          return (
+                            <ProfileTableRow
+                              key={row.id}
+                              row={row}
+                              meta={tableMeta}
+                              rowIndex={virtualRow.index}
+                              rowHeight={ROW_HEIGHT}
+                              selected={row.getIsSelected()}
+                              inspected={profileForInfoDialog?.id === row.id}
+                              moving={
+                                profileDrag?.movingIds.has(row.id) ?? false
+                              }
+                              crossOsTitle={crossOsTitle}
+                              activeColumn={
+                                visibleColumnIds.find(
+                                  (id) =>
+                                    keyboard.cellProps(row.id, id).tabIndex ===
+                                    0,
+                                ) ?? null
+                              }
+                              cellPropsRef={cellPropsRef}
+                              columnsKey={visibleColumnsKey}
+                              columnWidth={columnWidth}
+                              sizing={view.preferences.sizing}
+                              layoutDependency={
+                                animated ? rowOrderKey : "still"
+                              }
+                              riseKind={riseKind}
+                              riseIndex={riseKind ? viewIndex : 0}
+                              flashAt={
+                                motionAllowed && flash?.id === row.id
+                                  ? flash.at
+                                  : null
+                              }
+                              fades={rowFades}
+                            />
+                          );
+                        })}
+                      </AnimatePresence>
+                      {paddingBottom > 0 && (
+                        <tr
+                          aria-hidden="true"
+                          tabIndex={-1}
+                          style={{ height: `${paddingBottom}px` }}
+                        >
+                          <td colSpan={table.getVisibleLeafColumns().length} />
+                        </tr>
+                      )}
+                    </>
+                  )}
+                </TableBody>
+              </ContextMenuTrigger>
+              {menuProfile && menuActions && (
+                <RowContextMenuContent
+                  profile={menuProfile}
+                  actions={menuActions}
+                  onCloseAutoFocus={(event) => {
+                    if (menuKeepsFocus.current) {
+                      event.preventDefault();
+                      menuKeepsFocus.current = false;
+                    }
+                  }}
+                />
+              )}
+            </ContextMenu>
+          </Table>
+        </div>
+        <DeleteConfirmationDialog
+          isOpen={profileToDelete !== null}
+          onClose={() => {
+            setProfileToDelete(null);
+          }}
+          onConfirm={handleDelete}
+          title={t("profiles.delete.title")}
+          description={t("profiles.delete.description", {
+            profileName: profileToDelete?.name ?? "",
+          })}
+          confirmButtonText={t("profiles.delete.confirmButton")}
+          isLoading={isDeleting}
+        />
+        <AnimatePresence
+          key={inspectorPresence}
+          mode="popLayout"
+          initial={false}
+        >
+          {profileForInfoDialog &&
+            (() => {
+              const infoProfile =
+                allProfiles.find((p) => p.id === profileForInfoDialog.id) ??
+                profileForInfoDialog;
+              const infoIsRunning =
+                browserState.isClient && runningProfiles.has(infoProfile.id);
+              const infoIsLaunching = launchingProfiles.has(infoProfile.id);
+              const infoIsStopping = stoppingProfiles.has(infoProfile.id);
+              const infoIsCrossOs = isCrossOsProfile(infoProfile);
+              const infoIsDisabled =
+                infoIsRunning ||
+                infoIsLaunching ||
+                infoIsStopping ||
+                infoIsCrossOs;
+              const slides = inspectorLayout && motionAllowed;
+              return (
+                <motion.div
+                  key="profile-inspector"
+                  data-slot="profile-inspector-frame"
+                  className={
+                    inspectorLayout ? "flex min-h-0 shrink-0" : "contents"
+                  }
+                  initial={slides ? { x: 24 } : false}
+                  animate={{ x: 0, opacity: 1 }}
+                  exit={
+                    slides
+                      ? {
+                          x: 24,
+                          opacity: 0,
+                          transition: { duration: 0.12, ease: MOTION_EASE_IN },
+                        }
+                      : { opacity: 1, transition: { duration: 0 } }
+                  }
+                  transition={MOTION_SPRING.page}
+                >
+                  <ProfileInfoDialog
+                    presentation={inspectorLayout ? "inspector" : "modal"}
+                    openMethod={infoOpenMethod ?? internalInfoOpenMethod}
+                    handoffState={handoffFor(infoProfile.id)}
+                    isOpen={profileForInfoDialog !== null}
+                    onClose={() => {
+                      setProfileForInfoDialog(null);
+                    }}
+                    profile={infoProfile}
+                    storedProxies={storedProxies}
+                    vpnConfigs={vpnConfigs}
+                    onOpenTrafficDialog={(profileId) => {
+                      const profile = profiles.find((p) => p.id === profileId);
+                      setTrafficDialogProfile({
+                        id: profileId,
+                        name: profile?.name,
+                      });
+                    }}
+                    onOpenProfileSyncDialog={onOpenProfileSyncDialog}
+                    onAssignProfilesToGroup={onAssignProfilesToGroup}
+                    onConfigureWayfern={onConfigureWayfern}
+                    onCopyCookiesToProfile={onCopyCookiesToProfile}
+                    onOpenCookieManagement={onOpenCookieManagement}
+                    onAssignExtensionGroup={onAssignExtensionGroup}
+                    onOpenBypassRules={(profile) => {
+                      setBypassRulesProfile(profile);
+                    }}
+                    onOpenDnsBlocklist={(profile) => {
+                      setDnsBlocklistProfile(profile);
+                    }}
+                    onOpenLaunchHook={(profile) => {
+                      setLaunchHookProfile(profile);
+                    }}
+                    onCloneProfile={onCloneProfile}
+                    onSaveAsTemplate={setTemplateProfile}
+                    onLaunchWithSync={onLaunchWithSync}
+                    onSetPassword={onSetPassword}
+                    onChangePassword={onChangePassword}
+                    onRemovePassword={onRemovePassword}
+                    onDeleteProfile={(profile) => {
+                      setProfileForInfoDialog(null);
+                      if (profile.ephemeral) setProfileToDelete(profile);
+                      else void onDeleteProfile(profile);
+                    }}
+                    crossOsUnlocked={crossOsUnlocked}
+                    isRunning={infoIsRunning}
+                    isDisabled={infoIsDisabled}
+                    isCrossOs={infoIsCrossOs}
+                    syncStatuses={syncStatuses}
+                    onToggleRun={() => toggleRowRun(infoProfile, tableMeta)}
+                    canToggleRun={
+                      getRowRuntime(infoProfile, tableMeta).canToggle
+                    }
+                    isLaunching={infoIsLaunching}
+                    isStopping={infoIsStopping}
+                  />
+                </motion.div>
+              );
+            })()}
+        </AnimatePresence>
+      </div>
+      <DataTableActionBar table={table}>
+        <DataTableActionBarSelection table={table} />
+        {onBulkRun && (
+          <span className="relative inline-flex">
+            <DataTableActionBarAction
+              data-bulk-action="run"
+              data-count={bulkCounts.run}
+              tooltip={
+                bulkActionsUnlocked
+                  ? t("profiles.actionBar.runSelected")
+                  : t("profiles.actionBar.proRequired")
+              }
+              label={t("profiles.actionBar.runCount", {
+                count: bulkCounts.run,
+              })}
+              onClick={bulkActionsUnlocked ? onBulkRun : undefined}
+              disabled={!bulkActionsUnlocked || bulkCounts.run === 0}
+            >
+              <LuPlay className="fill-current" />
+            </DataTableActionBarAction>
+            {!bulkActionsUnlocked && (
+              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
+            )}
+          </span>
+        )}
+        {onBulkStop && (
+          <span className="relative inline-flex">
+            <DataTableActionBarAction
+              data-bulk-action="stop"
+              data-count={bulkCounts.stop}
+              tooltip={
+                bulkActionsUnlocked
+                  ? t("profiles.actionBar.stopSelected")
+                  : t("profiles.actionBar.proRequired")
+              }
+              label={t("profiles.actionBar.stopCount", {
+                count: bulkCounts.stop,
+              })}
+              onClick={bulkActionsUnlocked ? onBulkStop : undefined}
+              disabled={!bulkActionsUnlocked || bulkCounts.stop === 0}
+            >
+              <LuSquare className="fill-current" />
+            </DataTableActionBarAction>
+            {!bulkActionsUnlocked && (
+              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
+            )}
+          </span>
+        )}
+        <DataTableActionBarAction
+          tooltip={t("bulkEdit.action")}
+          onClick={() => setBulkEditOpen(true)}
+        >
+          <LuSlidersHorizontal />
+        </DataTableActionBarAction>
+        {onBulkGroupAssignment && (
+          <DataTableActionBarAction
+            tooltip={t("profiles.actionBar.assignToGroup")}
+            onClick={onBulkGroupAssignment}
+          >
+            <LuUsers />
+          </DataTableActionBarAction>
+        )}
+        {onBulkProxyAssignment && (
+          <DataTableActionBarAction
+            tooltip={t("profiles.actionBar.assignProxy")}
+            onClick={onBulkProxyAssignment}
+          >
+            <LuWifi />
+          </DataTableActionBarAction>
+        )}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="subtle"
+              size="sm"
+              className={cn("h-7 rounded-lg text-xs", ACTION_BAR_BUTTON_CLASS)}
+            >
+              {t("tables.moreActions")}
+              <LuChevronDown className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {onBulkProxyDistribution && (
+              <DropdownMenuItem onSelect={onBulkProxyDistribution}>
+                <LuShuffle />
+                {t("profiles.actionBar.distributeProxies")}
+              </DropdownMenuItem>
+            )}
+            {onBulkExtensionGroupAssignment && (
+              <DropdownMenuItem onSelect={onBulkExtensionGroupAssignment}>
+                <LuPuzzle />
+                {t("profiles.actionBar.assignExtensionGroup")}
+              </DropdownMenuItem>
+            )}
+            {onBulkCopyCookies && (
+              <DropdownMenuItem onSelect={onBulkCopyCookies}>
+                <LuCookie />
+                {t("profiles.actionBar.copyCookies")}
+              </DropdownMenuItem>
+            )}
+            {onBulkEnableSync && (
+              <DropdownMenuItem onSelect={onBulkEnableSync}>
+                <LuRefreshCw />
+                {t("profiles.actionBar.enableSync")}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem
+              disabled={!cookieBotUnlocked}
+              onSelect={() => {
+                if (cookieBotUnlocked) handleBulkCookieBotEnrol();
+              }}
+            >
+              <LuMoon />
+              {t("cookieBot.actionBar.enrol")}
+              {!cookieBotUnlocked && <ProBadge />}
+            </DropdownMenuItem>
+            {onBulkDelete && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onSelect={onBulkDelete}>
+                  <LuTrash2 />
+                  {t("profileTable.menu.moveToTrash")}
+                </DropdownMenuItem>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </DataTableActionBar>
+      {trafficDialogProfile && (
+        <TrafficDetailsDialog
+          isOpen={trafficDialogProfile !== null}
+          onClose={() => {
+            setTrafficDialogProfile(null);
+          }}
+          profileId={trafficDialogProfile.id}
+          profileName={trafficDialogProfile.name}
+        />
+      )}
+      <ProfileBypassRulesDialog
+        isOpen={bypassRulesProfile !== null}
+        onClose={() => {
+          setBypassRulesProfile(null);
+        }}
+        profileId={bypassRulesProfile?.id ?? null}
+        initialRules={bypassRulesProfile?.proxy_bypass_rules ?? []}
+      />
+      <SaveTemplateDialog
+        profile={templateProfile}
+        onClose={() => setTemplateProfile(null)}
+      />
+      <BulkEditDialog
+        isOpen={bulkEditOpen}
+        onClose={() => setBulkEditOpen(false)}
+        profileIds={selectedProfiles}
+        statuses={profileStatuses}
+      />
+      <ProfileStatusesDialog
+        isOpen={statusesDialogOpen}
+        onClose={() => setStatusesDialogOpen(false)}
+        statuses={profileStatuses}
+        profiles={allProfiles}
+      />
+      <ProfileDnsBlocklistDialog
+        isOpen={dnsBlocklistProfile !== null}
+        onClose={() => {
+          setDnsBlocklistProfile(null);
+        }}
+        profileId={dnsBlocklistProfile?.id ?? null}
+        currentLevel={dnsBlocklistProfile?.dns_blocklist ?? null}
+      />
+      <ProfileLaunchHookDialog
+        isOpen={launchHookProfile !== null}
+        onClose={() => {
+          setLaunchHookProfile(null);
+        }}
+        profileId={launchHookProfile?.id ?? null}
+        currentLaunchHook={launchHookProfile?.launch_hook ?? null}
+      />
+      {botScheduleDialog && (
+        <CookieBotEnrolDialog
+          isOpen
+          onClose={() => {
+            setBotScheduleDialog(null);
+          }}
+          profiles={botScheduleDialog.profiles}
+          existing={botScheduleDialog.existing}
+          onOpenProfileSync={onOpenProfileSyncDialog}
+          // "A proxy or VPN is required" is the precondition most profiles
+          // fail, and without this the dialog showed the reason with no way to
+          // act on it — one-click fixable from the Cookie Bot page and a dead
+          // end from the row menu that is the primary entry point.
+          onAssignProxy={onAssignProfilesToProxy}
+          onSaved={() => {
+            // Clearing after a bulk write mirrors the other bulk actions: the
+            // selection has been acted on, and leaving it live invites a second
+            // pass over profiles that are already enrolled.
+            if (botScheduleDialog.profiles.length > 1) {
+              onSelectedProfilesChange([]);
+            }
+          }}
+        />
+      )}
+      <DeleteConfirmationDialog
+        isOpen={pendingBulkEnrol !== null}
+        onClose={() => {
+          setPendingBulkEnrol(null);
+        }}
+        onConfirm={() => {
+          if (!pendingBulkEnrol) return;
+          setBotScheduleDialog({
+            profiles: pendingBulkEnrol,
+            existing: null,
+          });
+          setPendingBulkEnrol(null);
+        }}
+        title={t("cookieBot.enrol.confirmBulkTitle", {
+          count:
+            pendingBulkEnrol?.filter(
+              (p) => preflight(p, syncPasswordSet).eligible,
+            ).length ?? 0,
+        })}
+        description={t("cookieBot.enrol.confirmBulkDescription", {
+          count:
+            pendingBulkEnrol?.filter(
+              (p) => preflight(p, syncPasswordSet).eligible,
+            ).length ?? 0,
+        })}
+        confirmButtonText={t("cookieBot.enrol.confirmBulkButton", {
+          count:
+            pendingBulkEnrol?.filter(
+              (p) => preflight(p, syncPasswordSet).eligible,
+            ).length ?? 0,
+        })}
+        confirmButtonVariant="default"
+        profileIds={pendingBulkEnrol
+          ?.filter((p) => preflight(p, syncPasswordSet).eligible)
+          .map((p) => p.id)}
+        profiles={pendingBulkEnrol?.map((p) => ({ id: p.id, name: p.name }))}
+      />
+      <CookieBotRunsDialog
+        isOpen={botRunsProfile !== null}
+        onClose={() => {
+          setBotRunsProfile(null);
+        }}
+        profileId={botRunsProfile?.id ?? null}
+        profileName={botRunsProfile?.name}
+        onRunCancelled={() => {
+          void refreshCookieBotState();
+        }}
+      />
+      <DeleteConfirmationDialog
+        isOpen={botUnenrolProfile !== null}
+        onClose={() => {
+          setBotUnenrolProfile(null);
+        }}
+        onConfirm={handleBotUnenrol}
+        title={t("cookieBot.schedule.unenrolTitle", {
+          name: botUnenrolProfile?.name ?? "",
+        })}
+        description={t("cookieBot.schedule.unenrolDescription")}
+        confirmButtonText={t("cookieBot.schedule.unenrol")}
+        isLoading={isUnenrolling}
+      />
+    </>
+  );
+}

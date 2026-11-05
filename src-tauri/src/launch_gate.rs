@@ -1,0 +1,824 @@
+//! The pre-spawn gate.
+//!
+//! Runs on every real browser spawn, after the upstream has been normalized
+//! and before any worker, decrypted copy or browser process exists. It answers
+//! one question — may this launch proceed — and changes nothing else; the
+//! launch path does its own preparation (the group's bookmarks, the blocklist)
+//! around it.
+//!
+//! Two findings can stop a launch being what the user expects:
+//!
+//! * a **VPN/proxy extension** in the profile, which can override the proxy
+//!   Donut configured and silently move the browser's exit away from the one
+//!   the fingerprint was generated for — a warning, since Donut cannot tell
+//!   from outside whether it is actually routing anything;
+//! * a measured **exit/fingerprint mismatch**, which is a hard block: the
+//!   browser does not start until the user explicitly proceeds.
+//!
+//! The enforcing half runs inside `browser_runner::launch_browser_internal`,
+//! after the upstream has been normalized (so VLESS and VPN profiles are
+//! reachable at all) and before the local proxy starts or the browser spawns.
+//! `get_profile_pre_launch_checks` is the cheap half the UI calls first, so a
+//! profile whose exit is already known blocks without starting a single
+//! worker. Its one network use is a route check of at most four seconds,
+//! skipped when a recent result exists.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::fingerprint_consistency::{self, ConsistencyResult};
+use crate::profile::types::BrowserProfile;
+use crate::vpn_extension_detect::{self, DetectedVpnExtension};
+
+/// How long a "launch anyway" decision stays redeemable. Long enough to read
+/// the dialog, short enough that a token cannot sit around across a session.
+const CONSENT_TTL_SECS: u64 = 10 * 60;
+
+/// What the gate is allowed to do on this launch.
+#[derive(Debug, Clone, Default)]
+pub enum FingerprintGate {
+  /// Block on a measured mismatch. The default, and what the GUI uses.
+  #[default]
+  Enforce,
+  /// Measure only from cache and report; never block, never probe the network.
+  /// Automation runs here: a headless client has no dialog to answer and
+  /// cannot regenerate its fingerprint mid-run, so a hard failure would turn a
+  /// warning into an outage for a whole fleet.
+  Advisory,
+  /// The user already said "launch anyway" and handed back a token.
+  Consented(String),
+}
+
+struct PendingConsent {
+  profile_id: String,
+  fingerprint_hash: String,
+  exit_identity: String,
+  issued_at: u64,
+}
+
+static CONSENTS: std::sync::LazyLock<Mutex<HashMap<String, PendingConsent>>> =
+  std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn consents() -> std::sync::MutexGuard<'static, HashMap<String, PendingConsent>> {
+  CONSENTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn random_token() -> String {
+  use rand::Rng;
+  let mut rng = rand::rng();
+  let mut bytes = [0u8; 16];
+  rng.fill_bytes(&mut bytes);
+  bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Issue a single-use token authorizing one launch of this exact
+/// (profile, fingerprint, exit) combination.
+///
+/// A plain `bypass: bool` cannot express this: a "proceed" the user granted
+/// while looking at proxy A would silently authorize a launch through proxy B
+/// if they changed it before the retry landed.
+pub fn mint_consent(profile: &BrowserProfile, exit_identity: &str) -> String {
+  let token = random_token();
+  let now = crate::proxy_manager::now_secs();
+  let mut store = consents();
+  store.retain(|_, c| now.saturating_sub(c.issued_at) < CONSENT_TTL_SECS);
+  store.insert(
+    token.clone(),
+    PendingConsent {
+      profile_id: profile.id.to_string(),
+      fingerprint_hash: crate::launch_gate_prefs::fingerprint_hash(profile),
+      exit_identity: exit_identity.to_string(),
+      issued_at: now,
+    },
+  );
+  token
+}
+
+/// Redeem a consent token. Single use — a redeemed token is removed whether or
+/// not it validated, so a leaked token cannot be replayed.
+pub fn redeem_consent(
+  token: &str,
+  profile: &BrowserProfile,
+  exit_identity: &str,
+) -> Result<(), String> {
+  let now = crate::proxy_manager::now_secs();
+  let pending = {
+    let mut store = consents();
+    store.retain(|_, c| now.saturating_sub(c.issued_at) < CONSENT_TTL_SECS);
+    store.remove(token)
+  };
+
+  let Some(pending) = pending else {
+    return Err(crate::backend_error("LAUNCH_CONSENT_EXPIRED"));
+  };
+  if pending.profile_id != profile.id.to_string()
+    || pending.fingerprint_hash != crate::launch_gate_prefs::fingerprint_hash(profile)
+    || pending.exit_identity != exit_identity
+  {
+    return Err(crate::backend_error("LAUNCH_CONSENT_EXPIRED"));
+  }
+  Ok(())
+}
+
+fn mismatch_error(result: &ConsistencyResult, token: &str) -> String {
+  serde_json::json!({
+    "code": "FINGERPRINT_EXIT_MISMATCH",
+    "params": {
+      "token": token,
+      "exitIp": result.exit_ip.clone().unwrap_or_default(),
+      "exitCountry": result.exit_country_code.clone().unwrap_or_default(),
+      "exitTimezone": result.exit_timezone.clone().unwrap_or_default(),
+      "fingerprintTimezone": result.fingerprint_timezone.clone().unwrap_or_default(),
+      "fingerprintLanguage": result.fingerprint_language.clone().unwrap_or_default(),
+      "mismatches": result.mismatches.join(","),
+      "unverified": result.unverified.join(","),
+    }
+  })
+  .to_string()
+}
+
+/// Say which of the three states a non-blocking check landed in.
+///
+/// Only a measured disagreement stops a launch. The other two both continue -
+/// and telling them apart is the whole point, because "the exit and the
+/// fingerprint agree" and "nothing was compared" are different claims and the
+/// second used to be reported as the first.
+///
+/// Reaching an exit and finding nothing to compare is deliberately not a block:
+/// a fingerprint whose geolocation probe failed carries no location at all,
+/// since generation stopped inventing one, and refusing to start those profiles
+/// would break profiles that are legitimately in that state. It is not a pass
+/// either, so the launch says what it could not check.
+fn report_consistency(profile: &BrowserProfile, result: &ConsistencyResult) {
+  if result.is_verified() {
+    log::debug!("Fingerprint gate passed profile={}", profile.id);
+    return;
+  }
+  if result.unverified.is_empty() {
+    return;
+  }
+  log::info!(
+    "Fingerprint gate could not verify, fingerprint declares no value profile={} unverified={}",
+    profile.id,
+    result.unverified.join(",")
+  );
+  if let Err(e) = crate::events::emit("fingerprint-consistency-unverified", result) {
+    log::warn!("Event emit failed event=fingerprint-consistency-unverified err=\"{e}\"");
+  }
+}
+
+fn gate_disabled() -> bool {
+  crate::settings_manager::SettingsManager::instance()
+    .load_settings()
+    .map(|s| s.fingerprint_gate_disabled)
+    .unwrap_or(false)
+}
+
+/// The kill switch. With "Block launches without a proxy or VPN" on, a launch
+/// that would reach the internet from the machine's own address is refused:
+/// a profile with no route, and a profile whose proxy or VPN is gone or gave
+/// no endpoint. The fingerprint gate below would let the second kind through
+/// whenever the real location happens to match the fingerprint.
+pub fn enforce_route_required(profile: &BrowserProfile, has_upstream: bool) -> Result<(), String> {
+  let declares_route = profile.proxy_id.is_some() || profile.vpn_id.is_some();
+  route_verdict(declares_route, has_upstream, route_required())
+}
+
+fn route_verdict(declares_route: bool, has_upstream: bool, required: bool) -> Result<(), String> {
+  if has_upstream || !required {
+    return Ok(());
+  }
+  Err(crate::backend_error(if declares_route {
+    "PROFILE_ROUTE_UNAVAILABLE"
+  } else {
+    "PROFILE_ROUTE_REQUIRED"
+  }))
+}
+
+fn route_required() -> bool {
+  crate::settings_manager::SettingsManager::instance()
+    .load_settings()
+    .map(|s| s.require_route_for_launch)
+    .unwrap_or(false)
+}
+
+fn extension_warning_disabled() -> bool {
+  crate::settings_manager::SettingsManager::instance()
+    .load_settings()
+    .map(|s| s.vpn_extension_warning_disabled)
+    .unwrap_or(false)
+}
+
+/// Identity used for consent and acknowledgement when the browser will connect
+/// directly. Distinct from any proxy identity, so accepting a direct-exit
+/// mismatch never disarms the gate for a proxied one.
+const DIRECT_EXIT_IDENTITY: &str = "direct";
+
+/// Gate a launch that will connect directly despite the profile declaring a
+/// route. Measures the exit the browser will really use.
+async fn enforce_direct_exit(
+  profile: &BrowserProfile,
+  gate: &FingerprintGate,
+) -> Result<(), String> {
+  if gate_disabled() {
+    return Ok(());
+  }
+  if crate::launch_gate_prefs::fingerprint_ack_matches(profile, DIRECT_EXIT_IDENTITY) {
+    return Ok(());
+  }
+  if let FingerprintGate::Consented(token) = gate {
+    return redeem_consent(token, profile, DIRECT_EXIT_IDENTITY);
+  }
+  // Automation never probes; without a cache to consult there is nothing to say.
+  if matches!(gate, FingerprintGate::Advisory) {
+    return Ok(());
+  }
+
+  let result = match fingerprint_consistency::probe_direct_and_check(profile).await {
+    Ok(result) => result,
+    Err(e) => {
+      log::warn!(
+        "Fingerprint gate direct exit probe failed, launch allowed profile={} err=\"{}\"",
+        profile.id,
+        crate::log_redaction::text(&e.to_string())
+      );
+      return Ok(());
+    }
+  };
+  if !result.is_mismatch() {
+    report_consistency(profile, &result);
+    return Ok(());
+  }
+
+  let token = mint_consent(profile, DIRECT_EXIT_IDENTITY);
+  Err(mismatch_error(&result, &token))
+}
+
+/// The pre-spawn stage: gate the launch, then say what it will not apply.
+///
+/// Fails **open** on every degradation — probe failure, timeout, missing geo
+/// database, private exit IP. The gate blocks only on a positively measured
+/// mismatch; a flaky IP-echo endpoint must never make profiles unlaunchable.
+pub async fn enforce_fingerprint_gate(
+  profile: &BrowserProfile,
+  upstream: Option<&crate::browser::ProxySettings>,
+  gate: &FingerprintGate,
+) -> Result<(), String> {
+  gate_exit(profile, upstream, gate).await?;
+  notice_unapplied_fingerprint_edits(profile).await;
+  Ok(())
+}
+
+/// The notice code for a launch whose profile carries its own fingerprint
+/// edits while the plan does not include them, or `None`. Informational:
+/// the launch goes on, and the edits stay stored for when the plan has them.
+fn unapplied_edits_notice(
+  profile: &BrowserProfile,
+  plan_includes_edits: bool,
+) -> Option<&'static str> {
+  (!plan_includes_edits && has_fingerprint_edits(profile))
+    .then_some("FINGERPRINT_EDITS_NOT_APPLIED")
+}
+
+fn has_fingerprint_edits(profile: &BrowserProfile) -> bool {
+  profile.wayfern_config.as_ref().is_some_and(|config| {
+    !crate::wayfern_manager::WayfernManager::stored_object(config.identity_overrides.as_deref())
+      .is_empty()
+  })
+}
+
+/// Tell the app once per launch that the profile starts without its own
+/// fingerprint edits. Never asks the plan for a profile with no edits.
+async fn notice_unapplied_fingerprint_edits(profile: &BrowserProfile) {
+  if !has_fingerprint_edits(profile) {
+    return;
+  }
+  let plan_includes_edits = crate::cloud_auth::CLOUD_AUTH
+    .can_use_cross_os_fingerprints()
+    .await;
+  let Some(code) = unapplied_edits_notice(profile, plan_includes_edits) else {
+    return;
+  };
+  log::info!(
+    "Launching without the profile's fingerprint edits, plan does not include them profile={}",
+    profile.id
+  );
+  let payload = serde_json::json!({ "profile_id": profile.id.to_string(), "code": code });
+  if let Err(e) = crate::events::emit("launch-notice", payload) {
+    log::warn!("Event emit failed event=launch-notice err=\"{e}\"");
+  }
+}
+
+async fn gate_exit(
+  profile: &BrowserProfile,
+  upstream: Option<&crate::browser::ProxySettings>,
+  gate: &FingerprintGate,
+) -> Result<(), String> {
+  // A profile that declares no route is genuinely direct: the browser's exit is
+  // this machine, which is what an un-proxied fingerprint should describe.
+  //
+  // But a profile that DOES declare one and still arrives here with no upstream
+  // is about to go direct anyway — a deleted or unresolvable proxy resolves to
+  // `None` and the launch continues. That is the exact leak this gate exists to
+  // stop, so it must be measured, not waved through.
+  let declares_route = profile.proxy_id.is_some() || profile.vpn_id.is_some();
+  if upstream.is_none() && !declares_route {
+    return Ok(());
+  }
+  if gate_disabled() {
+    return Ok(());
+  }
+
+  // Decide *once*, before any consent handling, whether this launch is going
+  // out directly. Both a route that no longer resolves (deleted proxy) and one
+  // that produced no usable upstream (a VPN worker with no local port) end up
+  // connecting directly, and both must mint and redeem consent under the same
+  // identity — splitting that decision across the function meant the first
+  // attempt minted under "direct" while the retry redeemed against the proxy
+  // identity, so "Launch anyway" could never succeed.
+  let key = fingerprint_consistency::exit_cache_key(profile);
+  if key.is_none() || upstream.is_none() {
+    log::warn!(
+      "Profile route gave no usable upstream, gate measures the direct exit profile={} proxy={} vpn={}",
+      profile.id,
+      profile.proxy_id.as_deref().unwrap_or("none"),
+      profile.vpn_id.as_deref().unwrap_or("none")
+    );
+    return enforce_direct_exit(profile, gate).await;
+  }
+  let key = key.expect("checked above");
+
+  // Ack first: a persisted acknowledgement already permits this launch, so a
+  // stale token must not turn it into a hard failure.
+  if crate::launch_gate_prefs::fingerprint_ack_matches(profile, &key.identity) {
+    return Ok(());
+  }
+
+  if let FingerprintGate::Consented(token) = gate {
+    redeem_consent(token, profile, &key.identity)?;
+    return Ok(());
+  }
+
+  let result = if matches!(gate, FingerprintGate::Advisory) {
+    // Automation: answer from a warm cache or say nothing. Probing here would
+    // add seconds to every profile in a batch run.
+    fingerprint_consistency::check_profile_consistency_cached(profile)
+  } else {
+    match fingerprint_consistency::probe_and_check_consistency(profile, upstream, &key).await {
+      Ok(result) => result,
+      Err(e) => {
+        log::warn!(
+          "Fingerprint gate exit probe failed, launch allowed profile={} err=\"{}\"",
+          profile.id,
+          crate::log_redaction::text(&e.to_string())
+        );
+        return Ok(());
+      }
+    }
+  };
+
+  if !result.is_mismatch() {
+    // A mismatch carries its own report, and the dialog it opens already lists
+    // whatever went uncompared alongside it.
+    report_consistency(profile, &result);
+    return Ok(());
+  }
+
+  // Automation is the only caller allowed past a measured mismatch, because it
+  // has no dialog to answer. A proxy-capable extension in the profile does NOT
+  // earn the same pass: it makes the measurement less trustworthy, and a route
+  // that might be worse than measured is a reason for more scrutiny, not less.
+  // Waiving the block on it also meant any download manager holding Chromium's
+  // `proxy` permission silently disarmed the gate for good.
+  if matches!(gate, FingerprintGate::Advisory) {
+    log::warn!(
+      "Launching with a known fingerprint exit mismatch profile={} mismatches={}",
+      profile.id,
+      result.mismatches.join(",")
+    );
+    if let Err(e) = crate::events::emit("fingerprint-consistency-warning", &result) {
+      log::warn!("Event emit failed event=fingerprint-consistency-warning err=\"{e}\"");
+    }
+    return Ok(());
+  }
+
+  let token = mint_consent(profile, &key.identity);
+  Err(mismatch_error(&result, &token))
+}
+
+/// Everything the UI needs to decide whether to stop a launch. Starts no
+/// worker; the only network use is the bounded route check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreLaunchChecks {
+  pub vpn_extensions: Vec<DetectedVpnExtension>,
+  pub scan_state: String,
+  /// Cache-only; `checked` is false when the exit has not been measured yet.
+  pub consistency: ConsistencyResult,
+  /// True when the enforcing gate will still probe during the launch AND that
+  /// probe can actually compare something, so the UI can say the check is not
+  /// finished rather than implying it passed.
+  pub exit_probe_pending: bool,
+  /// Dimensions no probe can ever verify for this profile, because its
+  /// fingerprint declares no value to compare. Answered locally, with no
+  /// measurement. Informational and never a block, but the launch must not
+  /// read as verified on a dimension nothing will compare.
+  pub exit_unverified: Vec<String>,
+  /// An extension holding the `proxy` permission is present, so any exit
+  /// measurement describes a route the browser may not take. Informational
+  /// only — it never relaxes the block.
+  pub exit_measurement_unreliable: bool,
+  /// Present only when a cached mismatch is already blocking, so "launch
+  /// anyway" can proceed without a second round trip.
+  pub consent_token: Option<String>,
+  /// The profile's proxy or VPN did not answer a check just now. A warning
+  /// the user can launch past, never a block.
+  pub route_unreachable: Option<crate::proxy_manager::RouteUnreachable>,
+}
+
+fn load_profile(profile_id: &str) -> Result<BrowserProfile, String> {
+  crate::profile::ProfileManager::instance()
+    .list_profiles()
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .find(|p| p.id.to_string() == profile_id)
+    .ok_or_else(|| crate::backend_error("PROFILE_NOT_FOUND"))
+}
+
+#[tauri::command]
+pub async fn get_profile_pre_launch_checks(profile_id: String) -> Result<PreLaunchChecks, String> {
+  let profile = load_profile(&profile_id)?;
+
+  // The setting suppresses the extension report entirely, which is safe
+  // precisely because nothing enforcing depends on it: the scan feeds the
+  // dialog's warning and the "measurement may be unreliable" note, never the
+  // decision to block.
+  let scan = if extension_warning_disabled() {
+    vpn_extension_detect::ExtensionScan {
+      extensions: Vec::new(),
+      scan_state: "scanned".to_string(),
+    }
+  } else {
+    vpn_extension_detect::scan_profile(&profile)
+  };
+
+  // Drop anything the user has already acknowledged for this profile, so the
+  // dialog only ever opens for something new.
+  let vpn_extensions: Vec<DetectedVpnExtension> = scan
+    .extensions
+    .iter()
+    .filter(|e| {
+      !crate::launch_gate_prefs::extensions_acked(&profile_id, std::slice::from_ref(&e.key))
+    })
+    .cloned()
+    .collect();
+  let exit_measurement_unreliable = vpn_extension_detect::has_proxy_control(&scan);
+
+  let disabled = gate_disabled();
+  let key = fingerprint_consistency::exit_cache_key(&profile);
+
+  let consistency = if disabled {
+    ConsistencyResult::skip()
+  } else {
+    fingerprint_consistency::check_profile_consistency_cached(&profile)
+  };
+
+  let already_acked = key
+    .as_ref()
+    .is_some_and(|k| crate::launch_gate_prefs::fingerprint_ack_matches(&profile, &k.identity));
+
+  let blocking = consistency.is_mismatch() && !already_acked;
+  let consent_token = match (&key, blocking) {
+    (Some(k), true) => Some(mint_consent(&profile, &k.identity)),
+    _ => None,
+  };
+
+  // Only meaningful when an exit check is going to happen at all: an
+  // acknowledged profile, a disabled gate, or a profile with no route never
+  // measures an exit, so there is nothing it failed to verify.
+  let gate_will_measure = !disabled && !already_acked && key.is_some();
+  let exit_unverified = if gate_will_measure {
+    fingerprint_consistency::unverifiable_dimensions(&profile)
+  } else {
+    Vec::new()
+  };
+
+  // Bounded and shared per route, so a bulk launch checks each proxy once.
+  let route_unreachable = crate::proxy_manager::check_route_before_launch(
+    profile.proxy_id.as_deref(),
+    profile.vpn_id.as_deref(),
+  )
+  .await;
+
+  Ok(PreLaunchChecks {
+    vpn_extensions,
+    scan_state: scan.scan_state,
+    consistency: if blocking {
+      consistency
+    } else {
+      ConsistencyResult::skip()
+    },
+    // A probe that can compare nothing is not pending work. Reporting it as
+    // pending promises the user Donut "will check it while starting and stop if
+    // it doesn't match", which is the same unearned assurance in a second
+    // costume.
+    exit_probe_pending: gate_will_measure
+      && !blocking
+      && fingerprint_consistency::can_verify_anything(&profile),
+    exit_unverified,
+    exit_measurement_unreliable,
+    consent_token,
+    route_unreachable,
+  })
+}
+
+/// Persist "don't ask me again" choices from the gate dialog.
+#[tauri::command]
+pub async fn ack_launch_gate(
+  profile_id: String,
+  ack_fingerprint: bool,
+  ack_extension_keys: Vec<String>,
+) -> Result<(), String> {
+  let profile = load_profile(&profile_id)?;
+
+  if ack_fingerprint {
+    // Must match the identity the block was issued against. A profile whose
+    // route did not resolve is gated on the direct exit and has no cache key,
+    // so falling back here is what makes "don't block again" stick for it.
+    let identity = fingerprint_consistency::exit_cache_key(&profile)
+      .map(|key| key.identity)
+      .unwrap_or_else(|| DIRECT_EXIT_IDENTITY.to_string());
+    crate::launch_gate_prefs::ack_fingerprint(&profile, &identity);
+  }
+  crate::launch_gate_prefs::ack_extensions(&profile_id, &ack_extension_keys);
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn with_the_kill_switch_off_every_launch_passes() {
+    assert!(route_verdict(false, false, false).is_ok());
+    assert!(route_verdict(true, false, false).is_ok());
+  }
+
+  #[test]
+  fn the_kill_switch_refuses_a_launch_with_no_route() {
+    let error = route_verdict(false, false, true).unwrap_err();
+    assert!(error.contains("PROFILE_ROUTE_REQUIRED"), "{error}");
+  }
+
+  #[test]
+  fn the_kill_switch_refuses_a_route_that_is_gone() {
+    let error = route_verdict(true, false, true).unwrap_err();
+    assert!(error.contains("PROFILE_ROUTE_UNAVAILABLE"), "{error}");
+  }
+
+  #[test]
+  fn the_kill_switch_lets_a_routed_launch_through() {
+    assert!(route_verdict(true, true, true).is_ok());
+  }
+
+  fn profile_with(fingerprint: &str) -> BrowserProfile {
+    let mut profile = BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      browser: "wayfern".into(),
+      ..Default::default()
+    };
+    profile.wayfern_config = Some(crate::wayfern_manager::WayfernConfig {
+      fingerprint: Some(fingerprint.to_string()),
+      ..Default::default()
+    });
+    profile
+  }
+
+  #[test]
+  fn consent_token_authorizes_exactly_one_launch() {
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    let token = mint_consent(&profile, "http://gw:1");
+    assert!(redeem_consent(&token, &profile, "http://gw:1").is_ok());
+    // Replaying it must fail, so a leaked token cannot re-authorize.
+    assert!(redeem_consent(&token, &profile, "http://gw:1").is_err());
+  }
+
+  #[test]
+  fn consent_token_is_rejected_for_a_different_profile() {
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    let other = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    let token = mint_consent(&profile, "http://gw:1");
+    assert!(redeem_consent(&token, &other, "http://gw:1").is_err());
+  }
+
+  #[test]
+  fn consent_token_is_rejected_after_the_fingerprint_changes() {
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    let token = mint_consent(&profile, "http://gw:1");
+
+    let mut regenerated = profile_with(r#"{"timezone":"America/New_York"}"#);
+    regenerated.id = profile.id;
+    assert!(redeem_consent(&token, &regenerated, "http://gw:1").is_err());
+  }
+
+  #[test]
+  fn consent_token_is_rejected_after_the_exit_changes() {
+    // The reason a bare `bypass: bool` is not enough: consent granted for one
+    // proxy must not authorize a launch through another.
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    let token = mint_consent(&profile, "http://gw:1");
+    assert!(redeem_consent(&token, &profile, "http://other:2").is_err());
+  }
+
+  #[test]
+  fn an_unknown_token_is_rejected() {
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    let err = redeem_consent("deadbeef", &profile, "http://gw:1").unwrap_err();
+    assert!(err.contains("LAUNCH_CONSENT_EXPIRED"), "{err}");
+  }
+
+  #[test]
+  fn expired_tokens_are_swept_and_rejected() {
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    let token = mint_consent(&profile, "http://gw:1");
+    // Back-date it past the TTL.
+    {
+      let mut store = consents();
+      if let Some(pending) = store.get_mut(&token) {
+        pending.issued_at = crate::proxy_manager::now_secs() - CONSENT_TTL_SECS - 1;
+      }
+    }
+    assert!(redeem_consent(&token, &profile, "http://gw:1").is_err());
+  }
+
+  #[test]
+  fn mismatch_error_carries_the_details_the_dialog_renders() {
+    let result = ConsistencyResult {
+      consistent: false,
+      checked: true,
+      exit_ip: Some("1.2.3.4".into()),
+      exit_country_code: Some("DE".into()),
+      exit_timezone: Some("Europe/Berlin".into()),
+      fingerprint_timezone: Some("America/New_York".into()),
+      fingerprint_language: Some("en-US".into()),
+      mismatches: vec!["timezone".into(), "language".into()],
+      unverified: Vec::new(),
+    };
+    let encoded = mismatch_error(&result, "tok");
+    let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(parsed["code"], "FINGERPRINT_EXIT_MISMATCH");
+    assert_eq!(parsed["params"]["token"], "tok");
+    assert_eq!(parsed["params"]["exitTimezone"], "Europe/Berlin");
+    assert_eq!(parsed["params"]["fingerprintTimezone"], "America/New_York");
+    // params values must be strings for the frontend's interpolation.
+    assert_eq!(parsed["params"]["mismatches"], "timezone,language");
+    assert_eq!(parsed["params"]["unverified"], "");
+  }
+
+  #[test]
+  fn mismatch_error_carries_what_it_could_not_verify_too() {
+    // One dimension disagreed and the other was never compared. The dialog
+    // rebuilds its finding from these params, so dropping `unverified` here
+    // would make the rebuilt result claim a clean bill on a dimension nothing
+    // looked at.
+    let result = ConsistencyResult {
+      consistent: false,
+      checked: true,
+      exit_ip: Some("1.2.3.4".into()),
+      exit_country_code: Some("DE".into()),
+      exit_timezone: Some("Europe/Berlin".into()),
+      fingerprint_timezone: Some("America/New_York".into()),
+      fingerprint_language: None,
+      mismatches: vec!["timezone".into()],
+      unverified: vec!["language".into()],
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&mismatch_error(&result, "tok")).unwrap();
+    assert_eq!(parsed["params"]["mismatches"], "timezone");
+    assert_eq!(parsed["params"]["unverified"], "language");
+  }
+
+  #[test]
+  fn an_unverified_dimension_is_never_a_mismatch_and_never_blocks() {
+    // The N7 shape at the gate: an exit was reached, the fingerprint declares
+    // no timezone, so nothing was compared. That must not stop a launch...
+    let result = ConsistencyResult {
+      consistent: true,
+      checked: false,
+      exit_ip: Some("1.2.3.4".into()),
+      exit_country_code: Some("DE".into()),
+      exit_timezone: Some("Europe/Berlin".into()),
+      fingerprint_timezone: None,
+      fingerprint_language: None,
+      mismatches: Vec::new(),
+      unverified: vec!["timezone".into(), "language".into()],
+    };
+    assert!(
+      !result.is_mismatch(),
+      "an unverified dimension must not block"
+    );
+    // ...and must not be reported as a clean check either.
+    assert!(!result.is_verified());
+  }
+
+  #[test]
+  fn a_profile_that_can_verify_nothing_reports_no_pending_probe() {
+    // `exit_probe_pending` promises the user the launch "will check it while
+    // starting and stop if it doesn't match". A fingerprint with no locale at
+    // all leaves the probe nothing to compare, so that promise cannot be kept.
+    let bare = profile_with(r#"{"platform":"Win32"}"#);
+    assert!(!fingerprint_consistency::can_verify_anything(&bare));
+    assert_eq!(
+      fingerprint_consistency::unverifiable_dimensions(&bare),
+      vec!["timezone", "language"]
+    );
+
+    let located = profile_with(r#"{"timezone":"Europe/Berlin","language":"de-DE"}"#);
+    assert!(fingerprint_consistency::can_verify_anything(&located));
+    assert!(fingerprint_consistency::unverifiable_dimensions(&located).is_empty());
+  }
+
+  #[test]
+  fn a_profile_with_edits_launches_with_a_notice_without_the_plan() {
+    let mut edited = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    if let Some(config) = edited.wayfern_config.as_mut() {
+      config.identity_id = Some("identity-1".into());
+      config.identity_overrides = Some(r#"{"hardwareConcurrency":8}"#.into());
+    }
+    assert_eq!(
+      unapplied_edits_notice(&edited, false),
+      Some("FINGERPRINT_EDITS_NOT_APPLIED")
+    );
+    assert_eq!(
+      unapplied_edits_notice(&edited, true),
+      None,
+      "a plan with fingerprint edits never sees the notice"
+    );
+  }
+
+  #[test]
+  fn a_profile_without_edits_never_gets_the_notice() {
+    let mut plain = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    if let Some(config) = plain.wayfern_config.as_mut() {
+      config.identity_id = Some("identity-1".into());
+    }
+    assert_eq!(unapplied_edits_notice(&plain, false), None);
+
+    let mut emptied = plain.clone();
+    if let Some(config) = emptied.wayfern_config.as_mut() {
+      config.identity_overrides = Some("{}".into());
+    }
+    assert_eq!(
+      unapplied_edits_notice(&emptied, false),
+      None,
+      "an empty edit set is no edit"
+    );
+
+    let no_config = BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      browser: "wayfern".into(),
+      ..Default::default()
+    };
+    assert_eq!(unapplied_edits_notice(&no_config, false), None);
+  }
+
+  #[tokio::test]
+  async fn gate_allows_a_direct_connection_without_measuring() {
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    assert!(
+      enforce_fingerprint_gate(&profile, None, &FingerprintGate::Enforce)
+        .await
+        .is_ok()
+    );
+  }
+
+  #[tokio::test]
+  async fn gate_allows_a_profile_with_no_proxy_or_vpn() {
+    // A profile that declares no route has no upstream either — that pairing is
+    // the only one the launcher can actually produce. It must return without
+    // measuring anything, so this stays a pure unit test with no network.
+    let profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    assert!(
+      enforce_fingerprint_gate(&profile, None, &FingerprintGate::Enforce)
+        .await
+        .is_ok()
+    );
+  }
+
+  #[tokio::test]
+  async fn consent_for_a_direct_launch_is_redeemable_by_the_gate() {
+    // Regression: a route that yields no usable upstream is gated on the direct
+    // exit, so consent is minted under DIRECT_EXIT_IDENTITY. If the gate then
+    // redeemed against the proxy/VPN identity instead, "Launch anyway" would
+    // fail forever and the profile could never be started.
+    let mut profile = profile_with(r#"{"timezone":"Europe/Berlin"}"#);
+    profile.vpn_id = Some("vpn-with-no-port".into());
+
+    let token = mint_consent(&profile, DIRECT_EXIT_IDENTITY);
+    // No upstream: the launcher could not bring the route up.
+    let result = enforce_fingerprint_gate(&profile, None, &FingerprintGate::Consented(token)).await;
+    assert!(
+      result.is_ok(),
+      "consent minted for the direct exit must be redeemable, got {result:?}"
+    );
+  }
+}

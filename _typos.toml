@@ -1,0 +1,29 @@
+[files]
+extend-exclude = [
+    "src-tauri/src/territory_info.xml",
+    "src/i18n/locales/*.json",
+    # Dependency names and SPDX expressions are generated verbatim.
+    "src/generated/licenses.json",
+    # Auto-generated from commit subjects by release.yml; typos here originate
+    # in commit messages, which are immutable, so don't spell-check it.
+    "CHANGELOG.md",
+    # Upstream patches for the Flatpak's tray libraries, applied verbatim.
+    "packaging/flatpak/patches/",
+]
+
+[default.extend-words]
+# The IDN test fixtures in src-tauri/src/xray encode "cafe" as punycode
+# ("xn--caf-dma") and as percent-escapes ("caf%C3%A9"). Both leave a bare "caf"
+# token that is an encoding artefact, never a misspelling of "calf".
+caf = "caf"
+DBE = "DBE"
+nd = "nd"
+# Playwright's code for a BigUint64Array in an encoded IndexedDB value.
+bui = "bui"
+# German and French words in the tray menu labels (tray.rs).
+Alle = "Alle"
+cours = "cours"
+
+[default.extend-identifiers]
+# Chrome Web Store extension name in the known-VPN list.
+VeePN = "VeePN"

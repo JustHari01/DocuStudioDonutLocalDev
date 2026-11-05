@@ -1,0 +1,210 @@
+{
+  "schema_version": 2,
+  "version": "11.1.0-r1",
+  "domain": "G-13",
+  "name": "Máy công cụ và đo lường",
+  "file": "master-G13-11.1.0-r1.txt",
+  "sha256": "5a8b6512e22fddf7557db78c2b3d7e6eec878a81c3c8ca60f93562f2d3df64ce",
+  "characters": 17911,
+  "protocol": "content-package-v1",
+  "image_interval_seconds": 30,
+  "subtitle_max_characters": 40,
+  "masters": {
+    "G-13": {
+      "version": "11.1.0-r1",
+      "domain": "G-13",
+      "name": "Máy công cụ và đo lường",
+      "file": "master-G13-11.1.0-r1.txt",
+      "sha256": "5a8b6512e22fddf7557db78c2b3d7e6eec878a81c3c8ca60f93562f2d3df64ce",
+      "characters": 17911
+    },
+    "G-10": {
+      "version": "11.1.0-r1",
+      "domain": "G-10",
+      "name": "Đường sắt và hạ tầng",
+      "file": "master-G10-11.1.0-r1.txt",
+      "sha256": "5c44944e52b9b414058aa608b5e81579c3b7e4fbff42e6bc31d47fd669f0493f",
+      "characters": 17857
+    },
+    "G-09": {
+      "version": "11.1.0-r1",
+      "domain": "G-09",
+      "name": "Ô tô, hybrid và pin",
+      "file": "master-G09-11.1.0-r1.txt",
+      "sha256": "447f61ca285eb3518d37c8b68702f06736e0c7ec31e5d3186af523b296792828",
+      "characters": 17592
+    },
+    "G-12": {
+      "version": "11.1.0-r1",
+      "domain": "G-12",
+      "name": "Vật liệu và thiết bị bán dẫn",
+      "file": "master-G12-11.1.0-r1.txt",
+      "sha256": "d8387c8cab06f0785c2baf8c99fc27b08e419c238a65d42c8506dfda529bea2c",
+      "characters": 17759
+    },
+    "G-16": {
+      "version": "11.1.0-r1",
+      "domain": "G-16",
+      "name": "Linh kiện và chuỗi cung ứng",
+      "file": "master-G16-11.1.0-r1.txt",
+      "sha256": "19757f99907006f50450a9be78b71280294d3fc93faa05bc29461524c07b4527",
+      "characters": 17782
+    },
+    "G-11": {
+      "version": "11.1.0-r1",
+      "domain": "G-11",
+      "name": "Cảng, sân bay và logistics",
+      "file": "master-G11-11.1.0-r1.txt",
+      "sha256": "cd2f0f90bd1a7e1f73435243f456fb453fb71757e88d235f329ec103e54992b3",
+      "characters": 17858
+    },
+    "R-A6": {
+      "version": "11.1.0-r1",
+      "domain": "R-A6",
+      "name": "Tiêu chuẩn và chứng nhận",
+      "file": "master-RA6-11.1.0-r1.txt",
+      "sha256": "a9c44f9839334bd645781b1e2c74c3139fafd2720ae0479b49eac95bdc29b3e5",
+      "characters": 17504
+    },
+    "R-B2": {
+      "version": "11.1.0-r1",
+      "domain": "R-B2",
+      "name": "Thương hiệu, bảo hành và hậu mãi",
+      "file": "master-RB2-11.1.0-r1.txt",
+      "sha256": "9b01713e85c393c282a481736103d38f2a1134f1343f88fb86cae3331c8ad289",
+      "characters": 17225
+    },
+    "R-B3": {
+      "version": "11.1.0-r1",
+      "domain": "R-B3",
+      "name": "Bằng sáng chế và nguồn gốc công nghệ",
+      "file": "master-RB3-11.1.0-r1.txt",
+      "sha256": "2fe71faeb6cca2bbdf4ab3f54e4c18ca85d9f305be41fe852249c0540278fccf",
+      "characters": 17289
+    },
+    "R-B4": {
+      "version": "11.1.0-r1",
+      "domain": "R-B4",
+      "name": "Tri thức ngầm và monozukuri",
+      "file": "master-RB4-11.1.0-r1.txt",
+      "sha256": "ed864704a9db3c4d02cbb7260c83a07e51eec6a2f2d885b08fd0131ed6c0a235",
+      "characters": 17201
+    },
+    "R-B5": {
+      "version": "11.1.0-r1",
+      "domain": "R-B5",
+      "name": "Hợp đồng, đấu thầu và hợp tác quốc tế",
+      "file": "master-RB5-11.1.0-r1.txt",
+      "sha256": "836196c549039a8b470e4eb2d6d170f67fc26dad49887b56a5ef1e6f4f7892dd",
+      "characters": 17166
+    },
+    "R-B6": {
+      "version": "11.1.0-r1",
+      "domain": "R-B6",
+      "name": "Khủng hoảng và khả năng phục hồi hệ thống",
+      "file": "master-RB6-11.1.0-r1.txt",
+      "sha256": "7ab4e4502daf1c0742bda22b1a984b136ca785915be1316bbe08d0aa95a6d2ab",
+      "characters": 17118
+    },
+    "R-C1": {
+      "version": "11.1.0-r1",
+      "domain": "R-C1",
+      "name": "Kỹ sư, chuyển giao và hệ sinh thái",
+      "file": "master-RC1-11.1.0-r1.txt",
+      "sha256": "7da50944f365e364d387a59833cca602c48b176bc88c4e908c46228245bd2450",
+      "characters": 17086
+    },
+    "R-C2": {
+      "version": "11.1.0-r1",
+      "domain": "R-C2",
+      "name": "Tài chính, ngoại hối và thanh khoản",
+      "file": "master-RC2-11.1.0-r1.txt",
+      "sha256": "a59418fa887c60f17a8b97d49e2f2ff61ad86eb3cca7a5ff15164c32053ac6a5",
+      "characters": 17396
+    },
+    "R-C3": {
+      "version": "11.1.0-r1",
+      "domain": "R-C3",
+      "name": "Ngân hàng, tín dụng và xếp hạng",
+      "file": "master-RC3-11.1.0-r1.txt",
+      "sha256": "f37228fe159d7ed899a29eb9b0ed5a84766488f3b5a5ec4d8ee448f4392fa266",
+      "characters": 17209
+    },
+    "R-H3-01": {
+      "version": "11.1.0-r1",
+      "domain": "R-H3-01",
+      "name": "Năng lượng mới và tài nguyên biển sâu",
+      "file": "master-RH301-11.1.0-r1.txt",
+      "sha256": "61c27df07867d814f84aa12cb7e2ab72942653d06801d843c407ba1e55715dd2",
+      "characters": 17160
+    },
+    "R-H3-02": {
+      "version": "11.1.0-r1",
+      "domain": "R-H3-02",
+      "name": "Hàng không vũ trụ và thăm dò không gian",
+      "file": "master-RH302-11.1.0-r1.txt",
+      "sha256": "21d7a08596ba4c62197286775706dd701141d714498adae82b32332f0d668252",
+      "characters": 17081
+    },
+    "R-H3-03": {
+      "version": "11.1.0-r1",
+      "domain": "R-H3-03",
+      "name": "HVAC, bơm nhiệt và thích ứng khí hậu",
+      "file": "master-RH303-11.1.0-r1.txt",
+      "sha256": "83f7ac703cecaca9d224ecd3d91a4fc25d44da3dd5419870133c3b27b1f9706c",
+      "characters": 17028
+    },
+    "R-H3-04": {
+      "version": "11.1.0-r1",
+      "domain": "R-H3-04",
+      "name": "Kỹ thuật hậu cần quốc phòng và cứu hộ",
+      "file": "master-RH304-11.1.0-r1.txt",
+      "sha256": "c7ee238ffac17937f150f4a95326f27a6bcba88a285c0d0c91d6915ed872d450",
+      "characters": 17159
+    },
+    "R-H3-05": {
+      "version": "11.1.0-r1",
+      "domain": "R-H3-05",
+      "name": "Nghệ thuật biểu diễn và công nghệ giải trí",
+      "file": "master-RH305-11.1.0-r1.txt",
+      "sha256": "08801c4118a8f4963de34d5ad42760c0851b9b72d93a44d95f3b4cd59f43cb3e",
+      "characters": 17341
+    }
+  },
+  "archives": {
+    "G-13": {
+      "11.0.0-r1": {
+        "domain": "G-13",
+        "version": "11.0.0-r1",
+        "file": "master-G13-11.0.0-r1.txt",
+        "sha256": "db6f5c50e6862862e552e5cc9254c4772f0b510d738b630e391fcb9c889b9952"
+      }
+    }
+  },
+  "scope": "Explicit next-run selection; no change to in-flight drafts, schedules or queues",
+  "research_evidence_sha256": "d7573d38daa79ae051b21214d38c3264de73c6252b673439dd32d58ef6024636",
+  "domain_catalog_sha256": "9551849afcabf74c3b16f725653d2dc463b7879417633270cab4fa832c12be84",
+  "source_files": {
+    "G09.txt": "faccbf1fa239790e96d5f1275315f6acdec71c3b279b746386d43ac054229fe4",
+    "G10.txt": "988bf51d59deeff9a5bedee7ce758aa2f9c65064a78573573b364ba89591d731",
+    "G11.txt": "9c9d0fd49c87587061ef99521a4f0d27ff7b4acfc73e4140550d512d0c2e2097",
+    "G12.txt": "30d4cd7434a5d9d4db9c7cfd1ccdff89705a5f333c7bb7a6a296889d25eca49e",
+    "G13.txt": "542d029e23653ad619dbfa71db80cf6a32a5896cf4f73fdcd3c9878e54759270",
+    "G16.txt": "ddf605f29932ccfbe744f042a6af669d0c8e4add50c2d8b009c319574e50dcc3",
+    "protocol.txt": "7605ce3046e6a7842a9f46f55f81f31db25075edd12fe59ead3b4b123f464e12",
+    "RA6.txt": "60652aabf4788d00e34450e299b9db911fbb288664026c64be164c6462db3b1e",
+    "RB2.txt": "d5c7dc19a7b5324bdd8784d144dc416b6c7e38043929f876b065230b5abb8506",
+    "RB3.txt": "574bfc5d6b0bf8b5f2dfbc8cf4d1daae117a1d69378a6f4b55624814ccbdb167",
+    "RB4.txt": "f5c8da347cc3aff28956aa13816c101b9912198a9326b8bad49efe553d5e9f8a",
+    "RB5.txt": "1583ec717c24fab46c236d1012d8a1cb980823cc6a52566b9fef6c925277ea52",
+    "RB6.txt": "bcd391a1aa2c08c50b7a55b6346b5a3c4354ef4a7faea7ac2af3b04b12aa6c65",
+    "RC1.txt": "d0c58f52c72b91c80c72e78469a1cb8eb043fb795c96c8500788df921ff7cff5",
+    "RC2.txt": "159308a021c17c5f8d0cac86a0b220fc2667e0c19a1e157f75aee94fab64459d",
+    "RC3.txt": "0bc969c14039149151e9e8474d87230e69a9a23da606807383b9bb87777328b2",
+    "RH301.txt": "7b3c26a4643c03b83778022493c77492703eca6bfd90d4b0119ddda8f1e6c6c0",
+    "RH302.txt": "6600733b35ba854e43489d263d4f4e818f5e2471544a3bfba2705dccd3a028b2",
+    "RH303.txt": "442aad3a9a05c2b02a679ea30de3bf675791a2bf937a9af8895a2088b376fbd9",
+    "RH304.txt": "6362bc62fb5badcf5ba5d433e669ab0e42ea1b498b5ccf3b0e04ef5cf0bd25f9",
+    "RH305.txt": "40475ec2353eb11aa153fba602de65691ea0d86826b650d6f78caee14712508f"
+  }
+}

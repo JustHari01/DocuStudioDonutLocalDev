@@ -1,0 +1,42 @@
+DOMAIN: R-B3 — BẰNG SÁNG CHẾ VÀ NGUỒN GỐC CÔNG NGHỆ
+Lời hứa kênh: lần theo thời gian, bản vẽ và giới hạn yêu cầu bảo hộ để hiểu một
+công nghệ hình thành thế nào; không dùng kể chuyện để kết tội ai đánh cắp.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Nộp đơn, công bố và cấp bằng: các mốc khác nhau trong cùng hồ sơ.
+2. Ngày ưu tiên: vai trò của hồ sơ trước và phạm vi được viện dẫn.
+3. Một họ sáng chế ở nhiều nước: đối chiếu thành viên và tình trạng từng nơi.
+4. Bản vẽ giống nhưng yêu cầu khác: đọc vật thể minh họa cùng claims.
+5. Nhà phát minh, người nộp đơn và chủ sở hữu: những vai trò không đồng nhất.
+6. Giải pháp cải tiến: đóng góp mới có thể nằm ở một điều kiện nhỏ.
+7. Chuyển giao, license và hợp tác: chứng cứ nào có trong hồ sơ công khai.
+8. Bằng hết hiệu lực hoặc thay đổi trạng thái: nêu nước và ngày tra cứu.
+9. Từ sáng chế đến sản xuất: khoảng cách giữa hồ sơ bảo hộ và sản phẩm thương mại.
+10. Lời đồn ai làm trước: tách công bố, nguyên mẫu, thương mại hóa và truyền miệng.
+
+VẬT CHỨNG VÀ ĐỌC NGUỒN
+Ưu tiên hồ sơ J-PlatPat, WIPO/PATENTSCOPE, Espacenet hoặc cơ quan sáng chế có thẩm
+quyền; giữ số công bố, nước, ngày tra cứu và phần hỗ trợ kết luận. Không bịa mã
+bằng, ngày hoặc trích dẫn. Tình trạng pháp lý phải kiểm theo từng hồ sơ/quốc gia,
+không suy từ một bản dịch máy. Tiêu đề/abstract/bản vẽ không thay cho yêu cầu bảo
+hộ và hồ sơ xử lý. Có bằng không tự chứng minh tính thương mại, an toàn hay quyền
+tự do khai thác; không kết luận xâm phạm từ hình giống nhau. Khi chỉ có tài liệu
+một phía, mô tả giới hạn và tránh quy kết động cơ.
+
+THUẬT NGỮ NHẬT
+特許出願: đơn sáng chế; 公開公報: công báo công bố; 特許請求の範囲: yêu cầu bảo hộ;
+優先日: ngày ưu tiên; 発明者: nhà phát minh; 出願人: người nộp đơn;
+権利者: chủ quyền; 先行技術: giải pháp đã biết; 実施許諾: cấp phép;
+法的状態: tình trạng pháp lý. Giữ chính xác tên và mã hồ sơ, không tự tạo furigana.
+
+CÁCH KỂ VÀ HÌNH ẢNH
+Một dòng thời gian có vẻ ngược, hai bản vẽ dễ nhầm, rồi một điều khoản làm đổi
+cách hiểu. Thumbnail dùng vật thể công nghệ cùng chi tiết bản vẽ minh họa rõ ràng;
+tránh chữ ĂN CẮP hoặc biểu tượng tòa án khi chưa có phán quyết. Shot phân biệt
+nguyên mẫu → hồ sơ → điều kiện trong claim → sản phẩm. Không giả screenshot tra
+cứu, số bằng hay văn bản pháp lý bằng ảnh AI; chỉ tái dựng sơ đồ không gắn dữ kiện giả.
+
+BIÊN NGÁCH
+Đây là giải thích lịch sử/kỹ thuật dựa hồ sơ, không tư vấn pháp lý, kết tội doanh
+nghiệp hoặc hướng dẫn lách bằng. Chấp nhận lịch sử hợp tác đa quốc gia và kết quả
+không xác định; không buộc mọi phát minh đều có nguồn gốc Nhật.

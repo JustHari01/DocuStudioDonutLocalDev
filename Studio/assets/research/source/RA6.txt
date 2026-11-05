@@ -1,0 +1,44 @@
+DOMAIN: R-A6 — TIÊU CHUẨN, THỬ NGHIỆM VÀ CHỨNG NHẬN
+Lời hứa kênh: giải thích một dấu đạt chứng nhận thực sự xác nhận điều gì, trong
+phạm vi nào và vì sao truy xuất được phép thử quan trọng hơn một tờ giấy đẹp.
+R-A6 là mã thư viện nghiên cứu, không đổi nghĩa các mã G của Master cũ.
+
+PHẠM VI VÀ 10 FAMILY ĐỀ TÀI ĐỂ LUÂN PHIÊN
+1. Kết quả một mẫu so với cả lô hàng: chọn mẫu, sai lệch và giới hạn kết luận.
+2. Phòng thử nghiệm: phương pháp, thiết bị và phạm vi năng lực được công nhận.
+3. Hiệu chuẩn: chuỗi tham chiếu và độ không đảm bảo ảnh hưởng quyết định nhận hàng.
+4. Truy xuất: từ mã lô về vật liệu, công đoạn và hồ sơ thử tương ứng.
+5. Thử độ bền: chu kỳ, tải và môi trường khác nhau làm thay đổi ý nghĩa kết quả.
+6. Sửa thiết kế sau chứng nhận: thay đổi nào cần đánh giá phạm vi thử lại.
+7. Đánh giá nhà cung cấp: tài liệu có đủ nhưng quá trình thực tế không được kiểm soát.
+8. Thử liên phòng: hai nơi báo số khác và cách tìm khác biệt phương pháp.
+9. Chứng chỉ hết hạn hoặc sai phạm vi: kiểm tổ chức cấp và đối tượng được chứng nhận.
+10. Quyết định phù hợp: giới hạn đo gần ngưỡng, quy tắc quyết định và rủi ro chấp nhận.
+
+VẬT CHỨNG, NGUỒN VÀ ĐIỀU KIỆN SO SÁNH
+Ưu tiên tài liệu chính thức của tổ chức tiêu chuẩn/công nhận, phạm vi công nhận,
+phương pháp thử, phiên bản tiêu chuẩn, ngày cấp và đối tượng chứng nhận. Không
+chép một số ISO vào title nếu không có văn bản đủ để xác định phạm vi áp dụng.
+Phân biệt chứng nhận hệ thống quản lý, chứng nhận sản phẩm và công nhận năng lực
+phòng thử; không dùng một loại thay bằng chứng cho loại khác. Một tổ chức đạt
+hệ thống quản lý không tự chứng minh mọi sản phẩm của họ đạt mọi yêu cầu.
+So cùng phương pháp, trạng thái mẫu, đơn vị, điều kiện và quy tắc quyết định.
+Không lấy ảnh AI của phiếu thử, logo công nhận hay chữ ký làm hồ sơ thật.
+
+THUẬT NGỮ NHẬT
+規格: tiêu chuẩn; 認証: chứng nhận; 認定: công nhận; 試験方法: phương pháp thử;
+適用範囲: phạm vi áp dụng; トレーサビリティ: truy xuất; 校正: hiệu chuẩn;
+測定不確かさ: độ không đảm bảo đo; 抜取検査: kiểm tra lấy mẫu;
+適合性評価: đánh giá sự phù hợp. Phân biệt nghĩa theo tài liệu cụ thể.
+
+CÁCH KỂ VÀ THUMBNAIL/SHOT RIÊNG
+Mở bằng hai kết quả tưởng mâu thuẫn, lần theo điều kiện thử rồi trả lời đúng phạm
+vi. Hero là mẫu vật/thiết bị thử, kèm dấu định danh lô hoặc phạm vi hồ sơ được minh
+họa. Shot từ vật thể → điều kiện thử → kết quả → quyết định. Giấy minh họa không
+được giả thành chứng chỉ của doanh nghiệp thật. Không đóng dấu đỏ GIAN LẬN khi
+mới thấy khác phương pháp; kết thúc bằng điều được và chưa được chứng minh.
+
+BIÊN NGÁCH
+Trọng tâm là tiêu chuẩn và bằng chứng phù hợp, không biến thành CNC G-13 hoặc
+chuỗi cung ứng G-16 chỉ vì cùng có hồ sơ kiểm. Không viết hướng dẫn giả chứng chỉ,
+lách kiểm định hoặc kết luận pháp lý về tổ chức cụ thể khi chưa đủ hồ sơ.

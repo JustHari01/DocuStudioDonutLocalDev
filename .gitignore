@@ -1,0 +1,130 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# npm/yarn lock files (project uses pnpm only)
+**/package-lock.json
+**/yarn.lock
+
+# testing
+/coverage
+/e2e/app/target/
+/e2e/app/Cargo.lock
+/e2e/.driver/
+
+# next.js
+/.next/
+/out/
+/dist/
+
+# production
+/build
+
+# misc
+**/*.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# nested build output
+**/dist
+**/node_modules
+
+# local env files
+.env*.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+
+!**/.gitkeep
+
+# sync test harness cache
+.cache/
+
+# env
+.env
+
+# next
+**/next-env.d.ts
+
+# claude
+.claude/
+# Claude Code session-recovery runtime state
+HANDOFF.md
+.claude/settings.local.json
+.claude/rate-limit-state.json
+.claude/stop-failure-events.jsonl
+.claude/quota-blocked.json
+session-recover.yaml
+# Claude Code session-recovery state
+
+# Local feature builds and private self-hosted credentials
+.local-build/
+.local-sync/
+local-release/
+output/
+.playwright-cli/
+
+# Private machine state and generated portable installations
+/.local-dev-data/
+/LegacyData/
+/BuildTools/bin/
+/BuildTools/cargo-home/
+/ChannelKits/
+/portable-dev/*
+!/portable-dev/*.ps1
+!/portable-dev/*.cmd
+!/portable-dev/*.vbs
+!/portable-dev/*.md
+**/.git/
+**/__pycache__/
+**/.pytest_cache/
+**/.build*/
+**/target/
+**/gen/schemas/
+**/node_modules/
+**/third_party/
+**/.docurandom/
+**/Data/
+**/Workspaces/
+**/profiles/
+**/*.py[cod]
+**/*.exe
+**/*.dll
+**/*.pyd
+**/*.log
+**/*.jsonl
+**/*.sqlite*
+**/*.db
+**/*.pem
+**/*.key
+**/*.zip
+**/*.7z
+**/*.tar.gz
+**/*.tar.xz
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+!src-tauri/test-assets/test.zip
+!src-tauri/test-assets/test.tar.gz
+!src-tauri/test-assets/test.tar.xz
+
+# Keep the exact configuration/lockfiles captured for this development snapshot.
+!/next-env.d.ts
+!/BuildTools/package-lock.json
+!/e2e/app/Cargo.lock

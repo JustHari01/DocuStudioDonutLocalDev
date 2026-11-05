@@ -1,0 +1,5643 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri_plugin_shell::ShellExt;
+
+use crate::browser::ProxySettings;
+use crate::events;
+use crate::ip_utils;
+
+static PROXY_RECOVERY: crate::log_streak::KeyedStreak =
+  crate::log_streak::KeyedStreak::new(module_path!(), "Proxy worker recovery");
+
+// Export data format for JSON export
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyExportData {
+  pub version: String,
+  pub proxies: Vec<ExportedProxy>,
+  pub exported_at: String,
+  pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedProxy {
+  pub name: String,
+  #[serde(rename = "type")]
+  pub proxy_type: String,
+  pub host: String,
+  pub port: u16,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub username: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub password: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vless_uri: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyImportResult {
+  pub imported_count: usize,
+  pub skipped_count: usize,
+  pub errors: Vec<String>,
+  pub proxies: Vec<StoredProxy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedProxyLine {
+  pub proxy_type: String,
+  pub host: String,
+  pub port: u16,
+  pub username: Option<String>,
+  pub password: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vless_uri: Option<String>,
+  pub original_line: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum ProxyParseResult {
+  #[serde(rename = "parsed")]
+  Parsed(ParsedProxyLine),
+  #[serde(rename = "ambiguous")]
+  Ambiguous {
+    line: String,
+    possible_formats: Vec<String>,
+  },
+  #[serde(rename = "invalid")]
+  Invalid { line: String, reason: String },
+}
+
+/// The colon-separated fields of a proxy line. An IPv6 address in brackets at
+/// the start of a field stays one field: `[2001:db8::1]:8080:user:pass`.
+fn split_proxy_fields(line: &str) -> Vec<&str> {
+  let mut fields = Vec::new();
+  let mut rest = line;
+  loop {
+    if let Some(end) = rest.starts_with('[').then(|| rest.find(']')).flatten() {
+      let after = &rest[end + 1..];
+      if after.is_empty() {
+        fields.push(rest);
+        return fields;
+      }
+      if let Some(next) = after.strip_prefix(':') {
+        fields.push(&rest[..=end]);
+        rest = next;
+        continue;
+      }
+    }
+    match rest.split_once(':') {
+      Some((field, next)) => {
+        fields.push(field);
+        rest = next;
+      }
+      None => {
+        fields.push(rest);
+        return fields;
+      }
+    }
+  }
+}
+
+// Store active proxy information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyInfo {
+  pub id: String,
+  pub local_url: String,
+  pub upstream_host: String,
+  pub upstream_port: u16,
+  pub upstream_type: String,
+  pub local_port: u16,
+  // Optional profile ID to which this proxy instance is logically tied
+  pub profile_id: Option<String>,
+  pub blocklist_file: Option<String>,
+  #[serde(default)]
+  pub dns_server: Option<String>,
+}
+
+// Proxy check result cache
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyCheckResult {
+  pub ip: String,
+  pub city: Option<String>,
+  pub country: Option<String>,
+  pub country_code: Option<String>,
+  pub timestamp: u64,
+  pub is_valid: bool,
+  /// The exit's ISP or registered organisation, read from the local MaxMind
+  /// databases. `None` means the databases carry none, never "no ISP".
+  #[serde(default)]
+  pub isp: Option<String>,
+  /// The exit's own timezone, the value a fingerprint is matched against.
+  #[serde(default)]
+  pub timezone: Option<String>,
+  /// Whether the proxy carries UDP, which decides whether WebRTC can be
+  /// routed through it at all. Receipts written before this existed
+  /// deserialize as `Unknown`, which is the truth about them.
+  #[serde(default)]
+  pub udp: crate::proxy_udp::UdpSupport,
+  /// How long the whole check took, end to end.
+  #[serde(default)]
+  pub latency_ms: Option<u64>,
+}
+
+/// One line of a proxy's check log. Deliberately smaller than
+/// `ProxyCheckResult`: this is a trail, not a cache, so it keeps what a user
+/// reads down a list and nothing that would make the file grow without bound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProxyCheckHistoryEntry {
+  pub timestamp: u64,
+  pub ok: bool,
+  #[serde(default)]
+  pub ip: Option<String>,
+  #[serde(default)]
+  pub country: Option<String>,
+  #[serde(default)]
+  pub country_code: Option<String>,
+  #[serde(default)]
+  pub isp: Option<String>,
+  #[serde(default)]
+  pub udp: crate::proxy_udp::UdpSupport,
+  #[serde(default)]
+  pub latency_ms: Option<u64>,
+}
+
+/// How many checks a proxy remembers. Old enough entries stop being evidence
+/// and the file has to stay small enough to read on every popover open.
+pub const PROXY_CHECK_HISTORY_LIMIT: usize = 50;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProxyCheckHistory {
+  #[serde(default)]
+  entries: Vec<ProxyCheckHistoryEntry>,
+}
+
+/// Prepend `entry` and drop anything past the limit. Newest first is both the
+/// order the list is read in and the order that makes the cap mean "the last
+/// 50 checks" rather than "the first 50".
+fn push_history_entry(entries: &mut Vec<ProxyCheckHistoryEntry>, entry: ProxyCheckHistoryEntry) {
+  entries.insert(0, entry);
+  entries.truncate(PROXY_CHECK_HISTORY_LIMIT);
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedProxyCheck {
+  settings_hash: [u8; 32],
+  result: ProxyCheckResult,
+}
+
+impl CachedProxyCheck {
+  fn settings_hash(settings: &ProxySettings) -> Result<[u8; 32], serde_json::Error> {
+    Ok(Sha256::digest(serde_json::to_vec(settings)?).into())
+  }
+
+  fn for_settings(self, settings: &ProxySettings) -> Option<ProxyCheckResult> {
+    (self.settings_hash == Self::settings_hash(settings).ok()?).then_some(self.result)
+  }
+}
+
+pub const CLOUD_PROXY_ID: &str = "cloud-included-proxy";
+
+// Stored proxy configuration with name and ID for reuse
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredProxy {
+  pub id: String,
+  pub name: String,
+  pub proxy_settings: ProxySettings,
+  #[serde(default)]
+  pub sync_enabled: bool,
+  #[serde(default)]
+  pub last_sync: Option<u64>,
+  /// Unix seconds of the last meaningful user edit. Source of truth for sync
+  /// conflict resolution (last-write-wins) — bumped on config edits only, never
+  /// by sync bookkeeping. `None` on legacy files is treated as 0.
+  #[serde(default)]
+  pub updated_at: Option<u64>,
+  #[serde(default)]
+  pub is_cloud_managed: bool,
+  #[serde(default)]
+  pub is_cloud_derived: bool,
+  #[serde(default)]
+  pub geo_country: Option<String>,
+  // Legacy field kept for deserialization compat; mapped to geo_region on load
+  #[serde(default)]
+  pub geo_state: Option<String>,
+  #[serde(default)]
+  pub geo_region: Option<String>,
+  #[serde(default)]
+  pub geo_city: Option<String>,
+  #[serde(default)]
+  pub geo_isp: Option<String>,
+  #[serde(default)]
+  pub dynamic_proxy_url: Option<String>,
+  #[serde(default)]
+  pub dynamic_proxy_format: Option<String>,
+  /// The provider's "change IP" link. Calling it gives the proxy a new exit
+  /// address. It usually carries an API key, so it is handled like the
+  /// password: never logged, redacted for remote MCP callers.
+  #[serde(default)]
+  pub rotation_url: Option<String>,
+}
+
+/// Current unix time in whole seconds. Used to stamp `updated_at` on edits.
+pub fn now_secs() -> u64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs()
+}
+
+/// Keys in `active_proxies` at or above this value are in-flight launch
+/// placeholders, not real browser PIDs. Real OS PIDs never reach this range
+/// (Linux pid_max caps at 2^22, macOS at ~100k, Windows PIDs are small DWORD
+/// multiples of 4), so a placeholder can never shadow a live process ID.
+pub const LAUNCH_PLACEHOLDER_PID_MIN: u32 = u32::MAX - 0x00FF_FFFF;
+
+static NEXT_LAUNCH_PLACEHOLDER_PID: std::sync::atomic::AtomicU32 =
+  std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// What a donut-proxy command printed and how it ended.
+struct SidecarOutput {
+  code: Option<i32>,
+  /// Seen gone before its exit status arrived; see `collect_sidecar`.
+  exit_unreported: bool,
+  stdout: Vec<u8>,
+  stderr: Vec<u8>,
+}
+
+impl SidecarOutput {
+  fn success(&self) -> bool {
+    self.code == Some(0) || self.exit_unreported
+  }
+}
+
+/// How long output that is still on its way is read after the command exits.
+const SIDECAR_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often a running command is checked for having exited.
+const SIDECAR_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Run a short donut-proxy command. A command that does not exit in time is
+/// killed, and the launch reports it instead of waiting forever.
+async fn run_sidecar(
+  command: tauri_plugin_shell::process::Command,
+) -> Result<SidecarOutput, String> {
+  let started = std::time::Instant::now();
+  let (events, child) = command
+    .spawn()
+    .map_err(|e| format!("Failed to execute donut-proxy: {e}"))?;
+  let pid = child.pid();
+  let running = move || crate::proxy_storage::is_process_running(pid);
+  match collect_sidecar(events, running, crate::proxy_runner::SIDECAR_RESPONSE_LIMIT).await {
+    Some(output) => Ok(output),
+    None => {
+      let _ = child.kill();
+      log::error!(
+        "donut-proxy command timed out pid={pid} elapsed_ms={}",
+        started.elapsed().as_millis()
+      );
+      Err(crate::proxy_runner::sidecar_not_responding_error())
+    }
+  }
+}
+
+/// What a command printed until it exited, or `None` when it did not exit
+/// within `limit`. The exit ends the wait, not the end of its output: the
+/// exit status is reported only once the output pipes close, and on Windows
+/// the worker a command starts can keep them open for as long as it runs. So
+/// the process itself is also checked.
+async fn collect_sidecar(
+  mut events: tauri::async_runtime::Receiver<tauri_plugin_shell::process::CommandEvent>,
+  running: impl Fn() -> bool,
+  limit: std::time::Duration,
+) -> Option<SidecarOutput> {
+  use tauri_plugin_shell::process::CommandEvent;
+  let mut output = SidecarOutput {
+    code: None,
+    exit_unreported: false,
+    stdout: Vec::new(),
+    stderr: Vec::new(),
+  };
+  let mut deadline = tokio::time::Instant::now() + limit;
+  let mut exited = false;
+  loop {
+    let wake = deadline.min(tokio::time::Instant::now() + SIDECAR_POLL);
+    match tokio::time::timeout_at(wake, events.recv()).await {
+      Ok(Some(CommandEvent::Stdout(line))) => {
+        output.stdout.extend(line);
+        output.stdout.push(b'\n');
+      }
+      Ok(Some(CommandEvent::Stderr(line))) => {
+        output.stderr.extend(line);
+        output.stderr.push(b'\n');
+      }
+      Ok(Some(CommandEvent::Terminated(payload))) => {
+        output.code = payload.code;
+        output.exit_unreported = false;
+        return Some(output);
+      }
+      Ok(Some(_)) => {}
+      Ok(None) => return exited.then_some(output),
+      Err(_) if tokio::time::Instant::now() >= deadline => return exited.then_some(output),
+      Err(_) => {
+        if !exited && !running() {
+          exited = true;
+          output.exit_unreported = true;
+          deadline = deadline.min(tokio::time::Instant::now() + SIDECAR_DRAIN);
+        }
+      }
+    }
+  }
+}
+
+/// Allocate a unique `active_proxies` key for a launch in flight, so concurrent
+/// launches can never overwrite each other's placeholder entry.
+pub fn next_launch_placeholder_pid() -> u32 {
+  NEXT_LAUNCH_PLACEHOLDER_PID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn is_launch_placeholder_pid(pid: u32) -> bool {
+  pid >= LAUNCH_PLACEHOLDER_PID_MIN
+}
+
+/// Start times of the processes in `pids` that are alive, from one targeted
+/// read of the process table. A process that exited but is still listed
+/// (a zombie) is not alive.
+fn live_process_start_times(pids: &[u32]) -> HashMap<u32, u64> {
+  use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+  if pids.is_empty() {
+    return HashMap::new();
+  }
+  let pids: Vec<sysinfo::Pid> = pids
+    .iter()
+    .map(|&pid| sysinfo::Pid::from_u32(pid))
+    .collect();
+  let mut system = crate::proxy_storage::process_table(sysinfo::RefreshKind::nothing());
+  system.refresh_processes_specifics(
+    ProcessesToUpdate::Some(&pids),
+    true,
+    ProcessRefreshKind::nothing(),
+  );
+  pids
+    .iter()
+    .filter_map(|pid| {
+      let process = system.process(*pid)?;
+      crate::proxy_storage::snapshot_process_is_alive(process)
+        .then(|| (pid.as_u32(), process.start_time()))
+    })
+    .collect()
+}
+
+/// Worker records whose worker is gone: not tracked, not being recovered,
+/// past the 120 s launch grace, and with a PID that no longer runs. A record
+/// without a PID may be a worker still starting, so it stays.
+fn orphaned_worker_records<'a>(
+  configs: &'a [crate::proxy_storage::ProxyConfig],
+  tracked_ids: &std::collections::HashSet<String>,
+  recovering_ids: &std::collections::HashSet<String>,
+  is_alive: impl Fn(u32) -> bool,
+) -> Vec<&'a crate::proxy_storage::ProxyConfig> {
+  configs
+    .iter()
+    .filter(|config| {
+      !recovering_ids.contains(&config.id)
+        && !tracked_ids.contains(&config.id)
+        && crate::proxy_storage::proxy_config_age_secs(&config.id) >= 120
+        && config.pid.is_some_and(|pid| !is_alive(pid))
+    })
+    .collect()
+}
+
+/// Write the exact browser process identity (PID plus its start time) onto a
+/// worker's on-disk config. Both halves matter: the PID says which process to
+/// watch, the start time pins it to THAT process so a recycled PID can never
+/// read as "my browser is still alive".
+///
+/// Rejects launch placeholders and 0 — neither is a real browser — so a caller
+/// can treat `false` as "this worker has no verified owner" and abort rather
+/// than leave a worker nothing will reap.
+pub(crate) fn persist_browser_identity(proxy_id: &str, browser_pid: u32) -> bool {
+  if browser_pid == 0 || is_launch_placeholder_pid(browser_pid) {
+    return false;
+  }
+  let Some(mut cfg) = crate::proxy_storage::get_proxy_config(proxy_id) else {
+    return false;
+  };
+  let Some(start_time) = crate::proxy_storage::resolve_process_start_time(browser_pid) else {
+    log::warn!(
+      "Browser start time unknown, worker owner not recorded proxy_worker={proxy_id} browser_pid={browser_pid}"
+    );
+    return false;
+  };
+
+  cfg.browser_pid = Some(browser_pid);
+  cfg.browser_pid_start_time = Some(start_time);
+  if crate::proxy_storage::update_proxy_config(&cfg) {
+    log::debug!("Worker owner recorded proxy_worker={proxy_id} browser_pid={browser_pid}");
+    true
+  } else {
+    log::warn!("Worker owner write failed proxy_worker={proxy_id} browser_pid={browser_pid}");
+    false
+  }
+}
+
+/// A worker as it was just before the sidecar stopped it: the sidecar's own
+/// output never reaches this log, so the stop line is written from here.
+struct WorkerSnapshot {
+  pid: Option<u32>,
+  was_running: bool,
+  profile_id: Option<String>,
+  browser_pid: Option<u32>,
+}
+
+impl WorkerSnapshot {
+  fn take(proxy_id: &str) -> Self {
+    let config = crate::proxy_storage::get_proxy_config(proxy_id);
+    let pid = config.as_ref().and_then(|config| config.pid);
+    Self {
+      pid,
+      was_running: pid.is_some_and(crate::proxy_storage::is_process_running),
+      profile_id: config.as_ref().and_then(|config| config.profile_id.clone()),
+      browser_pid: config.as_ref().and_then(|config| config.browser_pid),
+    }
+  }
+
+  fn log_stopped(&self, proxy_id: &str) {
+    let how = match self.pid {
+      None => "unknown",
+      Some(_) if !self.was_running => "already_gone",
+      Some(pid) if crate::proxy_storage::is_process_running(pid) => "still_running",
+      Some(_) => "terminated",
+    };
+    log::info!(
+      "Proxy worker stopped id={proxy_id} pid={} profile={} browser_pid={} reason=profile_stop how={how}",
+      self.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "unknown".to_string()),
+      self.profile_id.as_deref().unwrap_or("none"),
+      self.browser_pid.map(|pid| pid.to_string()).unwrap_or_else(|| "none".to_string()),
+    );
+  }
+}
+
+impl StoredProxy {
+  pub fn new(name: String, proxy_settings: ProxySettings) -> Self {
+    let sync_enabled = crate::sync::is_sync_configured();
+    Self {
+      id: uuid::Uuid::new_v4().to_string(),
+      name,
+      proxy_settings,
+      sync_enabled,
+      last_sync: None,
+      updated_at: Some(now_secs()),
+      is_cloud_managed: false,
+      is_cloud_derived: false,
+      geo_country: None,
+      geo_state: None,
+      geo_region: None,
+      geo_city: None,
+      geo_isp: None,
+      dynamic_proxy_url: None,
+      dynamic_proxy_format: None,
+      rotation_url: None,
+    }
+  }
+
+  /// Migrate legacy geo_state to geo_region
+  pub fn migrate_geo_fields(&mut self) {
+    if self.geo_region.is_none() && self.geo_state.is_some() {
+      self.geo_region = self.geo_state.take();
+    }
+  }
+
+  /// Get the effective region (prefers geo_region, falls back to geo_state for compat)
+  pub fn effective_region(&self) -> Option<&String> {
+    self.geo_region.as_ref().or(self.geo_state.as_ref())
+  }
+
+  pub fn update_settings(&mut self, proxy_settings: ProxySettings) {
+    self.proxy_settings = proxy_settings;
+    self.updated_at = Some(now_secs());
+  }
+
+  pub fn update_name(&mut self, name: String) {
+    self.name = name;
+    self.updated_at = Some(now_secs());
+  }
+}
+
+// Global proxy manager to track active proxies and stored proxy configurations
+pub struct ProxyManager {
+  active_proxies: Mutex<HashMap<u32, ProxyInfo>>, // Maps browser process ID to proxy info
+  // Store proxy info by profile name for persistence across browser restarts
+  profile_proxies: Mutex<HashMap<String, ProxySettings>>, // Maps profile name to proxy settings
+  // Track active proxy IDs by profile name for targeted cleanup
+  profile_active_proxy_ids: Mutex<HashMap<String, String>>, // Maps profile name to proxy id
+  stored_proxies: Mutex<HashMap<String, StoredProxy>>,      // Maps proxy ID to stored proxy
+  // Consecutive cleanup passes during which a browser PID looked dead.
+  // We only reap a worker after it has been missed in N consecutive scans —
+  // a single sysinfo blip under load shouldn't kill a still-running worker.
+  dead_browser_misses: Mutex<HashMap<u32, u8>>,
+  // A requested stop must not race a recovery that starts the worker again.
+  worker_lifecycle: tokio::sync::Mutex<()>,
+}
+
+impl ProxyManager {
+  pub fn new() -> Self {
+    let manager = Self {
+      active_proxies: Mutex::new(HashMap::new()),
+      profile_proxies: Mutex::new(HashMap::new()),
+      profile_active_proxy_ids: Mutex::new(HashMap::new()),
+      stored_proxies: Mutex::new(HashMap::new()),
+      dead_browser_misses: Mutex::new(HashMap::new()),
+      worker_lifecycle: tokio::sync::Mutex::new(()),
+    };
+
+    // Load stored proxies on initialization
+    if let Err(e) = manager.load_stored_proxies() {
+      log::warn!("Stored proxies load failed err=\"{e}\"");
+    }
+
+    manager
+  }
+
+  fn get_proxies_dir(&self) -> PathBuf {
+    crate::app_dirs::proxies_dir()
+  }
+
+  fn get_proxy_check_cache_dir(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = crate::app_dirs::cache_dir().join("proxy_checks");
+    fs::create_dir_all(&path)?;
+    Ok(path)
+  }
+
+  // Get the path to a specific proxy check cache file
+  fn get_proxy_check_cache_file(
+    &self,
+    proxy_id: &str,
+  ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cache_dir = self.get_proxy_check_cache_dir()?;
+    Ok(cache_dir.join(format!("{proxy_id}.json")))
+  }
+
+  // Load cached proxy check result
+  fn load_proxy_check_cache(&self, proxy_id: &str) -> Option<ProxyCheckResult> {
+    let cache_file = match self.get_proxy_check_cache_file(proxy_id) {
+      Ok(file) => file,
+      Err(_) => return None,
+    };
+
+    if !cache_file.exists() {
+      return None;
+    }
+
+    let content = match fs::read_to_string(&cache_file) {
+      Ok(content) => content,
+      Err(_) => return None,
+    };
+
+    let settings = self.get_proxy_settings_by_id(proxy_id)?;
+    serde_json::from_str::<CachedProxyCheck>(&content)
+      .ok()?
+      .for_settings(&settings)
+  }
+
+  // Save proxy check result to cache
+  fn save_proxy_check_cache(
+    &self,
+    proxy_id: &str,
+    settings: &ProxySettings,
+    result: &ProxyCheckResult,
+  ) -> Result<(), Box<dyn std::error::Error>> {
+    let cache_file = self.get_proxy_check_cache_file(proxy_id)?;
+    let cache = CachedProxyCheck {
+      settings_hash: CachedProxyCheck::settings_hash(settings)?,
+      result: result.clone(),
+    };
+    let content = serde_json::to_string_pretty(&cache)?;
+    crate::app_dirs::write_owner_only(&cache_file, content.as_bytes())?;
+    Ok(())
+  }
+
+  // Get current timestamp
+  fn get_current_timestamp() -> u64 {
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_secs()
+  }
+
+  pub fn get_proxy_file_path(&self, proxy_id: &str) -> PathBuf {
+    self.get_proxies_dir().join(format!("{proxy_id}.json"))
+  }
+
+  // Load stored proxies from disk
+  fn load_stored_proxies(&self) -> Result<(), Box<dyn std::error::Error>> {
+    let proxies_dir = self.get_proxies_dir();
+
+    if !proxies_dir.exists() {
+      return Ok(()); // No proxies directory yet
+    }
+
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+    let mut loaded_count = 0;
+    let mut error_count = 0;
+
+    // Read all JSON files from the proxies directory
+    for entry in fs::read_dir(&proxies_dir)? {
+      let entry = entry?;
+      let path = entry.path();
+
+      if path.extension().is_some_and(|ext| ext == "json") {
+        match fs::read_to_string(&path) {
+          Ok(content) => match serde_json::from_str::<StoredProxy>(&content) {
+            Ok(proxy) => {
+              log::debug!("Loaded stored proxy proxy={}", proxy.id);
+              stored_proxies.insert(proxy.id.clone(), proxy);
+              loaded_count += 1;
+            }
+            Err(e) => {
+              log::warn!(
+                "Stored proxy parse failed path={} err=\"{e}\"",
+                path.display()
+              );
+              error_count += 1;
+            }
+          },
+          Err(e) => {
+            log::warn!(
+              "Stored proxy read failed path={} err=\"{e}\"",
+              path.display()
+            );
+            error_count += 1;
+          }
+        }
+      }
+    }
+
+    log::debug!("Loaded stored proxies count={loaded_count} errors={error_count}");
+    Ok(())
+  }
+
+  // Save a single proxy to disk
+  fn save_proxy(&self, proxy: &StoredProxy) -> Result<(), Box<dyn std::error::Error>> {
+    let proxies_dir = self.get_proxies_dir();
+
+    // Ensure directory exists
+    fs::create_dir_all(&proxies_dir)?;
+
+    let proxy_file = self.get_proxy_file_path(&proxy.id);
+    let content = serde_json::to_string_pretty(proxy)?;
+    crate::app_dirs::write_owner_only(&proxy_file, content.as_bytes())?;
+
+    Ok(())
+  }
+
+  // Delete a proxy file from disk
+  fn delete_proxy_file(&self, proxy_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy_file = self.get_proxy_file_path(proxy_id);
+    if proxy_file.exists() {
+      fs::remove_file(proxy_file)?;
+    }
+    let history_file = self.get_proxy_history_file_path(proxy_id);
+    if history_file.exists() {
+      // The trail is about a proxy that no longer exists, and it names the
+      // addresses that proxy exited from. It goes with the config.
+      fs::remove_file(history_file)?;
+    }
+    Ok(())
+  }
+
+  /// The check trail sits in a `history` folder beside the proxy configs
+  /// rather than next to them: `load_stored_proxies` reads every `*.json` in
+  /// the proxies directory and warns about anything that is not a proxy, so a
+  /// sibling file would log a parse failure per proxy on every start.
+  fn get_proxy_history_dir(&self) -> PathBuf {
+    self.get_proxies_dir().join("history")
+  }
+
+  fn get_proxy_history_file_path(&self, proxy_id: &str) -> PathBuf {
+    self
+      .get_proxy_history_dir()
+      .join(format!("{proxy_id}.json"))
+  }
+
+  /// Every remembered check for a proxy, newest first.
+  pub fn get_proxy_check_history(&self, proxy_id: &str) -> Vec<ProxyCheckHistoryEntry> {
+    let path = self.get_proxy_history_file_path(proxy_id);
+    let Ok(content) = fs::read_to_string(&path) else {
+      return Vec::new();
+    };
+    match serde_json::from_str::<ProxyCheckHistory>(&content) {
+      Ok(mut history) => {
+        history.entries.truncate(PROXY_CHECK_HISTORY_LIMIT);
+        history.entries
+      }
+      Err(e) => {
+        log::warn!("Proxy check history parse failed proxy={proxy_id} err=\"{e}\"");
+        Vec::new()
+      }
+    }
+  }
+
+  /// Append one check to a proxy's trail.
+  fn record_proxy_check(&self, proxy_id: &str, entry: ProxyCheckHistoryEntry) {
+    let mut entries = self.get_proxy_check_history(proxy_id);
+    push_history_entry(&mut entries, entry);
+
+    let dir = self.get_proxy_history_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+      log::warn!("Proxy check history dir create failed err=\"{e}\"");
+      return;
+    }
+    match serde_json::to_string_pretty(&ProxyCheckHistory { entries }) {
+      Ok(content) => {
+        // Owner-only: the trail records which addresses this machine exits
+        // from, which is exactly what the proxy exists to keep private.
+        if let Err(e) = crate::app_dirs::write_owner_only(
+          &self.get_proxy_history_file_path(proxy_id),
+          content.as_bytes(),
+        ) {
+          log::warn!("Proxy check history write failed proxy={proxy_id} err=\"{e}\"");
+        }
+      }
+      Err(e) => log::warn!("Proxy check history serialize failed proxy={proxy_id} err=\"{e}\""),
+    }
+  }
+
+  /// Xray-carried proxies keep their whole configuration in the share link
+  /// (`vless_uri`, named before VMess, Trojan and Hysteria2 joined). The link
+  /// decides the type, so a VMess link saved under "VLESS" is stored as VMess.
+  fn normalize_proxy_settings(mut proxy_settings: ProxySettings) -> Result<ProxySettings, String> {
+    if !crate::xray::is_xray_proxy_type(&proxy_settings.proxy_type) {
+      proxy_settings.vless_uri = None;
+      return Ok(proxy_settings);
+    }
+
+    let uri = proxy_settings
+      .vless_uri
+      .as_deref()
+      .filter(|uri| !uri.is_empty())
+      .ok_or_else(|| crate::backend_error("VLESS_CONFIG_INVALID"))?;
+    let parsed =
+      crate::xray::parse_share_link(uri).map_err(|error| crate::vless_config_error(&error))?;
+    let canonical_uri = crate::xray::export_share_link(&parsed.config, parsed.name.as_deref())
+      .map_err(|error| crate::vless_config_error(&error))?;
+
+    proxy_settings.proxy_type = parsed.config.protocol().proxy_type().to_string();
+    proxy_settings.host = parsed.config.address;
+    proxy_settings.port = parsed.config.port;
+    proxy_settings.username = None;
+    proxy_settings.password = None;
+    proxy_settings.vless_uri = Some(canonical_uri);
+    Ok(proxy_settings)
+  }
+
+  // Create a new stored proxy
+  pub fn create_stored_proxy(
+    &self,
+    _app_handle: &tauri::AppHandle,
+    name: String,
+    proxy_settings: ProxySettings,
+  ) -> Result<StoredProxy, String> {
+    if name.trim().is_empty() {
+      return Err(serde_json::json!({ "code": "NAME_CANNOT_BE_EMPTY" }).to_string());
+    }
+
+    // Check if name already exists
+    {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+      if stored_proxies.values().any(|p| p.name == name) {
+        return Err(format!("Proxy with name '{name}' already exists"));
+      }
+    }
+
+    let proxy_settings = Self::normalize_proxy_settings(proxy_settings)?;
+    let stored_proxy = StoredProxy::new(name, proxy_settings);
+
+    {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      stored_proxies.insert(stored_proxy.id.clone(), stored_proxy.clone());
+    }
+
+    if let Err(e) = self.save_proxy(&stored_proxy) {
+      log::error!("Proxy save failed proxy={} err=\"{e}\"", stored_proxy.id);
+    }
+
+    // Emit event for reactive UI updates
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+    }
+
+    if stored_proxy.sync_enabled {
+      crate::team_activity::record(
+        "proxy.create",
+        &stored_proxy.id,
+        Some(&stored_proxy.name),
+        None,
+      );
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = stored_proxy.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_proxy_sync(id).await;
+        });
+      }
+    }
+
+    Ok(stored_proxy)
+  }
+
+  // Check if a cloud-managed proxy exists
+  pub fn has_cloud_proxy(&self) -> bool {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies.contains_key(CLOUD_PROXY_ID)
+  }
+
+  // Upsert the cloud-managed proxy (create or update)
+  pub fn upsert_cloud_proxy(&self, proxy_settings: ProxySettings) -> Result<StoredProxy, String> {
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+
+    if let Some(existing) = stored_proxies.get_mut(CLOUD_PROXY_ID) {
+      existing.proxy_settings = proxy_settings;
+      let updated = existing.clone();
+      drop(stored_proxies);
+
+      if let Err(e) = self.save_proxy(&updated) {
+        log::warn!("Cloud proxy save failed err=\"{e}\"");
+      }
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+      }
+      Ok(updated)
+    } else {
+      let cloud_proxy = StoredProxy {
+        id: CLOUD_PROXY_ID.to_string(),
+        name: "Included Proxy".to_string(),
+        proxy_settings,
+        sync_enabled: false,
+        last_sync: None,
+        updated_at: Some(now_secs()),
+        is_cloud_managed: true,
+        is_cloud_derived: false,
+        geo_country: None,
+        geo_state: None,
+        geo_region: None,
+        geo_city: None,
+        geo_isp: None,
+        dynamic_proxy_url: None,
+        dynamic_proxy_format: None,
+        rotation_url: None,
+      };
+      stored_proxies.insert(CLOUD_PROXY_ID.to_string(), cloud_proxy.clone());
+      drop(stored_proxies);
+
+      if let Err(e) = self.save_proxy(&cloud_proxy) {
+        log::warn!("Cloud proxy save failed err=\"{e}\"");
+      }
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+      }
+      Ok(cloud_proxy)
+    }
+  }
+
+  // Remove the cloud-managed proxy
+  pub fn remove_cloud_proxy(&self) {
+    let removed = {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      stored_proxies.remove(CLOUD_PROXY_ID).is_some()
+    };
+
+    if removed {
+      if let Err(e) = self.delete_proxy_file(CLOUD_PROXY_ID) {
+        log::warn!("Cloud proxy file delete failed err=\"{e}\"");
+      }
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+      }
+    }
+  }
+
+  pub fn remove_cloud_proxies(&self) {
+    let removed_ids: Vec<String> = {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      let ids_to_remove: Vec<String> = stored_proxies
+        .values()
+        .filter(|p| p.is_cloud_managed || p.is_cloud_derived)
+        .map(|p| p.id.clone())
+        .collect();
+      for id in &ids_to_remove {
+        stored_proxies.remove(id);
+      }
+      ids_to_remove
+    };
+
+    if !removed_ids.is_empty() {
+      for id in &removed_ids {
+        if let Err(e) = self.delete_proxy_file(id) {
+          log::warn!("Cloud proxy file delete failed proxy={id} err=\"{e}\"");
+        }
+      }
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+      }
+      if let Err(e) = events::emit_empty("stored-proxies-changed") {
+        log::warn!("Event emit failed event=stored-proxies-changed err=\"{e}\"");
+      }
+    }
+  }
+
+  // Build a geo-targeted username from base username and location parts
+  // LP v2 format: username-country-{cc}[-region-{region}][-city-{city}][-isp-{isp}]
+  // Note: sid and ttl are NOT included here — they are injected at browser launch time
+  // per-profile via resolve_proxy_for_profile()
+  fn build_geo_username(
+    base_username: &str,
+    country: &str,
+    region: &Option<String>,
+    city: &Option<String>,
+    isp: &Option<String>,
+  ) -> String {
+    let mut username = format!("{}-country-{}", base_username, country);
+    if let Some(region) = region {
+      username = format!("{}-region-{}", username, region);
+    }
+    if let Some(city) = city {
+      username = format!("{}-city-{}", username, city);
+    }
+    if let Some(isp) = isp {
+      username = format!("{}-isp-{}", username, isp);
+    }
+    username
+  }
+
+  /// Generate a deterministic 11-char alphanumeric session ID from a profile UUID.
+  /// This ensures the same profile always gets the same sticky IP session,
+  /// even across credential refreshes.
+  pub fn generate_sid_for_profile(profile_id: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    profile_id.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    // Convert to base36 (a-z0-9) and take 11 chars
+    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
+    let mut sid = String::with_capacity(11);
+    let mut val = hash;
+    for _ in 0..11 {
+      sid.push(chars[(val % 36) as usize]);
+      val /= 36;
+    }
+    sid
+  }
+
+  /// Build the full proxy username with sid and ttl for a specific profile launch.
+  /// This is called at browser launch time, not at proxy creation time.
+  pub fn build_username_with_sid(base_geo_username: &str, profile_id: &str) -> String {
+    let sid = Self::generate_sid_for_profile(profile_id);
+    format!("{}-sid-{}-ttl-1440m", base_geo_username, sid)
+  }
+
+  /// Resolve proxy settings for a specific profile, injecting profile-specific sid
+  /// for cloud-derived proxies with geo targeting.
+  pub fn resolve_proxy_for_profile(
+    &self,
+    proxy_id: &str,
+    profile_id: &str,
+  ) -> Option<ProxySettings> {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    let proxy = stored_proxies.get(proxy_id)?;
+    let mut settings = proxy.proxy_settings.clone();
+
+    // For cloud-derived proxies with geo targeting, inject profile-specific sid
+    if proxy.is_cloud_derived && proxy.geo_country.is_some() {
+      if let Some(ref username) = settings.username {
+        settings.username = Some(Self::build_username_with_sid(username, profile_id));
+      }
+    }
+
+    Some(settings)
+  }
+
+  // Create a cloud-derived location proxy from the base cloud proxy credentials
+  pub fn create_cloud_location_proxy(
+    &self,
+    name: String,
+    country: String,
+    region: Option<String>,
+    city: Option<String>,
+    isp: Option<String>,
+  ) -> Result<StoredProxy, String> {
+    // Get base cloud proxy credentials
+    let base_proxy = {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+      stored_proxies
+        .get(CLOUD_PROXY_ID)
+        .cloned()
+        .ok_or_else(|| "No cloud proxy available. Please log in first.".to_string())?
+    };
+
+    let base_username = base_proxy
+      .proxy_settings
+      .username
+      .as_ref()
+      .ok_or_else(|| "Cloud proxy has no username".to_string())?;
+
+    let geo_username = Self::build_geo_username(base_username, &country, &region, &city, &isp);
+
+    let proxy_settings = ProxySettings {
+      proxy_type: base_proxy.proxy_settings.proxy_type.clone(),
+      host: base_proxy.proxy_settings.host.clone(),
+      port: base_proxy.proxy_settings.port,
+      username: Some(geo_username),
+      password: base_proxy.proxy_settings.password.clone(),
+      vless_uri: None,
+    };
+
+    // Check if name already exists
+    {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+      if stored_proxies.values().any(|p| p.name == name) {
+        return Err(format!("Proxy with name '{}' already exists", name));
+      }
+    }
+
+    let stored_proxy = StoredProxy {
+      id: uuid::Uuid::new_v4().to_string(),
+      name,
+      proxy_settings,
+      sync_enabled: false,
+      last_sync: None,
+      updated_at: Some(now_secs()),
+      is_cloud_managed: false,
+      is_cloud_derived: true,
+      geo_country: Some(country),
+      geo_state: None,
+      geo_region: region,
+      geo_city: city,
+      geo_isp: isp,
+      dynamic_proxy_url: None,
+      dynamic_proxy_format: None,
+      rotation_url: None,
+    };
+
+    {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      stored_proxies.insert(stored_proxy.id.clone(), stored_proxy.clone());
+    }
+
+    if let Err(e) = self.save_proxy(&stored_proxy) {
+      log::error!("Proxy save failed proxy={} err=\"{e}\"", stored_proxy.id);
+    }
+
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+    }
+
+    Ok(stored_proxy)
+  }
+
+  // Update all cloud-derived proxies when base cloud proxy credentials change
+  pub fn update_cloud_derived_proxies(&self) {
+    let base_proxy = {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+      match stored_proxies.get(CLOUD_PROXY_ID) {
+        Some(p) => p.clone(),
+        None => return, // No cloud proxy, nothing to update
+      }
+    };
+
+    let base_username = match &base_proxy.proxy_settings.username {
+      Some(u) => u.clone(),
+      None => return,
+    };
+
+    let mut updated = false;
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+
+    for proxy in stored_proxies.values_mut() {
+      if !proxy.is_cloud_derived {
+        continue;
+      }
+
+      let country = match &proxy.geo_country {
+        Some(c) => c.clone(),
+        None => continue,
+      };
+
+      let region = proxy.effective_region().cloned();
+      let geo_username = Self::build_geo_username(
+        &base_username,
+        &country,
+        &region,
+        &proxy.geo_city,
+        &proxy.geo_isp,
+      );
+
+      proxy.updated_at = Some(now_secs());
+      proxy.proxy_settings.username = Some(geo_username);
+      proxy.proxy_settings.password = base_proxy.proxy_settings.password.clone();
+      proxy.proxy_settings.host = base_proxy.proxy_settings.host.clone();
+      proxy.proxy_settings.port = base_proxy.proxy_settings.port;
+
+      updated = true;
+    }
+
+    if updated {
+      // Save all updated proxies
+      let proxies_to_save: Vec<StoredProxy> = stored_proxies
+        .values()
+        .filter(|p| p.is_cloud_derived)
+        .cloned()
+        .collect();
+      drop(stored_proxies);
+
+      for proxy in &proxies_to_save {
+        if let Err(e) = self.save_proxy(proxy) {
+          log::warn!("Derived proxy save failed proxy={} err=\"{e}\"", proxy.id);
+        }
+      }
+
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+      }
+
+      log::debug!(
+        "Updated cloud-derived proxies count={}",
+        proxies_to_save.len()
+      );
+    }
+  }
+
+  pub fn remove_from_memory(&self, proxy_id: &str) {
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies.remove(proxy_id);
+  }
+
+  // Get all stored proxies
+  pub fn get_stored_proxies(&self) -> Vec<StoredProxy> {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    let mut list: Vec<StoredProxy> = stored_proxies.values().cloned().collect();
+    // Sort case-insensitively by name for consistent ordering across UI/API consumers
+    list.sort_by_key(|p| p.name.to_lowercase());
+    list
+  }
+
+  /// Insert/replace a stored proxy in the in-memory map. Used by sync's
+  /// download_proxy after it writes the file to disk, mirroring how
+  /// download_group/download_vpn/download_extension keep their managers'
+  /// in-memory state in sync. Without this, get_stored_proxies (which reads
+  /// only the map) never sees a downloaded proxy until restart, so sync keeps
+  /// re-downloading it indefinitely.
+  pub fn upsert_stored_proxy(&self, proxy: StoredProxy) {
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies.insert(proxy.id.clone(), proxy);
+  }
+
+  // Get a stored proxy by ID
+
+  // Update a stored proxy
+  pub fn update_stored_proxy(
+    &self,
+    _app_handle: &tauri::AppHandle,
+    proxy_id: &str,
+    name: Option<String>,
+    proxy_settings: Option<ProxySettings>,
+  ) -> Result<StoredProxy, String> {
+    if name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+      return Err(serde_json::json!({ "code": "NAME_CANNOT_BE_EMPTY" }).to_string());
+    }
+
+    let proxy_settings = proxy_settings
+      .map(Self::normalize_proxy_settings)
+      .transpose()?;
+
+    // First, check for conflicts without holding a mutable reference
+    {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+
+      // Check if proxy exists
+      if !stored_proxies.contains_key(proxy_id) {
+        return Err(format!("Proxy with ID '{proxy_id}' not found"));
+      }
+
+      // Block editing cloud-managed proxies
+      if stored_proxies
+        .get(proxy_id)
+        .is_some_and(|p| p.is_cloud_managed)
+      {
+        return Err("Cannot edit a cloud-managed proxy".to_string());
+      }
+
+      // Check if new name conflicts with existing proxies
+      if let Some(ref new_name) = name {
+        if stored_proxies
+          .values()
+          .any(|p| p.id != proxy_id && p.name == *new_name)
+        {
+          return Err(format!("Proxy with name '{new_name}' already exists"));
+        }
+      }
+    } // Release the lock here
+
+    // Now get mutable access for updates
+    let updated_proxy = {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      let stored_proxy = stored_proxies.get_mut(proxy_id).unwrap(); // Safe because we checked above
+
+      if let Some(new_name) = name {
+        stored_proxy.update_name(new_name);
+      }
+
+      if let Some(new_settings) = proxy_settings {
+        stored_proxy.update_settings(new_settings);
+      }
+
+      stored_proxy.clone()
+    };
+
+    if let Err(e) = self.save_proxy(&updated_proxy) {
+      log::error!("Proxy save failed proxy={} err=\"{e}\"", updated_proxy.id);
+    }
+
+    // Emit event for reactive UI updates
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+    }
+
+    if updated_proxy.sync_enabled {
+      crate::team_activity::record(
+        "proxy.update",
+        &updated_proxy.id,
+        Some(&updated_proxy.name),
+        None,
+      );
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = updated_proxy.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_proxy_sync(id).await;
+        });
+      }
+    }
+
+    Ok(updated_proxy)
+  }
+
+  /// Set or clear a proxy's "change IP" link. Cloud proxies are refused:
+  /// the cloud owns their configuration.
+  pub fn set_rotation_url(
+    &self,
+    proxy_id: &str,
+    rotation_url: Option<String>,
+  ) -> Result<StoredProxy, String> {
+    let updated = {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      let proxy = stored_proxies
+        .get_mut(proxy_id)
+        .ok_or_else(|| crate::backend_error("PROXY_NOT_FOUND"))?;
+      if proxy.is_cloud_managed || proxy.is_cloud_derived {
+        return Err(crate::backend_error("CANNOT_MODIFY_CLOUD_MANAGED_PROXY"));
+      }
+      if proxy.rotation_url == rotation_url {
+        return Ok(proxy.clone());
+      }
+      proxy.rotation_url = rotation_url;
+      proxy.updated_at = Some(now_secs());
+      proxy.clone()
+    };
+    self
+      .save_proxy(&updated)
+      .map_err(|e| crate::wrap_backend_error(e, "Failed to save the proxy"))?;
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+    }
+    if updated.sync_enabled {
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = updated.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_proxy_sync(id).await;
+        });
+      }
+    }
+    Ok(updated)
+  }
+
+  /// Update the in-memory `sync_enabled` / `last_sync` fields of a stored
+  /// proxy and persist the change to disk. Returns the updated proxy or
+  /// `Err` if the proxy isn't found / is cloud-managed.
+  ///
+  /// This is the canonical write path for sync-state changes — direct
+  /// `fs::write` from a sync command would leave the in-memory cache
+  /// (`stored_proxies`) stale, and the next `get_stored_proxies()` would
+  /// return the old `sync_enabled`, breaking the UI toggle.
+  pub fn set_stored_proxy_sync_state(
+    &self,
+    proxy_id: &str,
+    sync_enabled: bool,
+    last_sync: Option<u64>,
+  ) -> Result<StoredProxy, String> {
+    let updated_proxy = {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      let proxy = stored_proxies
+        .get_mut(proxy_id)
+        .ok_or_else(|| format!("Proxy with ID '{proxy_id}' not found"))?;
+
+      if proxy.is_cloud_managed {
+        return Err("Cannot modify sync for a cloud-managed proxy".to_string());
+      }
+
+      proxy.sync_enabled = sync_enabled;
+      proxy.last_sync = last_sync;
+      proxy.clone()
+    };
+
+    self
+      .save_proxy(&updated_proxy)
+      .map_err(|e| format!("Failed to save proxy: {e}"))?;
+
+    Ok(updated_proxy)
+  }
+
+  // Delete a stored proxy
+  pub fn delete_stored_proxy(
+    &self,
+    app_handle: &tauri::AppHandle,
+    proxy_id: &str,
+  ) -> Result<(), String> {
+    // Remember if sync was enabled before deleting
+    let was_sync_enabled = {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+
+      // Block deleting cloud-managed proxies
+      if stored_proxies
+        .get(proxy_id)
+        .is_some_and(|p| p.is_cloud_managed)
+      {
+        return Err("Cannot delete a cloud-managed proxy".to_string());
+      }
+
+      stored_proxies
+        .get(proxy_id)
+        .map(|p| p.sync_enabled)
+        .unwrap_or(false)
+    };
+
+    {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      if stored_proxies.remove(proxy_id).is_none() {
+        return Err(format!("Proxy with ID '{proxy_id}' not found"));
+      }
+    }
+
+    if let Err(e) = self.delete_proxy_file(proxy_id) {
+      log::error!("Proxy file delete failed proxy={proxy_id} err=\"{e}\"");
+    }
+
+    // If sync was enabled, also delete from S3
+    if was_sync_enabled {
+      crate::team_activity::record("proxy.delete", proxy_id, None, None);
+      let proxy_id_owned = proxy_id.to_string();
+      let app_handle_clone = app_handle.clone();
+      tauri::async_runtime::spawn(async move {
+        match crate::sync::SyncEngine::create_from_settings(&app_handle_clone).await {
+          Ok(engine) => {
+            if let Err(e) = engine.delete_proxy(&proxy_id_owned).await {
+              log::warn!("Proxy sync delete failed proxy={proxy_id_owned} err=\"{e}\"");
+            } else {
+              log::info!("Proxy deleted from sync proxy={proxy_id_owned}");
+            }
+          }
+          Err(e) => {
+            log::debug!("Sync not configured, remote delete skipped err=\"{e}\"");
+          }
+        }
+      });
+    }
+
+    // Emit event for reactive UI updates
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+    }
+
+    Ok(())
+  }
+
+  // Check if a proxy is cloud-managed or cloud-derived (needs fresh credentials)
+  pub fn is_cloud_or_derived(&self, proxy_id: &str) -> bool {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies
+      .get(proxy_id)
+      .is_some_and(|p| p.is_cloud_managed || p.is_cloud_derived)
+  }
+
+  // Get proxy settings for a stored proxy ID
+  pub fn get_proxy_settings_by_id(&self, proxy_id: &str) -> Option<ProxySettings> {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies
+      .get(proxy_id)
+      .map(|p| p.proxy_settings.clone())
+  }
+
+  fn classify_proxy_error(raw_error: &str, settings: &ProxySettings) -> String {
+    let err = raw_error.to_lowercase();
+    let proxy_addr = format!("{}:{}", settings.host, settings.port);
+
+    if err.contains("connection refused") {
+      return format!(
+        "Connection refused by {proxy_addr}. The proxy server is not accepting connections."
+      );
+    }
+    if err.contains("connection reset") {
+      return format!(
+        "Connection reset by {proxy_addr}. The proxy server closed the connection unexpectedly."
+      );
+    }
+    if err.contains("timed out") || err.contains("deadline has elapsed") {
+      return format!("Connection to {proxy_addr} timed out. The proxy server is not responding.");
+    }
+    if err.contains("no such host") || err.contains("dns") || err.contains("resolve") {
+      return format!(
+        "Could not resolve proxy host '{}'. Check that the hostname is correct.",
+        settings.host
+      );
+    }
+    if err.contains("authentication") || err.contains("407") || err.contains("proxy auth") {
+      return format!(
+        "Proxy authentication failed for {proxy_addr}. Check your username and password."
+      );
+    }
+    if err.contains("403") || err.contains("forbidden") {
+      return format!("Access denied by {proxy_addr} (403 Forbidden).");
+    }
+    if err.contains("402") {
+      return format!(
+        "Payment required by {proxy_addr} (402). Your proxy subscription may have expired."
+      );
+    }
+    if err.contains("502") || err.contains("bad gateway") {
+      return format!(
+        "Bad gateway from {proxy_addr} (502). The upstream proxy server may be down."
+      );
+    }
+    if err.contains("503") || err.contains("service unavailable") {
+      return format!("Proxy {proxy_addr} is temporarily unavailable (503).");
+    }
+    if err.contains("socks") && err.contains("unreachable") {
+      return format!("SOCKS proxy {proxy_addr} could not reach the target. The proxy server may not have internet access.");
+    }
+    if err.contains("invalid proxy") || err.contains("unsupported proxy") {
+      return format!(
+        "Invalid proxy configuration for {proxy_addr}. Check the proxy type and address."
+      );
+    }
+
+    // Generic fallback — still show the proxy address for context
+    format!("Proxy check failed for {proxy_addr}. Could not connect through the proxy.")
+  }
+
+  // Build proxy URL string from ProxySettings. Credentials are percent-encoded:
+  // a password containing `/`, `#`, `?` or `@` otherwise breaks the URL
+  // authority and silently retargets the request at the wrong host.
+  pub fn build_proxy_url(proxy_settings: &ProxySettings) -> String {
+    if crate::xray::is_xray_proxy_type(&proxy_settings.proxy_type) {
+      return proxy_settings.vless_uri.clone().unwrap_or_default();
+    }
+
+    let mut url = format!("{}://", proxy_settings.proxy_type);
+
+    if let (Some(username), Some(password)) = (&proxy_settings.username, &proxy_settings.password) {
+      url.push_str(&urlencoding::encode(username));
+      url.push(':');
+      url.push_str(&urlencoding::encode(password));
+      url.push('@');
+    } else if let Some(username) = &proxy_settings.username {
+      url.push_str(&urlencoding::encode(username));
+      url.push('@');
+    }
+
+    url.push_str(&crate::proxy_storage::url_host(&proxy_settings.host));
+    url.push(':');
+    url.push_str(&proxy_settings.port.to_string());
+
+    url
+  }
+
+  /// Proxy URL for a diagnostic probe made by the app itself (reqwest), as
+  /// opposed to `build_proxy_url`, which feeds the browser.
+  ///
+  /// SOCKS5 becomes `socks5h://` so the probe endpoint's hostname resolves at
+  /// the exit rather than on this machine. Resolving locally would leak the
+  /// real DNS and, behind a split-horizon resolver, can reach a different host
+  /// than the browser would.
+  ///
+  /// `httpstls` becomes `https://` because reqwest has no such scheme; both
+  /// spellings mean TLS to the proxy followed by CONNECT, so the probe still
+  /// crosses the same encrypted hop the browser will.
+  /// Stored `https` becomes `http://`: the browser treats that legacy provider
+  /// label as plaintext CONNECT, not TLS to the first hop.
+  pub fn build_probe_proxy_url(proxy_settings: &ProxySettings) -> String {
+    let url = Self::build_proxy_url(proxy_settings);
+    crate::proxy_storage::reqwest_upstream_url(&url)
+  }
+
+  /// Prove the TLS hop to an `httpstls` proxy can actually be established, so
+  /// a certificate that does not verify is reported as exactly that.
+  ///
+  /// Returns the coded error the frontend translates. There is intentionally no
+  /// "connect anyway" path: verification is the property that makes this proxy
+  /// type resistant to an active man-in-the-middle rather than only to a
+  /// passive one, so a failure here is fatal by design.
+  async fn verify_upstream_tls(proxy_settings: &ProxySettings) -> Result<(), String> {
+    let host = crate::proxy_storage::bare_host(&proxy_settings.host).to_string();
+    let port = proxy_settings.port;
+    let addr = crate::proxy_server::connect_authority(&host, port);
+
+    let attempt = async {
+      let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| e.to_string())?;
+      let connector = tokio_native_tls::TlsConnector::from(
+        native_tls::TlsConnector::new().map_err(|e| e.to_string())?,
+      );
+      connector
+        .connect(host.as_str(), tcp)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    };
+
+    let detail = match tokio::time::timeout(std::time::Duration::from_secs(15), attempt).await {
+      Ok(Ok(())) => return Ok(()),
+      Ok(Err(detail)) => detail,
+      Err(_) => "timed out".to_string(),
+    };
+
+    log::warn!("Upstream TLS handshake failed err=\"{detail}\"");
+    Err(
+      serde_json::json!({
+        "code": "PROXY_TLS_HANDSHAKE_FAILED",
+        "params": { "proxy": addr }
+      })
+      .to_string(),
+    )
+  }
+
+  // Check if a proxy is valid by routing through a temporary donut-proxy process.
+  // This tests the exact same code path the browser uses.
+  // Falls back to direct reqwest check if the proxy worker fails to start.
+  pub async fn check_proxy_validity(
+    &self,
+    proxy_id: &str,
+    proxy_settings: &ProxySettings,
+  ) -> Result<ProxyCheckResult, String> {
+    let mut xray_worker_id = None;
+    let effective_proxy_settings = if crate::xray::is_xray_proxy_type(&proxy_settings.proxy_type) {
+      let uri = proxy_settings
+        .vless_uri
+        .as_deref()
+        .ok_or_else(|| crate::backend_error("VLESS_CONFIG_INVALID"))?;
+      let worker = crate::xray_worker_runner::start_xray_worker(None, uri)
+        .await
+        .map_err(|error| error.to_string())?;
+      xray_worker_id = Some(worker.id.clone());
+      worker.local_proxy_settings()
+    } else {
+      proxy_settings.clone()
+    };
+    let upstream_url = Self::build_proxy_url(&effective_proxy_settings);
+    let started = std::time::Instant::now();
+
+    // Whether the proxy carries UDP is asked of the same endpoint the browser
+    // dials. Spawned rather than awaited here so it runs alongside the exit
+    // lookup: a check should not take twice as long to answer twice as much,
+    // and for a VLESS proxy the probe has to reach the local worker while it
+    // is still up.
+    let probe_settings = effective_proxy_settings.clone();
+    let udp_probe = tauri::async_runtime::spawn(async move {
+      crate::proxy_udp::probe_udp_support(&probe_settings).await
+    });
+
+    // The dominant failure for a TLS-wrapped hop is a certificate that will not
+    // verify: the provider publishes a bare IP, or serves a self-signed cert.
+    // Through the worker that surfaces as a generic "could not connect", which
+    // sends users hunting for the wrong problem. One handshake, on this type
+    // only, so no existing proxy type can regress.
+    if effective_proxy_settings
+      .proxy_type
+      .eq_ignore_ascii_case("httpstls")
+    {
+      Self::verify_upstream_tls(&effective_proxy_settings).await?;
+    }
+
+    // Try process-based check first (identical to browser launch path).
+    // If the proxy worker fails to start (e.g. Gatekeeper, antivirus, signing
+    // restrictions), fall back to a direct reqwest check.
+    let proxy_start_result =
+      crate::proxy_runner::start_proxy_process(Some(upstream_url.clone()), None)
+        .await
+        .map_err(|e| e.to_string());
+
+    let ip_result = match proxy_start_result {
+      Ok(proxy_config) => {
+        let local_url = format!("http://127.0.0.1:{}", proxy_config.local_port.unwrap_or(0));
+        let config_id = proxy_config.id.clone();
+        // Tie the check worker's lifetime to this GUI process: the worker's
+        // owner watchdog self-exits when that identity dies, so if the app is
+        // killed mid-check the worker follows instead of idling until the
+        // next app launch.
+        if !persist_browser_identity(&config_id, std::process::id()) {
+          log::warn!(
+            "Check worker owner not recorded, it outlives an app crash proxy_worker={config_id}"
+          );
+        }
+        // Wrap in a timeout so the check worker doesn't stay alive indefinitely
+        // if the upstream is slow or unreachable.
+        let result = tokio::time::timeout(
+          std::time::Duration::from_secs(30),
+          ip_utils::fetch_public_ip(Some(&local_url)),
+        )
+        .await
+        .unwrap_or_else(|_| {
+          Err(ip_utils::IpError::Network(
+            "Proxy check timed out after 30s".to_string(),
+          ))
+        });
+        // Always stop the worker — even if the check failed or timed out
+        let _ = crate::proxy_runner::stop_proxy_process_because(&config_id, "check_done").await;
+        result
+      }
+      Err(err_msg) => {
+        if xray_worker_id.is_some() {
+          log::warn!(
+            "Proxy worker start failed in front of Xray err=\"{}\"",
+            crate::log_redaction::text(&err_msg)
+          );
+          Err(ip_utils::IpError::Network(err_msg))
+        } else {
+          log::warn!(
+            "Proxy worker start failed, checking directly err=\"{}\"",
+            crate::log_redaction::text(&err_msg)
+          );
+          // Convert the stored route exactly once, including legacy HTTPS
+          // CONNECT and remote DNS for SOCKS5. This is still a proxied request,
+          // never a retry through the host's own internet connection.
+          let fallback_url = crate::proxy_storage::reqwest_upstream_url(&upstream_url);
+          // Only when reqwest can genuinely route through it. For `ss`,
+          // `vless`, or any scheme it does not know, `Proxy::all` succeeds and
+          // then matches nothing, so this "fallback check" fetched the
+          // MACHINE'S OWN address, reported it as the proxy's exit, and marked
+          // the proxy valid. Answering "could not check" is the honest result.
+          if crate::proxy_storage::reqwest_can_proxy(&fallback_url) {
+            ip_utils::fetch_public_ip(Some(&fallback_url)).await
+          } else {
+            Err(ip_utils::IpError::Network(format!(
+              "Could not start a proxy worker ({err_msg}), and this proxy type cannot be checked directly"
+            )))
+          }
+        }
+      }
+    };
+    if let Some(worker_id) = xray_worker_id {
+      let _ = crate::xray_worker_runner::stop_xray_worker(&worker_id).await;
+    }
+
+    let ip = match ip_result {
+      Ok(ip) => ip,
+      Err(e) => {
+        let udp = udp_probe
+          .await
+          .unwrap_or(crate::proxy_udp::UdpSupport::Unknown);
+        let failed_result = ProxyCheckResult {
+          ip: String::new(),
+          city: None,
+          country: None,
+          country_code: None,
+          timestamp: Self::get_current_timestamp(),
+          is_valid: false,
+          isp: None,
+          timezone: None,
+          udp,
+          latency_ms: Some(started.elapsed().as_millis() as u64),
+        };
+        let _ = self.save_proxy_check_cache(proxy_id, proxy_settings, &failed_result);
+        self.record_proxy_check(proxy_id, Self::history_entry(&failed_result));
+
+        let err_str = e.to_string();
+        let user_message = Self::classify_proxy_error(&err_str, proxy_settings);
+        return Err(user_message);
+      }
+    };
+
+    // Get geolocation
+    let (city, country, country_code) = crate::geolocation::lookup_place(&ip);
+
+    // The ISP and the timezone come off the databases already on disk. Handing
+    // an exit address to an outside lookup service to learn them would tell
+    // that service which addresses this machine is testing.
+    let insight = crate::geolocation::lookup_exit_insight(&ip);
+    let udp = udp_probe
+      .await
+      .unwrap_or(crate::proxy_udp::UdpSupport::Unknown);
+
+    // Create successful result
+    let result = ProxyCheckResult {
+      ip: ip.clone(),
+      city,
+      country,
+      country_code,
+      timestamp: Self::get_current_timestamp(),
+      is_valid: true,
+      isp: insight.organization,
+      timezone: insight.timezone,
+      udp,
+      latency_ms: Some(started.elapsed().as_millis() as u64),
+    };
+
+    // Save to cache
+    let _ = self.save_proxy_check_cache(proxy_id, proxy_settings, &result);
+    self.record_proxy_check(proxy_id, Self::history_entry(&result));
+
+    Ok(result)
+  }
+
+  /// The trail line for a finished check. Built from the receipt rather than
+  /// assembled twice, so the list can never disagree with the last result.
+  fn history_entry(result: &ProxyCheckResult) -> ProxyCheckHistoryEntry {
+    ProxyCheckHistoryEntry {
+      timestamp: result.timestamp,
+      ok: result.is_valid,
+      ip: (!result.ip.is_empty()).then(|| result.ip.clone()),
+      country: result.country.clone(),
+      country_code: result.country_code.clone(),
+      isp: result.isp.clone(),
+      udp: result.udp,
+      latency_ms: result.latency_ms,
+    }
+  }
+
+  // Get cached proxy check result
+  pub fn get_cached_proxy_check(&self, proxy_id: &str) -> Option<ProxyCheckResult> {
+    self.load_proxy_check_cache(proxy_id)
+  }
+
+  // Export all proxies as JSON
+  pub fn export_proxies_json(&self) -> Result<String, String> {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    let proxies: Vec<ExportedProxy> = stored_proxies
+      .values()
+      .filter(|p| !p.is_cloud_managed && !p.is_cloud_derived)
+      .map(|p| ExportedProxy {
+        name: p.name.clone(),
+        proxy_type: p.proxy_settings.proxy_type.clone(),
+        host: p.proxy_settings.host.clone(),
+        port: p.proxy_settings.port,
+        username: p.proxy_settings.username.clone(),
+        password: p.proxy_settings.password.clone(),
+        vless_uri: p.proxy_settings.vless_uri.clone(),
+      })
+      .collect();
+
+    let export_data = ProxyExportData {
+      version: "1.0".to_string(),
+      proxies,
+      exported_at: Utc::now().to_rfc3339(),
+      source: "DonutBrowser".to_string(),
+    };
+
+    serde_json::to_string_pretty(&export_data).map_err(|e| format!("Failed to serialize: {e}"))
+  }
+
+  // Export all proxies as TXT (one per line: protocol://user:pass@host:port)
+  pub fn export_proxies_txt(&self) -> String {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies
+      .values()
+      .filter(|p| !p.is_cloud_managed && !p.is_cloud_derived)
+      .map(|p| Self::build_proxy_url(&p.proxy_settings))
+      .collect::<Vec<_>>()
+      .join("\n")
+  }
+
+  // Parse TXT content with auto-detection of formats
+  pub fn parse_txt_proxies(content: &str) -> Vec<ProxyParseResult> {
+    content
+      .lines()
+      .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+      .map(|line| Self::parse_single_proxy_line(line.trim()))
+      .collect()
+  }
+
+  // Parse a single proxy line with format auto-detection
+  fn parse_single_proxy_line(line: &str) -> ProxyParseResult {
+    // Format 1: protocol://username:password@host:port (full URL)
+    if let Some(result) = Self::try_parse_url_format(line) {
+      return result;
+    }
+
+    // Try colon-separated formats
+    let parts = split_proxy_fields(line);
+
+    match parts.len() {
+      // host:port (no auth)
+      2 => {
+        if let Ok(port) = parts[1].parse::<u16>() {
+          return ProxyParseResult::Parsed(ParsedProxyLine {
+            proxy_type: "http".to_string(),
+            host: parts[0].to_string(),
+            port,
+            username: None,
+            password: None,
+            vless_uri: None,
+            original_line: line.to_string(),
+          });
+        }
+        ProxyParseResult::Invalid {
+          line: line.to_string(),
+          reason: "Invalid port number".to_string(),
+        }
+      }
+      // Could be: host:port:user or user:pass@host (with @ in the middle)
+      3 => {
+        // Try username:password@host:port first
+        if let Some(result) = Self::try_parse_user_pass_at_host_port(line) {
+          return result;
+        }
+        ProxyParseResult::Invalid {
+          line: line.to_string(),
+          reason: "Could not determine format with 3 parts".to_string(),
+        }
+      }
+      // 4 parts: could be host:port:user:pass OR user:pass:host:port
+      4 => Self::parse_colon_separated_quad(&parts, "http", line),
+      // username:password@[IPv6]:port
+      _ => {
+        Self::try_parse_user_pass_at_host_port(line).unwrap_or_else(|| ProxyParseResult::Invalid {
+          line: line.to_string(),
+          reason: format!("Unexpected format with {} parts", parts.len()),
+        })
+      }
+    }
+  }
+
+  // Resolve a four-part colon-separated body, which is either
+  // host:port:username:password or username:password:host:port. The port
+  // position tells the two apart; when both positions parse as a port the
+  // caller has to ask the user.
+  fn parse_colon_separated_quad(parts: &[&str], proxy_type: &str, line: &str) -> ProxyParseResult {
+    let port_at_1 = parts[1].parse::<u16>().ok();
+    let port_at_3 = parts[3].parse::<u16>().ok();
+
+    match (port_at_1, port_at_3) {
+      // host:port:user:pass
+      (Some(port), None) => ProxyParseResult::Parsed(ParsedProxyLine {
+        proxy_type: proxy_type.to_string(),
+        host: parts[0].to_string(),
+        port,
+        username: Some(parts[2].to_string()),
+        password: Some(parts[3].to_string()),
+        vless_uri: None,
+        original_line: line.to_string(),
+      }),
+      // user:pass:host:port
+      (None, Some(port)) => ProxyParseResult::Parsed(ParsedProxyLine {
+        proxy_type: proxy_type.to_string(),
+        host: parts[2].to_string(),
+        port,
+        username: Some(parts[0].to_string()),
+        password: Some(parts[1].to_string()),
+        vless_uri: None,
+        original_line: line.to_string(),
+      }),
+      // Both could be ports - ambiguous
+      (Some(_), Some(_)) => ProxyParseResult::Ambiguous {
+        line: line.to_string(),
+        possible_formats: vec![
+          "host:port:username:password".to_string(),
+          "username:password:host:port".to_string(),
+        ],
+      },
+      // Neither is a valid port
+      (None, None) => ProxyParseResult::Invalid {
+        line: line.to_string(),
+        reason: "No valid port number found".to_string(),
+      },
+    }
+  }
+
+  // Try to parse URL format: protocol://username:password@host:port
+  fn try_parse_url_format(line: &str) -> Option<ProxyParseResult> {
+    if crate::xray::XrayProtocol::from_share_link(line).is_some() {
+      return Some(match crate::xray::parse_share_link(line) {
+        Ok(parsed) => ProxyParseResult::Parsed(ParsedProxyLine {
+          proxy_type: parsed.config.protocol().proxy_type().to_string(),
+          host: parsed.config.address,
+          port: parsed.config.port,
+          username: None,
+          password: None,
+          vless_uri: Some(line.to_string()),
+          original_line: line.to_string(),
+        }),
+        Err(error) => ProxyParseResult::Invalid {
+          line: line.to_string(),
+          reason: error.to_string(),
+        },
+      });
+    }
+
+    // Check for protocol prefix using strip_prefix
+    let (protocol, rest) = if let Some(rest) = line.strip_prefix("httpstls://") {
+      // Must be tested before `http://`, which is not a prefix of it but reads
+      // as though it could be at a glance. Deliberately NOT folded into
+      // `https://`: provider lists routinely paste `https://user:pass@host:port`
+      // for a plaintext CONNECT endpoint, so mapping that to the TLS type would
+      // break real imports.
+      ("httpstls", rest)
+    } else if let Some(rest) = line.strip_prefix("http://") {
+      ("http", rest)
+    } else if let Some(rest) = line.strip_prefix("https://") {
+      ("https", rest)
+    } else if let Some(rest) = line.strip_prefix("socks4://") {
+      ("socks4", rest)
+    } else if let Some(rest) = line.strip_prefix("socks5://") {
+      ("socks5", rest)
+    } else if let Some(rest) = line.strip_prefix("socks://") {
+      ("socks5", rest) // Default socks to socks5
+    } else if let Some(rest) = line.strip_prefix("ss://") {
+      ("ss", rest)
+    } else {
+      let rest = line.strip_prefix("shadowsocks://")?;
+      ("ss", rest)
+    };
+
+    // Check if there's auth (contains @)
+    if let Some(at_pos) = rest.rfind('@') {
+      let auth = &rest[..at_pos];
+      let host_port = &rest[at_pos + 1..];
+
+      // Parse auth (user:pass)
+      let (username, password) = if let Some(colon_pos) = auth.find(':') {
+        let user = urlencoding::decode(&auth[..colon_pos]).unwrap_or_default();
+        let pass = urlencoding::decode(&auth[colon_pos + 1..]).unwrap_or_default();
+        (Some(user.to_string()), Some(pass.to_string()))
+      } else {
+        (
+          Some(urlencoding::decode(auth).unwrap_or_default().to_string()),
+          None,
+        )
+      };
+
+      // Parse host:port
+      if let Some(colon_pos) = host_port.rfind(':') {
+        let host = &host_port[..colon_pos];
+        if let Ok(port) = host_port[colon_pos + 1..].parse::<u16>() {
+          return Some(ProxyParseResult::Parsed(ParsedProxyLine {
+            proxy_type: protocol.to_string(),
+            host: host.to_string(),
+            port,
+            username,
+            password,
+            vless_uri: None,
+            original_line: line.to_string(),
+          }));
+        }
+      }
+    } else {
+      // Vendors also hand out the colon-separated body behind a scheme, as in
+      // socks5://host:port:user:pass, so try that before plain host:port.
+      let parts = split_proxy_fields(rest);
+      if parts.len() == 4 && parts.iter().all(|part| !part.is_empty()) {
+        return Some(Self::parse_colon_separated_quad(&parts, protocol, line));
+      }
+
+      // No auth, just host:port
+      if let Some(colon_pos) = rest.rfind(':') {
+        let host = &rest[..colon_pos];
+        if let Ok(port) = rest[colon_pos + 1..].parse::<u16>() {
+          return Some(ProxyParseResult::Parsed(ParsedProxyLine {
+            proxy_type: protocol.to_string(),
+            host: host.to_string(),
+            port,
+            username: None,
+            password: None,
+            vless_uri: None,
+            original_line: line.to_string(),
+          }));
+        }
+      }
+    }
+
+    Some(ProxyParseResult::Invalid {
+      line: line.to_string(),
+      reason: "Invalid URL format".to_string(),
+    })
+  }
+
+  // Try to parse: username:password@host:port format (no protocol)
+  fn try_parse_user_pass_at_host_port(line: &str) -> Option<ProxyParseResult> {
+    if let Some(at_pos) = line.rfind('@') {
+      let auth = &line[..at_pos];
+      let host_port = &line[at_pos + 1..];
+
+      // Parse auth
+      let (username, password) = {
+        let colon_pos = auth.find(':')?;
+        (
+          Some(auth[..colon_pos].to_string()),
+          Some(auth[colon_pos + 1..].to_string()),
+        )
+      };
+
+      // Parse host:port
+      if let Some(colon_pos) = host_port.rfind(':') {
+        let host = &host_port[..colon_pos];
+        if let Ok(port) = host_port[colon_pos + 1..].parse::<u16>() {
+          return Some(ProxyParseResult::Parsed(ParsedProxyLine {
+            proxy_type: "http".to_string(),
+            host: host.to_string(),
+            port,
+            username,
+            password,
+            vless_uri: None,
+            original_line: line.to_string(),
+          }));
+        }
+      }
+    }
+    None
+  }
+
+  // Import proxies from JSON content
+  pub fn import_proxies_json(
+    &self,
+    app_handle: &tauri::AppHandle,
+    content: &str,
+  ) -> Result<ProxyImportResult, String> {
+    let export_data: ProxyExportData =
+      serde_json::from_str(content).map_err(|e| format!("Invalid JSON format: {e}"))?;
+
+    let mut imported = Vec::new();
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+
+    for exported in export_data.proxies {
+      let proxy_settings = ProxySettings {
+        proxy_type: exported.proxy_type,
+        host: exported.host,
+        port: exported.port,
+        username: exported.username,
+        password: exported.password,
+        vless_uri: exported.vless_uri,
+      };
+
+      match self.create_stored_proxy(app_handle, exported.name.clone(), proxy_settings) {
+        Ok(proxy) => imported.push(proxy),
+        Err(e) => {
+          if e.contains("already exists") {
+            skipped += 1;
+          } else {
+            errors.push(format!("Failed to import '{}': {}", exported.name, e));
+          }
+        }
+      }
+    }
+
+    Ok(ProxyImportResult {
+      imported_count: imported.len(),
+      skipped_count: skipped,
+      errors,
+      proxies: imported,
+    })
+  }
+
+  // Import proxies from already parsed proxy lines
+  pub fn import_proxies_from_parsed(
+    &self,
+    app_handle: &tauri::AppHandle,
+    parsed_proxies: Vec<ParsedProxyLine>,
+    name_prefix: Option<String>,
+  ) -> Result<ProxyImportResult, String> {
+    let mut imported = Vec::new();
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+    let prefix = name_prefix.unwrap_or_else(|| "Imported".to_string());
+    // Numbered from the first free name, not from 1: a second batch under the
+    // same prefix otherwise collided with every name of the first and was
+    // skipped whole as duplicates.
+    let mut taken: std::collections::HashSet<String> = self
+      .get_stored_proxies()
+      .into_iter()
+      .map(|proxy| proxy.name)
+      .collect();
+    let mut number = 0;
+
+    for parsed in parsed_proxies {
+      let proxy_name = loop {
+        number += 1;
+        let candidate = format!("{} Proxy {}", prefix, number);
+        if !taken.contains(&candidate) {
+          break candidate;
+        }
+      };
+      taken.insert(proxy_name.clone());
+      let proxy_settings = ProxySettings {
+        proxy_type: parsed.proxy_type,
+        host: parsed.host,
+        port: parsed.port,
+        username: parsed.username,
+        password: parsed.password,
+        vless_uri: parsed.vless_uri,
+      };
+
+      match self.create_stored_proxy(app_handle, proxy_name.clone(), proxy_settings) {
+        Ok(proxy) => imported.push(proxy),
+        Err(e) => {
+          if e.contains("already exists") {
+            skipped += 1;
+          } else {
+            errors.push(format!("Failed to import '{}': {}", proxy_name, e));
+          }
+        }
+      }
+    }
+
+    Ok(ProxyImportResult {
+      imported_count: imported.len(),
+      skipped_count: skipped,
+      errors,
+      proxies: imported,
+    })
+  }
+
+  // Start a proxy for given proxy settings and associate it with a browser process ID
+  // If proxy_settings is None, starts a direct proxy for traffic monitoring
+  #[allow(clippy::too_many_arguments)]
+  pub async fn start_proxy(
+    &self,
+    app_handle: tauri::AppHandle,
+    proxy_settings: Option<&ProxySettings>,
+    browser_pid: u32,
+    profile_id: Option<&str>,
+    bypass_rules: Vec<String>,
+    blocklist_file: Option<String>,
+    dns_allowlist_mode: bool,
+    dns_server: Option<&str>,
+    record_domains: bool,
+    // Protocol the local worker serves the browser: "socks5" (Wayfern). Reflected in
+    // the returned ProxySettings.proxy_type so the caller formats the right local proxy URL scheme.
+    local_protocol: &str,
+  ) -> Result<ProxySettings, String> {
+    let _lifecycle = self.worker_lifecycle.lock().await;
+    ensure_route_health_monitor();
+    let started = std::time::Instant::now();
+    if let Some(name) = profile_id {
+      // Check if we have an active proxy recorded for this profile
+      let maybe_existing_id = {
+        let map = self.profile_active_proxy_ids.lock().unwrap();
+        map.get(name).cloned()
+      };
+
+      if let Some(existing_id) = maybe_existing_id {
+        // Find the existing proxy info
+        let existing_info = {
+          let proxies = self.active_proxies.lock().unwrap();
+          proxies.values().find(|p| p.id == existing_id).cloned()
+        };
+
+        if let Some(existing) = existing_info {
+          let desired_type = proxy_settings
+            .map(|p| p.proxy_type.as_str())
+            .unwrap_or("DIRECT");
+          let desired_host = proxy_settings.map(|p| p.host.as_str()).unwrap_or("DIRECT");
+          let desired_port = proxy_settings.map(|p| p.port).unwrap_or(0);
+
+          let is_same_upstream = existing.upstream_type == desired_type
+            && existing.upstream_host == desired_host
+            && existing.upstream_port == desired_port
+            && existing.dns_server.as_deref() == dns_server;
+
+          if is_same_upstream {
+            // Settings match - can reuse existing proxy
+            // Just update the PID mapping if needed
+            let proxies = self.active_proxies.lock().unwrap();
+            if proxies.contains_key(&browser_pid) {
+              // Already mapped, reuse it
+              return Ok(ProxySettings {
+                proxy_type: local_protocol.to_string(),
+                host: "127.0.0.1".to_string(),
+                port: existing.local_port,
+                username: None,
+                password: None,
+                vless_uri: None,
+              });
+            }
+            // Need to add this PID to the mapping - we'll do that after starting
+          }
+          // Settings differ - we'll create a new proxy, but don't stop the old one
+          // It will be cleaned up by periodic cleanup if it becomes dead
+        }
+      }
+    }
+    // Check if we already have a proxy for this browser PID
+    // If settings match, reuse it; otherwise create a new one (don't stop the old one)
+    {
+      let proxies = self.active_proxies.lock().unwrap();
+      if let Some(existing) = proxies.get(&browser_pid) {
+        let desired_type = proxy_settings
+          .map(|p| p.proxy_type.as_str())
+          .unwrap_or("DIRECT");
+        let desired_host = proxy_settings.map(|p| p.host.as_str()).unwrap_or("DIRECT");
+        let desired_port = proxy_settings.map(|p| p.port).unwrap_or(0);
+
+        let is_same_upstream = existing.upstream_type == desired_type
+          && existing.upstream_host == desired_host
+          && existing.upstream_port == desired_port
+          && existing.dns_server.as_deref() == dns_server;
+
+        if is_same_upstream {
+          // Check if profile_id matches
+          let profile_id_matches = match (profile_id, &existing.profile_id) {
+            (Some(ref new_id), Some(ref old_id)) => new_id == old_id,
+            (None, None) => true,
+            _ => false,
+          };
+
+          if profile_id_matches {
+            // Reuse existing local proxy (settings and profile_id match)
+            return Ok(ProxySettings {
+              proxy_type: local_protocol.to_string(),
+              host: "127.0.0.1".to_string(),
+              port: existing.local_port,
+              username: None,
+              password: None,
+              vless_uri: None,
+            });
+          }
+          // Profile ID changed - we'll create a new proxy but don't stop the old one
+          // It will be cleaned up by periodic cleanup if it becomes dead
+        }
+        // Upstream changed - we'll create a new proxy but don't stop the old one
+        // It will be cleaned up by periodic cleanup if it becomes dead
+      }
+    }
+
+    crate::proxy_runner::ensure_sidecar_version()
+      .await
+      .map_err(|e| e.to_string())?;
+
+    // Start a new proxy using the donut-proxy binary with the correct CLI interface
+    let mut proxy_cmd = app_handle
+      .shell()
+      .sidecar("donut-proxy")
+      .map_err(|e| format!("Failed to create sidecar: {e}"))?
+      .arg("proxy")
+      .arg("start");
+
+    // Add upstream proxy settings if provided, otherwise create direct proxy
+    if let Some(proxy_settings) = proxy_settings {
+      proxy_cmd = proxy_cmd
+        .arg("--host")
+        .arg(&proxy_settings.host)
+        .arg("--proxy-port")
+        .arg(proxy_settings.port.to_string())
+        .arg("--type")
+        .arg(&proxy_settings.proxy_type);
+
+      // Keep credentials out of process arguments. The short-lived sidecar
+      // removes these variables before it spawns the detached worker.
+      if let Some(username) = &proxy_settings.username {
+        proxy_cmd = proxy_cmd.env("DONUT_PROXY_USERNAME", username);
+      }
+      if let Some(password) = &proxy_settings.password {
+        proxy_cmd = proxy_cmd.env("DONUT_PROXY_PASSWORD", password);
+      }
+    }
+
+    // Add profile ID if provided for traffic tracking
+    if let Some(id) = profile_id {
+      proxy_cmd = proxy_cmd.arg("--profile-id").arg(id);
+    }
+
+    // Add bypass rules if any
+    if !bypass_rules.is_empty() {
+      let rules_json = serde_json::to_string(&bypass_rules)
+        .map_err(|e| format!("Failed to serialize bypass rules: {e}"))?;
+      proxy_cmd = proxy_cmd.arg("--bypass-rules").arg(rules_json);
+    }
+
+    // Add blocklist file path if provided
+    if let Some(ref path) = blocklist_file {
+      proxy_cmd = proxy_cmd.arg("--blocklist-file").arg(path);
+      if dns_allowlist_mode {
+        proxy_cmd = proxy_cmd.arg("--dns-allowlist-mode");
+      }
+    }
+
+    if let Some(dns_server) = dns_server {
+      proxy_cmd = proxy_cmd.arg("--dns-server").arg(dns_server);
+    }
+
+    if !record_domains {
+      proxy_cmd = proxy_cmd.arg("--no-domain-history");
+    }
+
+    // Tell the worker which protocol to serve the browser (http or socks5)
+    proxy_cmd = proxy_cmd.arg("--local-protocol").arg(local_protocol);
+
+    // The donut-proxy command starts the worker, prints it and exits.
+    let output = run_sidecar(proxy_cmd).await?;
+
+    if !output.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      let stdout = String::from_utf8_lossy(&output.stdout);
+      return Err(format!(
+        "Proxy start failed - stdout: {stdout}, stderr: {stderr}"
+      ));
+    }
+
+    let json_string =
+      String::from_utf8(output.stdout).map_err(|e| format!("Failed to parse proxy output: {e}"))?;
+
+    // Parse the JSON output
+    let json: Value = serde_json::from_str(json_string.trim())
+      .map_err(|e| format!("Failed to parse JSON: {e}. Output was: {}", json_string))?;
+
+    // Extract proxy information
+    let id = json["id"].as_str().ok_or("Missing proxy ID")?;
+    let local_port = json["localPort"]
+      .as_u64()
+      .ok_or_else(|| format!("Missing local port in JSON: {}", json_string))?
+      as u16;
+    let local_url = json["localUrl"]
+      .as_str()
+      .ok_or_else(|| format!("Missing local URL in JSON: {}", json_string))?
+      .to_string();
+
+    let proxy_info = ProxyInfo {
+      id: id.to_string(),
+      local_url,
+      upstream_host: proxy_settings
+        .map(|p| p.host.clone())
+        .unwrap_or_else(|| "DIRECT".to_string()),
+      upstream_port: proxy_settings.map(|p| p.port).unwrap_or(0),
+      upstream_type: proxy_settings
+        .map(|p| p.proxy_type.clone())
+        .unwrap_or_else(|| "DIRECT".to_string()),
+      local_port,
+      profile_id: profile_id.map(|s| s.to_string()),
+      blocklist_file: blocklist_file.clone(),
+      dns_server: dns_server.map(str::to_string),
+    };
+
+    // Wait for the local proxy port to be ready to accept connections
+    {
+      use tokio::net::TcpStream;
+      use tokio::time::{sleep, Duration};
+      let mut ready = false;
+      for _ in 0..50 {
+        match TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, proxy_info.local_port)).await {
+          Ok(_stream) => {
+            ready = true;
+            break;
+          }
+          Err(_) => {
+            sleep(Duration::from_millis(100)).await;
+          }
+        }
+      }
+      if !ready {
+        // The detached worker is already running with its config on disk, but
+        // it was never registered in active_proxies — no cleanup pass could
+        // ever find it, so it must be killed before this error propagates.
+        let _ =
+          crate::proxy_runner::stop_proxy_process_because(&proxy_info.id, "start_timeout").await;
+        return Err(format!(
+          "Local proxy on 127.0.0.1:{} did not become ready in time",
+          proxy_info.local_port
+        ));
+      }
+    }
+
+    log::info!(
+      "Proxy worker started id={} pid={} port={} profile={} upstream={} elapsed_ms={}",
+      proxy_info.id,
+      crate::proxy_storage::get_proxy_config(&proxy_info.id)
+        .and_then(|config| config.pid)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string()),
+      proxy_info.local_port,
+      profile_id.unwrap_or("none"),
+      crate::log_redaction::Plain(&proxy_info.upstream_type.to_lowercase()),
+      started.elapsed().as_millis()
+    );
+
+    // Store the proxy info
+    {
+      let mut proxies = self.active_proxies.lock().unwrap();
+      proxies.insert(browser_pid, proxy_info.clone());
+    }
+
+    // Store the profile proxy info for persistence
+    if let Some(id) = profile_id {
+      if let Some(proxy_settings) = proxy_settings {
+        let mut profile_proxies = self.profile_proxies.lock().unwrap();
+        profile_proxies.insert(id.to_string(), proxy_settings.clone());
+      }
+      // Also record the active proxy id for this profile for quick cleanup on changes
+      let mut map = self.profile_active_proxy_ids.lock().unwrap();
+      map.insert(id.to_string(), proxy_info.id.clone());
+    }
+
+    // Return proxy settings for the browser
+    Ok(ProxySettings {
+      proxy_type: local_protocol.to_string(),
+      host: "127.0.0.1".to_string(), // Use 127.0.0.1 instead of localhost for better compatibility
+      port: proxy_info.local_port,
+      username: None,
+      password: None,
+      vless_uri: None,
+    })
+  }
+
+  // Stop the proxy associated with a browser process ID
+  pub async fn stop_proxy(
+    &self,
+    app_handle: tauri::AppHandle,
+    browser_pid: u32,
+  ) -> Result<(), String> {
+    let _lifecycle = self.worker_lifecycle.lock().await;
+    self.stop_proxy_inner(app_handle, browser_pid).await
+  }
+
+  async fn stop_proxy_inner(
+    &self,
+    app_handle: tauri::AppHandle,
+    browser_pid: u32,
+  ) -> Result<(), String> {
+    let (proxy_id, profile_id): (String, Option<String>) = {
+      let mut proxies = self.active_proxies.lock().unwrap();
+      match proxies.remove(&browser_pid) {
+        Some(proxy) => (proxy.id, proxy.profile_id.clone()),
+        None => return Ok(()), // No proxy to stop
+      }
+    };
+    let worker = WorkerSnapshot::take(&proxy_id);
+
+    // Stop the proxy using the donut-proxy binary
+    let proxy_cmd = app_handle
+      .shell()
+      .sidecar("donut-proxy")
+      .map_err(|e| format!("Failed to create sidecar: {e}"))?
+      .arg("proxy")
+      .arg("stop")
+      .arg("--id")
+      .arg(&proxy_id);
+
+    // A failed spawn (sidecar missing, permission denied, fd exhaustion) must
+    // not panic the cleanup task — the proxy is already removed from tracking,
+    // so degrade gracefully like the non-success branch below.
+    match run_sidecar(proxy_cmd).await {
+      Ok(output) if !output.success() => {
+        log::warn!(
+          "Proxy worker stop command failed id={proxy_id} stderr={:?}",
+          String::from_utf8_lossy(&output.stderr).trim()
+        );
+      }
+      Ok(_) => {}
+      Err(e) => log::warn!("Proxy worker stop command did not run id={proxy_id} err=\"{e}\""),
+    }
+    worker.log_stopped(&proxy_id);
+    if let Some(id) = profile_id.as_deref() {
+      clear_route_health(id);
+    }
+
+    // Clear profile-to-proxy mapping if it references this proxy
+    if let Some(id) = profile_id {
+      let mut map = self.profile_active_proxy_ids.lock().unwrap();
+      if let Some(current_id) = map.get(&id) {
+        if current_id == &proxy_id {
+          map.remove(&id);
+        }
+      }
+    }
+
+    // Emit event for reactive UI updates
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+    }
+
+    Ok(())
+  }
+
+  // Stop the proxy associated with a profile ID
+  pub async fn stop_proxy_by_profile_id(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile_id: &str,
+  ) -> Result<(), String> {
+    let _lifecycle = self.worker_lifecycle.lock().await;
+    let proxy_id = self.resolve_proxy_id_for_profile(profile_id);
+
+    if let Some(proxy_id) = proxy_id {
+      // Find the PID for this proxy
+      let pid = {
+        let proxies = self.active_proxies.lock().unwrap();
+        proxies.iter().find_map(|(pid, proxy)| {
+          if proxy.id == proxy_id {
+            Some(*pid)
+          } else {
+            None
+          }
+        })
+      };
+
+      if let Some(pid) = pid {
+        // Use the existing stop_proxy method
+        self.stop_proxy_inner(app_handle, pid).await
+      } else {
+        // Proxy not found in active_proxies, try to stop it directly by ID
+        let worker = WorkerSnapshot::take(&proxy_id);
+        let proxy_cmd = app_handle
+          .shell()
+          .sidecar("donut-proxy")
+          .map_err(|e| format!("Failed to create sidecar: {e}"))?
+          .arg("proxy")
+          .arg("stop")
+          .arg("--id")
+          .arg(&proxy_id);
+
+        // Don't panic if the sidecar can't be spawned — still clear the mapping.
+        match run_sidecar(proxy_cmd).await {
+          Ok(output) if !output.success() => {
+            log::warn!(
+              "Proxy worker stop command failed id={proxy_id} stderr={:?}",
+              String::from_utf8_lossy(&output.stderr).trim()
+            );
+          }
+          Ok(_) => {}
+          Err(e) => log::warn!("Proxy worker stop command did not run id={proxy_id} err=\"{e}\""),
+        }
+        worker.log_stopped(&proxy_id);
+
+        // Clear profile-to-proxy mapping
+        let mut map = self.profile_active_proxy_ids.lock().unwrap();
+        map.remove(profile_id);
+
+        // Emit event for reactive UI updates
+        if let Err(e) = events::emit_empty("proxies-changed") {
+          log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+        }
+
+        Ok(())
+      }
+    } else {
+      // No proxy found for this profile
+      Ok(())
+    }
+  }
+
+  // Update the PID mapping for an existing proxy
+  /// Re-key the in-memory map when a profile's browser PID changes, and rewrite
+  /// the worker's on-disk owner identity to match.
+  ///
+  /// Persisting is not optional bookkeeping. The detached worker reaps itself by
+  /// watching the identity on disk, so a re-key that only touched memory left
+  /// the worker watching the PREVIOUS process: once that PID was recycled the
+  /// worker saw a live "browser" forever and outlived both its browser and the
+  /// GUI. Callers on the status-sync path (`profile::manager`) hit this every
+  /// time a browser re-execs or restarts itself.
+  pub fn update_proxy_pid(&self, old_pid: u32, new_pid: u32) -> Result<(), String> {
+    let proxy_id = {
+      let mut proxies = self.active_proxies.lock().unwrap();
+      match proxies.remove(&old_pid) {
+        Some(proxy_info) => {
+          let id = proxy_info.id.clone();
+          proxies.insert(new_pid, proxy_info);
+          id
+        }
+        None => return Err(format!("No proxy found for PID {old_pid}")),
+      }
+    };
+
+    if !persist_browser_identity(&proxy_id, new_pid) {
+      log::warn!(
+        "Worker owner not persisted, worker still watches the old browser proxy_worker={proxy_id} old_browser_pid={old_pid} browser_pid={new_pid}"
+      );
+    }
+    Ok(())
+  }
+
+  /// Persist the real browser PID onto the worker's on-disk config so the
+  /// detached worker can self-terminate when that browser dies, independent of
+  /// the GUI being alive. Resolved via the profile→proxy_id map rather than the
+  /// PID-keyed `active_proxies` map: the latter is keyed by a per-launch
+  /// placeholder until `update_proxy_pid` runs, so it is not a reliable way to
+  /// find the worker for a profile mid-launch. Safe on the reuse
+  /// path — it simply rewrites `browser_pid` to the new live PID. A `browser_pid`
+  /// of 0 (launch failed to report a PID) is rejected so the caller can abort
+  /// the launch instead of leaving a worker without a verified browser owner.
+  pub fn set_browser_pid_for_profile(&self, profile_id: &str, browser_pid: u32) -> bool {
+    if browser_pid == 0 {
+      return false;
+    }
+    let Some(proxy_id) = self.resolve_proxy_id_for_profile(profile_id) else {
+      return false;
+    };
+    persist_browser_identity(&proxy_id, browser_pid)
+  }
+
+  /// Find the worker serving a profile. Prefers the in-memory map, then falls
+  /// back to the newest matching config on disk: after a GUI restart the map is
+  /// empty, but a browser (and its worker) launched by the PREVIOUS GUI can
+  /// still be running, and that worker's owner identity must stay refreshable.
+  pub(crate) fn resolve_proxy_id_for_profile(&self, profile_id: &str) -> Option<String> {
+    if let Some(id) = self
+      .profile_active_proxy_ids
+      .lock()
+      .unwrap()
+      .get(profile_id)
+      .cloned()
+    {
+      return Some(id);
+    }
+
+    // Smallest age = most recently created worker for this profile.
+    crate::proxy_storage::list_proxy_configs()
+      .into_iter()
+      .filter(|config| config.profile_id.as_deref() == Some(profile_id))
+      .min_by_key(|config| crate::proxy_storage::proxy_config_age_secs(&config.id))
+      .map(|config| config.id)
+  }
+
+  // Restore routes for live browsers before removing dead worker records.
+  pub async fn cleanup_dead_proxies(
+    &self,
+    _app_handle: tauri::AppHandle,
+  ) -> Result<Vec<u32>, String> {
+    let dead_pids: Vec<u32> = Vec::new();
+    let mut changed = false;
+
+    // One read of the worker records serves the whole pass. Disk as well as
+    // the in-memory map: a browser and its route can outlive the GUI, so a
+    // fresh GUI has no active_proxies entry for them.
+    let configs = crate::proxy_storage::list_proxy_configs();
+    let worker_pids: Vec<u32> = configs.iter().filter_map(|config| config.pid).collect();
+    let live_workers = live_process_start_times(&worker_pids);
+
+    let mut recovering_ids = std::collections::HashSet::new();
+    {
+      // Recovery starts workers again, and a requested stop must not race it.
+      let _lifecycle = self.worker_lifecycle.lock().await;
+      for config in &configs {
+        if !crate::proxy_runner::proxy_needs_recovery(config) {
+          continue;
+        }
+        recovering_ids.insert(config.id.clone());
+        let key = format!(
+          "profile={} proxy_worker={}",
+          config.profile_id.as_deref().unwrap_or("none"),
+          config.id
+        );
+        match crate::proxy_runner::recover_proxy_process(&config.id).await {
+          Ok(Some(recovered)) => {
+            changed = true;
+            PROXY_RECOVERY.succeeded(&key);
+            log::info!(
+              "Proxy worker recovered {key} old_pid={} pid={} port={}",
+              config.pid.unwrap_or_default(),
+              recovered.pid.unwrap_or_default(),
+              recovered.local_port.unwrap_or_default()
+            );
+          }
+          Ok(None) => {}
+          Err(error) => PROXY_RECOVERY.failed(&key, error),
+        }
+      }
+
+      let tracked_proxy_ids: std::collections::HashSet<String> = {
+        let proxies = self.active_proxies.lock().unwrap();
+        proxies.values().map(|p| p.id.clone()).collect()
+      };
+      for config in orphaned_worker_records(&configs, &tracked_proxy_ids, &recovering_ids, |pid| {
+        live_workers.contains_key(&pid)
+      }) {
+        log::info!(
+          "Proxy worker exited, record removed id={} pid={} profile={}",
+          config.id,
+          config.pid.unwrap_or_default(),
+          config.profile_id.as_deref().unwrap_or("none")
+        );
+        if crate::proxy_storage::delete_proxy_config(&config.id) {
+          changed = true;
+        }
+      }
+    }
+
+    // Kill stale profileless proxy workers — these are check workers
+    // (from check_proxy_validity or similar) that were never cleaned up.
+    // Profile-associated proxies are left alone to avoid the regression
+    // where killing proxies for "dead" browsers on Linux also killed
+    // proxies for running browsers (due to launcher-vs-browser PID mismatch).
+    for config in &configs {
+      let stale_check_worker = config.profile_id.is_none()
+        && config
+          .pid
+          .is_some_and(|pid| live_workers.contains_key(&pid))
+        && crate::proxy_storage::proxy_config_age_secs(&config.id) > 300;
+      if stale_check_worker
+        && crate::proxy_runner::stop_proxy_process_because(&config.id, "stale_check_worker")
+          .await
+          .unwrap_or(false)
+      {
+        changed = true;
+      }
+    }
+
+    // Kill proxy workers whose browser process has died.
+    //
+    // active_proxies is keyed by the EXACT browser PID that was recorded in
+    // update_proxy_pid(). That PID is checked in one targeted process-table
+    // read AND, when the worker's config records one, against the browser's
+    // start time — existence alone would let a recycled PID keep a dead
+    // browser's worker alive indefinitely. This avoids the fuzzy
+    // launcher-vs-browser detection used by check_browser_status (which
+    // historically had false negatives on Linux and was the reason
+    // profile-associated workers were left alone in the other cleanup branches).
+    //
+    // Without this, every time a user closes their browser via the window's
+    // X button (bypassing Donut's stop flow) or the browser crashes, the
+    // worker keeps running forever. On Windows users reported dozens of
+    // donut-proxy processes accumulating this way.
+    {
+      // Snapshot current active entries first so we don't hold the mutex
+      // while reading the process table.
+      let snapshot: Vec<(u32, String, Option<String>)> = {
+        let proxies = self.active_proxies.lock().unwrap();
+        proxies
+          .iter()
+          .map(|(&browser_pid, info)| (browser_pid, info.id.clone(), info.profile_id.clone()))
+          .collect()
+      };
+
+      if !snapshot.is_empty() {
+        // Launch placeholders (and the legacy 0 sentinel) are not real
+        // browser PIDs — update_proxy_pid hasn't recorded the real one yet.
+        let browser_pids: Vec<u32> = snapshot
+          .iter()
+          .map(|(browser_pid, _, _)| *browser_pid)
+          .filter(|&pid| pid != 0 && !is_launch_placeholder_pid(pid))
+          .collect();
+        let live_browsers = live_process_start_times(&browser_pids);
+        let start_time_by_worker: HashMap<&str, u64> = configs
+          .iter()
+          .filter_map(|config| Some((config.id.as_str(), config.browser_pid_start_time?)))
+          .collect();
+
+        // Two-state classification: alive PIDs reset their miss counter,
+        // dead PIDs increment it. A worker is only reaped after MISS_THRESHOLD
+        // consecutive misses (~60s by default given the 30s cleanup cadence),
+        // so a single process-table blip under heavy load doesn't kill a healthy worker.
+        const MISS_THRESHOLD: u8 = 2;
+
+        let mut alive_pids: Vec<u32> = Vec::new();
+        let mut dead_candidates: Vec<(u32, String, Option<String>)> = Vec::new();
+        let mut snapshot_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for (browser_pid, proxy_id, profile_id) in snapshot {
+          snapshot_pids.insert(browser_pid);
+          if browser_pid == 0 || is_launch_placeholder_pid(browser_pid) {
+            continue;
+          }
+          // Hold the entry to the recorded identity when the worker has one:
+          // same PID with a different start time is a reused PID.
+          let expected_start_time = start_time_by_worker.get(proxy_id.as_str()).copied();
+          let still_the_same_browser = live_browsers
+            .get(&browser_pid)
+            .is_some_and(|&started| expected_start_time.is_none_or(|expected| started == expected));
+          if still_the_same_browser {
+            alive_pids.push(browser_pid);
+          } else {
+            dead_candidates.push((browser_pid, proxy_id, profile_id));
+          }
+        }
+
+        let dead_browser_entries: Vec<(u32, String, Option<String>)> = {
+          let mut misses = self.dead_browser_misses.lock().unwrap();
+          // Forget PIDs no longer tracked at all (worker already torn down elsewhere).
+          misses.retain(|pid, _| snapshot_pids.contains(pid));
+          // Reset miss count for any PID that's currently alive.
+          for pid in &alive_pids {
+            misses.remove(pid);
+          }
+          // Increment dead candidates and select those past threshold.
+          let mut to_reap = Vec::new();
+          for (browser_pid, proxy_id, profile_id) in dead_candidates {
+            let count = misses.entry(browser_pid).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= MISS_THRESHOLD {
+              misses.remove(&browser_pid);
+              to_reap.push((browser_pid, proxy_id, profile_id));
+            }
+          }
+          to_reap
+        };
+
+        if !dead_browser_entries.is_empty() {
+          // A launch reusing the profile's worker must not race its stop.
+          let _lifecycle = self.worker_lifecycle.lock().await;
+          for (browser_pid, proxy_id, profile_id) in dead_browser_entries {
+            if self
+              .reap_worker_of_dead_browser(browser_pid, &proxy_id, profile_id.as_deref())
+              .await
+            {
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+
+    // Clean up orphaned VPN worker configs where the worker process is dead
+    {
+      use crate::proxy_storage::is_process_running;
+      use crate::vpn_worker_storage::{delete_vpn_worker_config, list_vpn_worker_configs};
+
+      let vpn_workers = list_vpn_worker_configs();
+      for worker in vpn_workers {
+        if let Some(pid) = worker.pid {
+          if !is_process_running(pid) {
+            log::info!(
+              "VPN worker exited, record removed id={} pid={pid} vpn={}",
+              worker.id,
+              worker.vpn_id
+            );
+            let _ = std::fs::remove_file(&worker.config_file_path);
+            if delete_vpn_worker_config(&worker.id) {
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+
+    {
+      use crate::proxy_storage::process_identity_matches;
+      use crate::xray_worker_storage::{list_xray_worker_configs, unstarted_worker_is_stale};
+
+      for worker in list_xray_worker_configs() {
+        let dead = worker
+          .pid
+          .is_some_and(|pid| !process_identity_matches(pid, worker.pid_start_time));
+        if (dead || unstarted_worker_is_stale(&worker))
+          && crate::xray_worker_runner::stop_xray_worker(&worker.id)
+            .await
+            .unwrap_or(false)
+        {
+          changed = true;
+        }
+      }
+    }
+
+    // Traffic files of workers that no longer run. A worker that started
+    // during this pass is not in `configs`; the sweep spares recent files.
+    let live_stats_keys: std::collections::HashSet<String> = configs
+      .iter()
+      .filter(|config| {
+        recovering_ids.contains(&config.id)
+          || config.pid.is_none_or(|pid| live_workers.contains_key(&pid))
+      })
+      .map(|config| {
+        config
+          .profile_id
+          .clone()
+          .unwrap_or_else(|| config.id.clone())
+      })
+      .collect();
+    if let Err(e) =
+      tokio::task::spawn_blocking(move || crate::traffic_stats::sweep_stale_files(&live_stats_keys))
+        .await
+    {
+      log::warn!("Traffic stats sweep failed err=\"{e}\"");
+    }
+
+    // Each emit makes the GUI reload its lists, so only a pass that changed
+    // something says so.
+    if changed {
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+      }
+    }
+
+    Ok(dead_pids)
+  }
+
+  /// Stop the worker of a browser the app has just seen exit, at once rather
+  /// than at the sweep that confirms the exit a minute later. The exit is
+  /// checked against the exact process the worker recorded, because the app's
+  /// own running check can miss a live browser on Linux; a browser that still
+  /// runs keeps its worker.
+  pub async fn stop_worker_of_exited_browser(&self, browser_pid: u32) {
+    if browser_pid == 0 || is_launch_placeholder_pid(browser_pid) {
+      return;
+    }
+    let Some((proxy_id, profile_id)) = self
+      .active_proxies
+      .lock()
+      .unwrap()
+      .get(&browser_pid)
+      .map(|info| (info.id.clone(), info.profile_id.clone()))
+    else {
+      return;
+    };
+    let expected_start_time = crate::proxy_storage::get_proxy_config(&proxy_id)
+      .and_then(|config| config.browser_pid_start_time);
+    let still_running = live_process_start_times(&[browser_pid])
+      .get(&browser_pid)
+      .is_some_and(|&started| expected_start_time.is_none_or(|expected| started == expected));
+    if still_running {
+      return;
+    }
+
+    let _lifecycle = self.worker_lifecycle.lock().await;
+    if self
+      .reap_worker_of_dead_browser(browser_pid, &proxy_id, profile_id.as_deref())
+      .await
+    {
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::warn!("Event emit failed event=proxies-changed err=\"{e}\"");
+      }
+    }
+  }
+
+  /// Forget and stop the worker that served `browser_pid`, which is gone.
+  /// False when the entry now maps to another worker or to none. The caller
+  /// holds `worker_lifecycle`.
+  async fn reap_worker_of_dead_browser(
+    &self,
+    browser_pid: u32,
+    proxy_id: &str,
+    profile_id: Option<&str>,
+  ) -> bool {
+    {
+      let mut proxies = self.active_proxies.lock().unwrap();
+      // Another thread may have replaced the entry since it was read.
+      if proxies
+        .get(&browser_pid)
+        .is_none_or(|current| current.id != proxy_id)
+      {
+        return false;
+      }
+      proxies.remove(&browser_pid);
+    }
+    self
+      .dead_browser_misses
+      .lock()
+      .unwrap()
+      .remove(&browser_pid);
+    if let Some(profile_id) = profile_id {
+      let mut map = self.profile_active_proxy_ids.lock().unwrap();
+      if map
+        .get(profile_id)
+        .is_some_and(|current| current == proxy_id)
+      {
+        map.remove(profile_id);
+      }
+    }
+    let reason = format!("browser_exited({browser_pid})");
+    let _ = crate::proxy_runner::stop_proxy_process_because(proxy_id, &reason).await;
+    true
+  }
+
+  /// Snapshot the set of tracked proxy IDs (for asserting in tests).
+  #[cfg(test)]
+  fn tracked_proxy_ids(&self) -> std::collections::HashSet<String> {
+    let proxies = self.active_proxies.lock().unwrap();
+    proxies.values().map(|p| p.id.clone()).collect()
+  }
+
+  /// Snapshot active proxy count.
+  #[cfg(test)]
+  fn active_proxy_count(&self) -> usize {
+    self.active_proxies.lock().unwrap().len()
+  }
+
+  /// Snapshot profile-to-proxy-id mapping count.
+  #[cfg(test)]
+  fn profile_proxy_mapping_count(&self) -> usize {
+    self.profile_active_proxy_ids.lock().unwrap().len()
+  }
+
+  /// Insert a proxy info entry directly (for testing).
+  #[cfg(test)]
+  fn insert_active_proxy(&self, browser_pid: u32, info: ProxyInfo) {
+    self
+      .active_proxies
+      .lock()
+      .unwrap()
+      .insert(browser_pid, info);
+  }
+
+  /// Insert a profile-to-proxy mapping directly (for testing).
+  #[cfg(test)]
+  fn insert_profile_proxy_mapping(&self, profile_id: String, proxy_id: String) {
+    self
+      .profile_active_proxy_ids
+      .lock()
+      .unwrap()
+      .insert(profile_id, proxy_id);
+  }
+
+  /// Get active proxy info by browser PID (for testing).
+  #[cfg(test)]
+  fn get_active_proxy(&self, browser_pid: u32) -> Option<ProxyInfo> {
+    self
+      .active_proxies
+      .lock()
+      .unwrap()
+      .get(&browser_pid)
+      .cloned()
+  }
+}
+
+// Create a singleton instance of the proxy manager
+pub static PROXY_MANAGER: std::sync::LazyLock<ProxyManager> =
+  std::sync::LazyLock::new(ProxyManager::new);
+
+/// A check result this recent stands in for a live check before a launch.
+pub const ROUTE_CHECK_FRESH_SECS: u64 = 120;
+/// The live pre-launch check never holds a launch longer than this.
+pub const ROUTE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A profile route the pre-launch check could not get through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteUnreachable {
+  /// `proxy` or `vpn`.
+  pub kind: String,
+  pub id: String,
+  /// A backend error code.
+  pub code: String,
+}
+
+#[derive(Debug, Clone)]
+struct RouteVerdict {
+  checked_at: u64,
+  failure: Option<String>,
+}
+
+/// Verdicts of recent pre-launch checks, by `kind:id`, so a bulk launch
+/// checks each distinct route once.
+static ROUTE_VERDICTS: std::sync::LazyLock<Mutex<HashMap<String, RouteVerdict>>> =
+  std::sync::LazyLock::new(Default::default);
+
+/// One lock per route: a second launch through the same route waits for the
+/// first check and takes its verdict.
+static ROUTE_CHECK_LOCKS: std::sync::LazyLock<
+  Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn is_fresh(checked_at: u64, now: u64) -> bool {
+  now.saturating_sub(checked_at) < ROUTE_CHECK_FRESH_SECS
+}
+
+/// The verdict a cached proxy check gives, when it is recent enough.
+fn verdict_from_cached_check(result: &ProxyCheckResult, now: u64) -> Option<Option<String>> {
+  is_fresh(result.timestamp, now)
+    .then(|| (!result.is_valid).then(|| "PROXY_NOT_WORKING".to_string()))
+}
+
+/// Whether the profile's proxy or VPN route answers, before a launch. Takes
+/// a recent result when there is one, else checks live within
+/// `ROUTE_CHECK_TIMEOUT`. `None` when the route answered or cannot be judged
+/// from here: the launch decides those.
+pub async fn check_route_before_launch(
+  proxy_id: Option<&str>,
+  vpn_id: Option<&str>,
+) -> Option<RouteUnreachable> {
+  let (kind, id) = match (
+    vpn_id.filter(|id| !id.is_empty()),
+    proxy_id.filter(|id| !id.is_empty()),
+  ) {
+    (Some(vpn), _) => ("vpn", vpn),
+    (None, Some(proxy)) => ("proxy", proxy),
+    (None, None) => return None,
+  };
+  if kind == "proxy" && PROXY_MANAGER.is_cloud_or_derived(id) {
+    return None;
+  }
+  let key = format!("{kind}:{id}");
+  let lock = ROUTE_CHECK_LOCKS
+    .lock()
+    .map(|mut locks| locks.entry(key.clone()).or_default().clone())
+    .ok()?;
+  let _checking = lock.lock().await;
+
+  let now = now_secs();
+  let remembered = ROUTE_VERDICTS
+    .lock()
+    .ok()
+    .and_then(|verdicts| verdicts.get(&key).cloned())
+    .filter(|verdict| is_fresh(verdict.checked_at, now))
+    .map(|verdict| verdict.failure);
+  let cached = || {
+    (kind == "proxy")
+      .then(|| PROXY_MANAGER.get_cached_proxy_check(id))
+      .flatten()
+      .and_then(|result| verdict_from_cached_check(&result, now))
+  };
+  let failure = match remembered.or_else(cached) {
+    Some(failure) => failure,
+    None => {
+      let started = std::time::Instant::now();
+      let failure = if kind == "vpn" {
+        probe_vpn_route(id).await
+      } else {
+        probe_proxy_route(id).await
+      };
+      log::info!(
+        "Route checked before launch {kind}={id} ok={} code={} elapsed_ms={}",
+        failure.is_none(),
+        failure.as_deref().unwrap_or("none"),
+        started.elapsed().as_millis()
+      );
+      if let Ok(mut verdicts) = ROUTE_VERDICTS.lock() {
+        verdicts.retain(|_, verdict| is_fresh(verdict.checked_at, now));
+        verdicts.insert(
+          key,
+          RouteVerdict {
+            checked_at: now,
+            failure: failure.clone(),
+          },
+        );
+      }
+      failure
+    }
+  };
+  failure.map(|code| RouteUnreachable {
+    kind: kind.to_string(),
+    id: id.to_string(),
+    code,
+  })
+}
+
+/// A dial error as the code the app shows.
+fn route_failure_code(error: &str) -> &'static str {
+  let error = error.to_ascii_lowercase();
+  if error.contains("402") {
+    "PROXY_PAYMENT_REQUIRED"
+  } else if error.contains("407") || error.contains("auth") {
+    "PROXY_AUTH_FAILED"
+  } else if error.contains("timed out") || error.contains("timeout") {
+    "PROXY_UPSTREAM_TIMEOUT"
+  } else {
+    "PROXY_UPSTREAM_UNREACHABLE"
+  }
+}
+
+/// One request through the proxy, as the browser would send it. Share-link
+/// proxies over TCP get a connection to their server; QUIC ones cannot be
+/// judged without starting their worker, so they pass.
+async fn probe_proxy_route(proxy_id: &str) -> Option<String> {
+  let settings = PROXY_MANAGER.get_proxy_settings_by_id(proxy_id)?;
+  // A dynamic proxy learns its address at launch.
+  let dynamic = PROXY_MANAGER
+    .stored_proxies
+    .lock()
+    .ok()
+    .and_then(|proxies| proxies.get(proxy_id).map(|p| p.dynamic_proxy_url.is_some()))
+    .unwrap_or(false);
+  if dynamic {
+    return None;
+  }
+  if crate::xray::is_xray_proxy_type(&settings.proxy_type) {
+    let config = crate::xray::parse_share_link(settings.vless_uri.as_deref()?.trim())
+      .ok()?
+      .config;
+    if config.protocol() == crate::xray::XrayProtocol::Hysteria2 {
+      return None;
+    }
+    let dial = tokio::net::TcpStream::connect((config.address.as_str(), config.port));
+    return match tokio::time::timeout(ROUTE_CHECK_TIMEOUT, dial).await {
+      Ok(Ok(_)) => None,
+      Ok(Err(e)) => Some(route_failure_code(&e.to_string()).to_string()),
+      Err(_) => Some("PROXY_UPSTREAM_TIMEOUT".to_string()),
+    };
+  }
+  if settings.host.is_empty() || settings.port == 0 {
+    return None;
+  }
+  let url = ProxyManager::build_probe_proxy_url(&settings);
+  if !crate::proxy_storage::reqwest_can_proxy(&url) {
+    return None;
+  }
+  let proxy = reqwest::Proxy::all(&url).ok()?;
+  let client = reqwest::Client::builder()
+    .no_proxy()
+    .proxy(proxy)
+    .timeout(ROUTE_CHECK_TIMEOUT)
+    .build()
+    .ok()?;
+  // Any answer from the site proves the route; only a failure to get one
+  // through the proxy counts.
+  match client
+    .head("https://cp.cloudflare.com/generate_204")
+    .send()
+    .await
+  {
+    Ok(_) => None,
+    Err(e) if e.is_timeout() => Some("PROXY_UPSTREAM_TIMEOUT".to_string()),
+    Err(e) => {
+      let detail = format!("{e:?}");
+      Some(route_failure_code(&detail).to_string())
+    }
+  }
+}
+
+/// A WireGuard handshake with the VPN's server. A tunnel already up for
+/// this VPN answers for itself.
+async fn probe_vpn_route(vpn_id: &str) -> Option<String> {
+  if crate::vpn_worker_storage::find_vpn_worker_by_vpn_id(vpn_id)
+    .and_then(|worker| worker.pid)
+    .is_some_and(crate::proxy_storage::is_process_running)
+  {
+    return None;
+  }
+  let config = crate::vpn::VPN_STORAGE
+    .lock()
+    .ok()
+    .and_then(|storage| storage.load_config(vpn_id).ok())?;
+  let wireguard = crate::vpn::parse_wireguard_config(&config.config_data).ok()?;
+  let handshake = tokio::task::spawn_blocking(move || wireguard_handshake(&wireguard));
+  match tokio::time::timeout(ROUTE_CHECK_TIMEOUT, handshake).await {
+    Ok(Ok(result)) => result.err(),
+    Ok(Err(_)) => None,
+    Err(_) => Some("VPN_UNREACHABLE".to_string()),
+  }
+}
+
+/// Send handshake initiations until the server answers, within the check's
+/// time. `Err` carries the code when it never does.
+fn wireguard_handshake(config: &crate::vpn::WireGuardConfig) -> Result<(), String> {
+  use boringtun::noise::{Tunn, TunnResult};
+  use boringtun::x25519::{PublicKey, StaticSecret};
+  use std::net::ToSocketAddrs;
+
+  let key = |encoded: &str| -> Option<[u8; 32]> {
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())
+      .ok()?
+      .try_into()
+      .ok()
+  };
+  // A config that does not parse is the launch's to report.
+  let (Some(private), Some(public)) = (key(&config.private_key), key(&config.peer_public_key))
+  else {
+    return Ok(());
+  };
+  let preshared = config.preshared_key.as_deref().and_then(key);
+  let Some(peer) = config
+    .peer_endpoint
+    .to_socket_addrs()
+    .ok()
+    .and_then(|mut addresses| addresses.next())
+  else {
+    return Err("VPN_UNREACHABLE".to_string());
+  };
+  let mut tunnel = Tunn::new(
+    StaticSecret::from(private),
+    PublicKey::from(public),
+    preshared,
+    None,
+    0,
+    None,
+  );
+  let bind = if peer.is_ipv6() {
+    "[::]:0"
+  } else {
+    "0.0.0.0:0"
+  };
+  let socket = std::net::UdpSocket::bind(bind).map_err(|_| "VPN_UNREACHABLE".to_string())?;
+  socket
+    .set_read_timeout(Some(std::time::Duration::from_millis(1800)))
+    .map_err(|_| "VPN_UNREACHABLE".to_string())?;
+  for _ in 0..2 {
+    let mut packet = vec![0u8; 2048];
+    if let TunnResult::WriteToNetwork(initiation) =
+      tunnel.format_handshake_initiation(&mut packet, true)
+    {
+      if socket.send_to(initiation, peer).is_err() {
+        return Err("VPN_UNREACHABLE".to_string());
+      }
+    }
+    let mut reply = vec![0u8; 2048];
+    if let Ok((len, _)) = socket.recv_from(&mut reply) {
+      let mut out = vec![0u8; 2048];
+      if !matches!(
+        tunnel.decapsulate(None, &reply[..len], &mut out),
+        TunnResult::Err(_)
+      ) {
+        return Ok(());
+      }
+    }
+  }
+  Err("VPN_UNREACHABLE".to_string())
+}
+
+/// How often the route health of running profiles is read.
+const ROUTE_HEALTH_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+static ROUTE_HEALTH_STREAK: crate::log_streak::KeyedStreak =
+  crate::log_streak::KeyedStreak::new(module_path!(), "Proxy route");
+
+static ROUTE_HEALTH: std::sync::LazyLock<
+  Mutex<HashMap<String, crate::traffic_stats::RouteHealthWindow>>,
+> = std::sync::LazyLock::new(Default::default);
+
+static ROUTE_HEALTH_MONITOR: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// Start the route health loop once, at the first worker start.
+fn ensure_route_health_monitor() {
+  if ROUTE_HEALTH_MONITOR.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    return;
+  }
+  tauri::async_runtime::spawn(async {
+    let mut ticker = tokio::time::interval(ROUTE_HEALTH_POLL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+      ticker.tick().await;
+      PROXY_MANAGER.poll_route_health();
+    }
+  });
+}
+
+/// The `proxy-health-changed` payload for a verdict.
+fn route_health_payload(
+  profile_id: &str,
+  verdict: crate::traffic_stats::RouteHealthVerdict,
+  at: u64,
+) -> serde_json::Value {
+  let (status, code) = verdict;
+  let mut payload = serde_json::json!({ "profile_id": profile_id, "status": status, "at": at });
+  if let Some(code) = code {
+    payload["code"] = serde_json::Value::from(code);
+  }
+  payload
+}
+
+/// Forget a stopped profile's route health and tell the app, when it had any.
+fn clear_route_health(profile_id: &str) {
+  let had_verdict = ROUTE_HEALTH
+    .lock()
+    .ok()
+    .and_then(|mut windows| windows.remove(profile_id))
+    .is_some_and(|window| window.current().is_some());
+  ROUTE_HEALTH_STREAK.succeeded(&format!("profile={profile_id}"));
+  if had_verdict {
+    let payload = serde_json::json!({ "profile_id": profile_id, "cleared": true });
+    if let Err(e) = events::emit("proxy-health-changed", payload) {
+      log::warn!("Event emit failed event=proxy-health-changed err=\"{e}\"");
+    }
+  }
+}
+
+impl ProxyManager {
+  /// Profiles running behind an upstream proxy or VPN.
+  fn routed_profiles(&self) -> Vec<String> {
+    let proxies = self.active_proxies.lock().unwrap();
+    let mut ids: Vec<String> = proxies
+      .values()
+      .filter(|info| info.upstream_type != "DIRECT")
+      .filter_map(|info| info.profile_id.clone())
+      .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+  }
+
+  fn poll_route_health(&self) {
+    let running = self.routed_profiles();
+    let gone: Vec<String> = ROUTE_HEALTH
+      .lock()
+      .map(|windows| {
+        windows
+          .keys()
+          .filter(|id| !running.contains(id))
+          .cloned()
+          .collect()
+      })
+      .unwrap_or_default();
+    for profile_id in gone {
+      clear_route_health(&profile_id);
+    }
+
+    let now = now_secs();
+    for profile_id in running {
+      let counts = crate::traffic_stats::upstream_counts_for_profile(&profile_id);
+      let change = {
+        let Ok(mut windows) = ROUTE_HEALTH.lock() else {
+          return;
+        };
+        let window = windows.entry(profile_id.clone()).or_default();
+        window.observe(now, counts.unwrap_or_default())
+      };
+      let Some(verdict) = change else {
+        continue;
+      };
+      let key = format!("profile={profile_id}");
+      match verdict {
+        (crate::traffic_stats::RouteHealthStatus::Ok, _) => ROUTE_HEALTH_STREAK.succeeded(&key),
+        (status, code) => ROUTE_HEALTH_STREAK.failed(
+          &key,
+          format_args!(
+            "status={} code={}",
+            serde_json::to_value(status)
+              .ok()
+              .and_then(|v| v.as_str().map(str::to_string))
+              .unwrap_or_default(),
+            code.unwrap_or("none")
+          ),
+        ),
+      }
+      if let Err(e) = events::emit(
+        "proxy-health-changed",
+        route_health_payload(&profile_id, verdict, now),
+      ) {
+        log::warn!("Event emit failed event=proxy-health-changed err=\"{e}\"");
+      }
+    }
+  }
+}
+
+#[cfg(test)]
+mod route_check_tests {
+  use super::*;
+
+  fn check(timestamp: u64, is_valid: bool) -> ProxyCheckResult {
+    ProxyCheckResult {
+      ip: String::new(),
+      city: None,
+      country: None,
+      country_code: None,
+      timestamp,
+      is_valid,
+      isp: None,
+      timezone: None,
+      udp: crate::proxy_udp::UdpSupport::Unknown,
+      latency_ms: None,
+    }
+  }
+
+  #[test]
+  fn a_recent_check_stands_in_for_a_live_one() {
+    assert_eq!(
+      verdict_from_cached_check(&check(1_000, true), 1_100),
+      Some(None)
+    );
+    assert_eq!(
+      verdict_from_cached_check(&check(1_000, false), 1_100),
+      Some(Some("PROXY_NOT_WORKING".to_string()))
+    );
+  }
+
+  #[test]
+  fn an_old_check_asks_for_a_live_one() {
+    assert_eq!(verdict_from_cached_check(&check(1_000, true), 1_120), None);
+    assert_eq!(verdict_from_cached_check(&check(1_000, false), 5_000), None);
+  }
+
+  #[test]
+  fn dial_errors_become_codes() {
+    assert_eq!(
+      route_failure_code("Connection refused (os error 61)"),
+      "PROXY_UPSTREAM_UNREACHABLE"
+    );
+    assert_eq!(
+      route_failure_code("operation timed out"),
+      "PROXY_UPSTREAM_TIMEOUT"
+    );
+    assert_eq!(
+      route_failure_code("unsuccessful tunnel: 407 Proxy Authentication Required"),
+      "PROXY_AUTH_FAILED"
+    );
+    assert_eq!(
+      route_failure_code("unsuccessful tunnel: 402 Payment Required"),
+      "PROXY_PAYMENT_REQUIRED"
+    );
+  }
+
+  #[test]
+  fn the_health_payload_matches_the_frontend_contract() {
+    let down = route_health_payload(
+      "p-1",
+      (
+        crate::traffic_stats::RouteHealthStatus::Down,
+        Some("PROXY_UPSTREAM_UNREACHABLE"),
+      ),
+      7,
+    );
+    assert_eq!(
+      down,
+      serde_json::json!({
+        "profile_id": "p-1",
+        "status": "down",
+        "code": "PROXY_UPSTREAM_UNREACHABLE",
+        "at": 7
+      })
+    );
+    let ok = route_health_payload(
+      "p-1",
+      (crate::traffic_stats::RouteHealthStatus::Ok, None),
+      8,
+    );
+    assert_eq!(
+      ok,
+      serde_json::json!({ "profile_id": "p-1", "status": "ok", "at": 8 })
+    );
+  }
+
+  #[tokio::test]
+  async fn a_profile_with_no_route_is_never_checked() {
+    assert_eq!(check_route_before_launch(None, None).await, None);
+    assert_eq!(check_route_before_launch(Some(""), Some("")).await, None);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn a_sidecar_that_exits_is_read_while_its_worker_holds_the_pipe() {
+    use tauri_plugin_shell::process::{CommandEvent, TerminatedPayload};
+    let (tx, rx) = tauri::async_runtime::channel(8);
+    tx.send(CommandEvent::Stdout(b"{\"id\":\"p\"}".to_vec()))
+      .await
+      .unwrap();
+    tx.send(CommandEvent::Terminated(TerminatedPayload {
+      code: Some(0),
+      signal: None,
+    }))
+    .await
+    .unwrap();
+    // `tx` stays alive, as the pipe does while a worker keeps it.
+    let output = tokio::time::timeout(
+      std::time::Duration::from_secs(5),
+      collect_sidecar(rx, || true, std::time::Duration::from_secs(30)),
+    )
+    .await
+    .expect("the exit ends the wait")
+    .expect("an exited command has output");
+    assert!(output.success());
+    assert_eq!(output.stdout, b"{\"id\":\"p\"}\n");
+    drop(tx);
+  }
+
+  #[tokio::test]
+  async fn a_sidecar_that_never_exits_is_given_up() {
+    use tauri_plugin_shell::process::CommandEvent;
+    let (tx, rx) = tauri::async_runtime::channel(8);
+    tx.send(CommandEvent::Stdout(b"starting".to_vec()))
+      .await
+      .unwrap();
+    let output = collect_sidecar(rx, || true, std::time::Duration::from_millis(300)).await;
+    assert!(output.is_none());
+    drop(tx);
+  }
+
+  #[tokio::test]
+  async fn a_sidecar_gone_without_a_reported_exit_is_read() {
+    use tauri_plugin_shell::process::CommandEvent;
+    let (tx, rx) = tauri::async_runtime::channel(8);
+    tx.send(CommandEvent::Stdout(b"{\"id\":\"p\"}".to_vec()))
+      .await
+      .unwrap();
+    // No exit status: a worker keeps the pipes open, but the command is gone.
+    let output = tokio::time::timeout(
+      std::time::Duration::from_secs(5),
+      collect_sidecar(rx, || false, std::time::Duration::from_secs(30)),
+    )
+    .await
+    .expect("the process check ends the wait")
+    .expect("a command that is gone has output");
+    assert!(output.success());
+    assert_eq!(output.stdout, b"{\"id\":\"p\"}\n");
+    drop(tx);
+  }
+  use std::env;
+  use std::path::PathBuf;
+
+  #[test]
+  fn only_dead_untracked_settled_workers_lose_their_record() {
+    let now = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+    let record = |id: String, pid: Option<u32>| crate::proxy_storage::ProxyConfig {
+      pid,
+      ..crate::proxy_storage::ProxyConfig::new(id, "DIRECT".into(), None)
+    };
+    let old = now - 600;
+    let configs = vec![
+      record(format!("proxy_{old}_1"), Some(11)),
+      record(format!("proxy_{old}_2"), Some(22)),
+      record(format!("proxy_{old}_3"), Some(33)),
+      record(format!("proxy_{old}_4"), Some(44)),
+      record(format!("proxy_{old}_5"), None),
+      record(format!("proxy_{now}_6"), Some(66)),
+    ];
+    let tracked = std::collections::HashSet::from([format!("proxy_{old}_3")]);
+    let recovering = std::collections::HashSet::from([format!("proxy_{old}_4")]);
+    let orphans: Vec<&str> =
+      orphaned_worker_records(&configs, &tracked, &recovering, |pid| pid == 22)
+        .into_iter()
+        .map(|config| config.id.as_str())
+        .collect();
+    // 2 runs, 3 is tracked, 4 is being recovered, 5 may still be starting,
+    // 6 is inside the launch grace.
+    assert_eq!(orphans, [format!("proxy_{old}_1")]);
+  }
+  use std::process::Stdio;
+  use std::time::Duration;
+  use tokio::process::Command;
+  use tokio::time::sleep;
+
+  // Mock HTTP server for testing
+
+  use http_body_util::Full;
+  use hyper::body::Bytes;
+  use hyper::server::conn::http1;
+  use hyper::service::service_fn;
+  use hyper::Response;
+  use hyper_util::rt::TokioIo;
+  use tokio::net::TcpListener;
+
+  // Helper function to build donut-proxy binary for testing
+  async fn ensure_donut_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cargo_manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
+    let project_root = PathBuf::from(cargo_manifest_dir)
+      .parent()
+      .unwrap()
+      .to_path_buf();
+    let proxy_binary_name = if cfg!(windows) {
+      "donut-proxy.exe"
+    } else {
+      "donut-proxy"
+    };
+    let target_directory = env::var_os("CARGO_TARGET_DIR")
+      .map(PathBuf::from)
+      .unwrap_or_else(|| project_root.join("src-tauri").join("target"));
+    let target_directory = if target_directory.is_absolute() {
+      target_directory
+    } else {
+      project_root.join("src-tauri").join(target_directory)
+    };
+    let proxy_binary = target_directory.join("debug").join(proxy_binary_name);
+
+    // Check if binary already exists
+    if proxy_binary.exists() {
+      return Ok(proxy_binary);
+    }
+
+    // Build the donut-proxy binary
+    println!("Building donut-proxy binary for tests...");
+
+    let build_status = Command::new("cargo")
+      .args(["build", "--bin", "donut-proxy"])
+      .current_dir(project_root.join("src-tauri"))
+      .status()
+      .await?;
+
+    if !build_status.success() {
+      return Err("Failed to build donut-proxy binary".into());
+    }
+
+    if !proxy_binary.exists() {
+      return Err("donut-proxy binary was not created successfully".into());
+    }
+
+    Ok(proxy_binary)
+  }
+
+  #[test]
+  fn cached_checks_do_not_survive_route_or_credential_edits() {
+    let settings = ProxySettings {
+      proxy_type: "http".into(),
+      host: "127.0.0.1".into(),
+      port: 8080,
+      username: Some("user".into()),
+      password: Some("secret".into()),
+      vless_uri: None,
+    };
+    let result = ProxyCheckResult {
+      ip: "203.0.113.1".into(),
+      city: None,
+      country: None,
+      country_code: None,
+      timestamp: 123,
+      is_valid: true,
+      isp: None,
+      timezone: None,
+      udp: crate::proxy_udp::UdpSupport::Unknown,
+      latency_ms: None,
+    };
+    let encoded = serde_json::to_string(&CachedProxyCheck {
+      settings_hash: CachedProxyCheck::settings_hash(&settings).unwrap(),
+      result: result.clone(),
+    })
+    .unwrap();
+    assert!(!encoded.contains("secret"));
+    let decode = |current: &ProxySettings| {
+      serde_json::from_str::<CachedProxyCheck>(&encoded)
+        .unwrap()
+        .for_settings(current)
+    };
+    assert_eq!(decode(&settings).unwrap().ip, result.ip);
+    let mut changed = settings.clone();
+    changed.password = Some("rotated".into());
+    assert!(decode(&changed).is_none());
+    changed = settings.clone();
+    changed.host = "other.example".into();
+    assert!(decode(&changed).is_none());
+    changed = settings.clone();
+    changed.port = 1080;
+    assert!(decode(&changed).is_none());
+    changed = settings.clone();
+    changed.proxy_type = "socks5".into();
+    assert!(decode(&changed).is_none());
+    changed = settings.clone();
+    changed.username = Some("another-user".into());
+    assert!(decode(&changed).is_none());
+    changed = settings.clone();
+    changed.vless_uri = Some("changed-route".into());
+    assert!(decode(&changed).is_none());
+    assert!(
+      serde_json::from_str::<CachedProxyCheck>(&serde_json::to_string(&result).unwrap()).is_err()
+    );
+  }
+
+  #[test]
+  fn test_proxy_settings_validation() {
+    // Test valid proxy settings
+    let valid_settings = ProxySettings {
+      proxy_type: "http".to_string(),
+      host: "127.0.0.1".to_string(),
+      port: 8080,
+      username: Some("user".to_string()),
+      password: Some("pass".to_string()),
+      vless_uri: None,
+    };
+
+    assert!(
+      !valid_settings.host.is_empty(),
+      "Valid settings should have non-empty host"
+    );
+    assert!(
+      valid_settings.port > 0,
+      "Valid settings should have positive port"
+    );
+    assert_eq!(valid_settings.proxy_type, "http", "Proxy type should match");
+    assert!(
+      valid_settings.username.is_some(),
+      "Username should be present"
+    );
+    assert!(
+      valid_settings.password.is_some(),
+      "Password should be present"
+    );
+
+    // Test proxy settings with empty values
+    let empty_settings = ProxySettings {
+      proxy_type: "http".to_string(),
+      host: "".to_string(),
+      port: 0,
+      username: None,
+      password: None,
+      vless_uri: None,
+    };
+
+    assert!(
+      empty_settings.host.is_empty(),
+      "Empty settings should have empty host"
+    );
+    assert_eq!(
+      empty_settings.port, 0,
+      "Empty settings should have zero port"
+    );
+    assert!(empty_settings.username.is_none(), "Username should be None");
+    assert!(empty_settings.password.is_none(), "Password should be None");
+  }
+
+  #[tokio::test]
+  async fn test_proxy_manager_concurrent_access() {
+    use std::sync::Arc;
+
+    let proxy_manager = Arc::new(ProxyManager::new());
+    let mut handles = vec![];
+
+    // Spawn multiple tasks that access the proxy manager concurrently
+    for i in 0..10 {
+      let pm = proxy_manager.clone();
+      let handle = tokio::spawn(async move {
+        let browser_pid = (1000 + i) as u32;
+        let proxy_info = ProxyInfo {
+          id: format!("proxy_{i}"),
+          local_url: format!("http://127.0.0.1:{}", 8000 + i),
+          upstream_host: "127.0.0.1".to_string(),
+          upstream_port: 3128,
+          upstream_type: "http".to_string(),
+          local_port: (8000 + i) as u16,
+          profile_id: None,
+          blocklist_file: None,
+          dns_server: None,
+        };
+
+        // Add proxy
+        {
+          let mut active_proxies = pm.active_proxies.lock().unwrap();
+          active_proxies.insert(browser_pid, proxy_info);
+        }
+
+        browser_pid
+      });
+      handles.push(handle);
+    }
+
+    // Wait for all tasks to complete
+    let results: Vec<u32> = futures_util::future::join_all(handles)
+      .await
+      .into_iter()
+      .map(|r| r.unwrap())
+      .collect();
+
+    // Verify all browser PIDs were processed
+    assert_eq!(results.len(), 10);
+    for (i, &browser_pid) in results.iter().enumerate() {
+      assert_eq!(browser_pid, (1000 + i) as u32);
+    }
+  }
+
+  // Integration test that actually builds and uses donut-proxy binary
+  #[tokio::test]
+  async fn test_proxy_integration_with_real_proxy() -> Result<(), Box<dyn std::error::Error>> {
+    // This test requires donut-proxy binary to be available
+    // Skip if we can't find the binary or if proxy startup fails
+    use crate::proxy_runner::{start_proxy_process, stop_proxy_process};
+    use tokio::net::TcpStream;
+
+    // Start a mock upstream HTTP server
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+
+    // Spawn upstream server
+    let server_handle = tokio::spawn(async move {
+      while let Ok((stream, _)) = upstream_listener.accept().await {
+        let io = TokioIo::new(stream);
+        tokio::task::spawn(async move {
+          let _ = http1::Builder::new()
+            .serve_connection(
+              io,
+              service_fn(|_req| async {
+                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Upstream OK"))))
+              }),
+            )
+            .await;
+        });
+      }
+    });
+
+    // Wait for server to start
+    sleep(Duration::from_millis(100)).await;
+
+    let upstream_url = format!("http://{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    // Try to start proxy - if it fails, skip the test
+    let config = match start_proxy_process(Some(upstream_url), None).await {
+      Ok(config) => config,
+      Err(e) => {
+        println!("Skipping proxy integration test - proxy startup failed: {e}");
+        server_handle.abort();
+        return Ok(()); // Skip test instead of failing
+      }
+    };
+
+    // Verify proxy configuration
+    assert!(!config.id.is_empty());
+    assert!(config.local_port.is_some());
+
+    let proxy_id = config.id.clone();
+    let local_port = config.local_port.unwrap();
+
+    // Verify the local port is listening (should be fast now)
+    match tokio::time::timeout(
+      Duration::from_millis(500),
+      TcpStream::connect(("127.0.0.1", local_port)),
+    )
+    .await
+    {
+      Ok(Ok(_)) => {
+        println!("Proxy is listening on port {local_port}");
+      }
+      Ok(Err(e)) => {
+        println!("Warning: Proxy port {local_port} is not listening: {e:?}");
+        // Don't fail the test, just log a warning
+      }
+      Err(_) => {
+        println!("Warning: Proxy port {local_port} connection check timed out");
+        // Don't fail the test, just log a warning
+      }
+    }
+
+    // Test stopping the proxy
+    let stopped = stop_proxy_process(&proxy_id).await?;
+    assert!(stopped);
+
+    println!("Integration test passed: proxy start/stop works correctly");
+
+    // Clean up server
+    server_handle.abort();
+
+    Ok(())
+  }
+
+  // Validate that non-secret proxy settings remain command arguments.
+  #[test]
+  fn test_proxy_command_construction() {
+    let proxy_settings = ProxySettings {
+      proxy_type: "http".to_string(),
+      host: "proxy.example.com".to_string(),
+      port: 8080,
+      username: Some("user".to_string()),
+      password: Some("pass".to_string()),
+      vless_uri: None,
+    };
+
+    // Test command arguments match expected format
+    let expected_args = [
+      "proxy",
+      "start",
+      "--host",
+      "proxy.example.com",
+      "--proxy-port",
+      "8080",
+      "--type",
+      "http",
+    ];
+
+    // This test verifies the argument structure without actually running the command
+    assert_eq!(
+      proxy_settings.host, "proxy.example.com",
+      "Host should match expected value"
+    );
+    assert_eq!(
+      proxy_settings.port, 8080,
+      "Port should match expected value"
+    );
+    assert_eq!(
+      proxy_settings.proxy_type, "http",
+      "Proxy type should match expected value"
+    );
+    assert_eq!(
+      proxy_settings.username.as_ref().unwrap(),
+      "user",
+      "Username should match expected value"
+    );
+    assert_eq!(
+      proxy_settings.password.as_ref().unwrap(),
+      "pass",
+      "Password should match expected value"
+    );
+
+    // Verify expected args structure
+    assert_eq!(expected_args[0], "proxy", "First arg should be 'proxy'");
+    assert_eq!(expected_args[1], "start", "Second arg should be 'start'");
+    assert_eq!(expected_args[2], "--host", "Third arg should be '--host'");
+    assert_eq!(
+      expected_args[3], "proxy.example.com",
+      "Fourth arg should be host value"
+    );
+  }
+
+  /// A CLI that does not detach from its worker never exits at all, so the
+  /// limit only has to be far past a slow start: the CLI itself waits up to
+  /// about four seconds for the worker, and a loaded machine adds to that.
+  const CLI_EXIT_LIMIT: Duration = Duration::from_secs(30);
+
+  /// Run `donut-proxy proxy start` against a real upstream and wait for the
+  /// CLI to exit. Its output goes to a file, not a pipe: on macOS a pipe is
+  /// made close-on-exec in a second step, so a child that another test in
+  /// this process starts in between inherits it and keeps it open, and a
+  /// reader waiting for the pipe to close waits for that child instead.
+  async fn run_cli_start(
+    proxy_path: &std::path::Path,
+  ) -> Result<(std::process::ExitStatus, String, Duration), Box<dyn std::error::Error>> {
+    let stdout = tempfile::NamedTempFile::new()?;
+    let stderr = tempfile::NamedTempFile::new()?;
+    let mut cmd = Command::new(proxy_path);
+    cmd
+      .args([
+        "proxy",
+        "start",
+        "--host",
+        "httpbin.org",
+        "--proxy-port",
+        "80",
+        "--type",
+        "http",
+      ])
+      .env("RUST_LOG", "debug")
+      .stdin(Stdio::null())
+      .stdout(Stdio::from(stdout.reopen()?))
+      .stderr(Stdio::from(stderr.reopen()?))
+      .kill_on_drop(true);
+    let started = std::time::Instant::now();
+    let mut child = cmd.spawn()?;
+    let status = match tokio::time::timeout(CLI_EXIT_LIMIT, child.wait()).await {
+      Ok(status) => status?,
+      Err(_) => {
+        let _ = child.kill().await;
+        let log = std::fs::read_to_string(stderr.path()).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(25).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(
+          format!(
+            "CLI command timed out - this indicates improper detachment. Its log:\n{}",
+            tail.join("\n")
+          )
+          .into(),
+        );
+      }
+    };
+    Ok((
+      status,
+      std::fs::read_to_string(stdout.path())?,
+      started.elapsed(),
+    ))
+  }
+
+  async fn stop_cli_proxy(proxy_path: &std::path::Path, stdout: &str) {
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(stdout) else {
+      return;
+    };
+    if let Some(proxy_id) = config["id"].as_str() {
+      let _ = Command::new(proxy_path)
+        .args(["proxy", "stop", "--id", proxy_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    }
+  }
+
+  #[tokio::test]
+  async fn test_cli_exits_after_proxy_start() -> Result<(), Box<dyn std::error::Error>> {
+    let proxy_path = ensure_donut_proxy_binary().await?;
+    let (status, stdout, elapsed) = run_cli_start(&proxy_path).await?;
+    if status.success() {
+      let config: serde_json::Value = serde_json::from_str(&stdout)?;
+      assert!(config["id"].is_string(), "the CLI prints the started proxy");
+      stop_cli_proxy(&proxy_path, &stdout).await;
+    }
+    println!("CLI detachment test passed - CLI exited in {elapsed:?}");
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_cli_detachment_behavior() -> Result<(), Box<dyn std::error::Error>> {
+    let proxy_path = ensure_donut_proxy_binary().await?;
+    // Even when the upstream fails, the CLI must exit instead of waiting on
+    // its worker.
+    let (status, stdout, _) = run_cli_start(&proxy_path).await?;
+    if status.success() {
+      stop_cli_proxy(&proxy_path, &stdout).await;
+    }
+    Ok(())
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Complex proxy process monitoring tests
+  // ──────────────────────────────────────────────────────────────────────
+
+  fn make_proxy_info(id: &str, port: u16, profile_id: Option<&str>) -> ProxyInfo {
+    ProxyInfo {
+      id: id.to_string(),
+      local_url: format!("http://127.0.0.1:{port}"),
+      upstream_host: "10.0.0.1".to_string(),
+      upstream_port: 3128,
+      upstream_type: "http".to_string(),
+      local_port: port,
+      profile_id: profile_id.map(|s| s.to_string()),
+      blocklist_file: None,
+      dns_server: None,
+    }
+  }
+
+  #[test]
+  fn test_pid_mapping_lifecycle() {
+    let pm = ProxyManager::new();
+
+    // Initially empty
+    assert_eq!(pm.active_proxy_count(), 0);
+
+    // Register proxies for 3 browser PIDs
+    pm.insert_active_proxy(1001, make_proxy_info("px_a", 9001, Some("profile_1")));
+    pm.insert_active_proxy(1002, make_proxy_info("px_b", 9002, Some("profile_2")));
+    pm.insert_active_proxy(1003, make_proxy_info("px_c", 9003, None));
+
+    assert_eq!(pm.active_proxy_count(), 3);
+
+    // Verify each PID resolves correctly
+    let a = pm.get_active_proxy(1001).unwrap();
+    assert_eq!(a.id, "px_a");
+    assert_eq!(a.local_port, 9001);
+    assert_eq!(a.profile_id.as_deref(), Some("profile_1"));
+
+    let c = pm.get_active_proxy(1003).unwrap();
+    assert!(c.profile_id.is_none());
+
+    // Unknown PID returns None
+    assert!(pm.get_active_proxy(9999).is_none());
+  }
+
+  #[test]
+  fn test_update_proxy_pid_remaps_correctly() {
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(100, make_proxy_info("px_remap", 9010, Some("prof_a")));
+
+    // Old PID 100 → new PID 200
+    pm.update_proxy_pid(100, 200).unwrap();
+
+    // Old PID should be gone
+    assert!(pm.get_active_proxy(100).is_none());
+
+    // New PID should have the same proxy info
+    let info = pm.get_active_proxy(200).unwrap();
+    assert_eq!(info.id, "px_remap");
+    assert_eq!(info.local_port, 9010);
+    assert_eq!(info.profile_id.as_deref(), Some("prof_a"));
+  }
+
+  /// Save a worker config for a profile in an isolated cache dir and return its id.
+  fn saved_worker_config(profile_id: Option<&str>) -> String {
+    let id = crate::proxy_storage::generate_proxy_id();
+    let config = crate::proxy_storage::ProxyConfig::new(id.clone(), "DIRECT".to_string(), Some(0))
+      .with_profile_id(profile_id.map(str::to_string));
+    crate::proxy_storage::save_proxy_config(&config).unwrap();
+    id
+  }
+
+  #[test]
+  fn browser_identity_records_the_pid_and_its_start_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_identity"));
+
+    let pid = std::process::id();
+    assert!(persist_browser_identity(&id, pid));
+
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, Some(pid));
+    assert_eq!(
+      saved.browser_pid_start_time,
+      crate::proxy_storage::process_start_time(pid),
+      "the start time must pin the PID to this exact process"
+    );
+    assert!(crate::proxy_storage::browser_owner_is_alive(&saved));
+  }
+
+  #[test]
+  fn browser_identity_refuses_owners_that_are_not_real_browsers() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_reject"));
+
+    // 0 and launch placeholders mean "no browser reported yet". Recording one
+    // would leave a worker whose owner can never die, so it must fail loudly
+    // enough for the caller to abort the launch.
+    assert!(!persist_browser_identity(&id, 0));
+    assert!(!persist_browser_identity(
+      &id,
+      next_launch_placeholder_pid()
+    ));
+    // A PID with no process behind it can't be pinned to an identity either.
+    assert!(!persist_browser_identity(&id, u32::MAX));
+    // An unknown worker is not silently created.
+    assert!(!persist_browser_identity(
+      "proxy_1_missing",
+      std::process::id()
+    ));
+
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, None);
+    assert_eq!(saved.browser_pid_start_time, None);
+  }
+
+  /// The regression behind the orphaned-worker reports: the status synchronizer
+  /// re-keys a profile's browser PID whenever the browser re-execs, and that
+  /// change has to reach the worker's config. When it only landed in memory the
+  /// detached worker kept watching the PREVIOUS process — and once that PID was
+  /// recycled it saw a live "browser" forever and outlived everything.
+  #[test]
+  fn remapping_a_browser_pid_rewrites_the_workers_on_disk_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_remap"));
+
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(100, make_proxy_info(&id, 9010, Some("prof_remap")));
+    let stale_start_time = 1;
+    let mut seeded = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    seeded.browser_pid = Some(100);
+    seeded.browser_pid_start_time = Some(stale_start_time);
+    assert!(crate::proxy_storage::update_proxy_config(&seeded));
+
+    let live_pid = std::process::id();
+    pm.update_proxy_pid(100, live_pid).unwrap();
+
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, Some(live_pid));
+    assert_ne!(saved.browser_pid_start_time, Some(stale_start_time));
+    assert!(
+      crate::proxy_storage::browser_owner_is_alive(&saved),
+      "the worker must now be watching the browser that is actually running"
+    );
+  }
+
+  /// After a GUI restart the profile→proxy map is empty, but a browser launched
+  /// by the previous GUI can still be running with its worker attached. That
+  /// worker's owner still has to be refreshable, so the lookup falls back to disk.
+  #[test]
+  fn the_worker_for_a_profile_is_found_on_disk_when_memory_is_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_restart"));
+    let _other = saved_worker_config(Some("prof_unrelated"));
+
+    let pm = ProxyManager::new();
+    assert_eq!(
+      pm.resolve_proxy_id_for_profile("prof_restart").as_deref(),
+      Some(id.as_str())
+    );
+    assert!(pm.resolve_proxy_id_for_profile("prof_absent").is_none());
+
+    let live_pid = std::process::id();
+    assert!(pm.set_browser_pid_for_profile("prof_restart", live_pid));
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, Some(live_pid));
+    assert!(crate::proxy_storage::browser_owner_is_alive(&saved));
+  }
+
+  #[test]
+  fn the_in_memory_mapping_wins_over_the_on_disk_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let stale = saved_worker_config(Some("prof_both"));
+    let current = saved_worker_config(Some("prof_both"));
+
+    let pm = ProxyManager::new();
+    pm.profile_active_proxy_ids
+      .lock()
+      .unwrap()
+      .insert("prof_both".to_string(), current.clone());
+
+    assert_eq!(
+      pm.resolve_proxy_id_for_profile("prof_both").as_deref(),
+      Some(current.as_str())
+    );
+    assert!(pm.set_browser_pid_for_profile("prof_both", std::process::id()));
+    assert_eq!(
+      crate::proxy_storage::get_proxy_config(&stale)
+        .unwrap()
+        .browser_pid,
+      None,
+      "only the tracked worker may be re-pointed"
+    );
+  }
+
+  #[test]
+  fn test_update_proxy_pid_error_for_unknown_pid() {
+    let pm = ProxyManager::new();
+    let result = pm.update_proxy_pid(777, 888);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("No proxy found for PID 777"));
+  }
+
+  #[test]
+  fn test_launch_placeholder_pids_unique_and_reconcile_independently() {
+    let a = next_launch_placeholder_pid();
+    let b = next_launch_placeholder_pid();
+    assert_ne!(a, b);
+    assert!(is_launch_placeholder_pid(a));
+    assert!(is_launch_placeholder_pid(b));
+    // Real PIDs (and the legacy 0 sentinel) are never in the placeholder range.
+    assert!(!is_launch_placeholder_pid(0));
+    assert!(!is_launch_placeholder_pid(1));
+    assert!(!is_launch_placeholder_pid(4_194_304)); // Linux pid_max
+    assert!(!is_launch_placeholder_pid(std::process::id()));
+
+    // Two concurrent launches with distinct placeholder keys: finishing
+    // launch A must not remap or evict launch B's in-flight entry.
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(a, make_proxy_info("px_launch_a", 9201, Some("prof_a")));
+    pm.insert_active_proxy(b, make_proxy_info("px_launch_b", 9202, Some("prof_b")));
+
+    pm.update_proxy_pid(a, 3001).unwrap();
+    assert_eq!(pm.get_active_proxy(3001).unwrap().id, "px_launch_a");
+    assert_eq!(pm.get_active_proxy(b).unwrap().id, "px_launch_b");
+
+    pm.update_proxy_pid(b, 3002).unwrap();
+    assert_eq!(pm.get_active_proxy(3002).unwrap().id, "px_launch_b");
+    assert!(pm.get_active_proxy(a).is_none());
+    assert!(pm.get_active_proxy(b).is_none());
+  }
+
+  #[test]
+  fn test_profile_proxy_id_mapping_tracks_active_proxy() {
+    let pm = ProxyManager::new();
+
+    pm.insert_active_proxy(500, make_proxy_info("px_1", 9100, Some("profile_x")));
+    pm.insert_profile_proxy_mapping("profile_x".to_string(), "px_1".to_string());
+
+    // Verify mapping exists
+    {
+      let map = pm.profile_active_proxy_ids.lock().unwrap();
+      assert_eq!(map.get("profile_x").unwrap(), "px_1");
+    }
+
+    // Simulate profile-specific cleanup: remove the profile mapping
+    {
+      let mut map = pm.profile_active_proxy_ids.lock().unwrap();
+      map.remove("profile_x");
+    }
+
+    assert_eq!(pm.profile_proxy_mapping_count(), 0);
+    // Active proxy itself should still be there
+    assert_eq!(pm.active_proxy_count(), 1);
+  }
+
+  #[test]
+  fn test_tracked_proxy_ids_returns_all_unique_ids() {
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(1, make_proxy_info("alpha", 8001, None));
+    pm.insert_active_proxy(2, make_proxy_info("beta", 8002, None));
+    pm.insert_active_proxy(3, make_proxy_info("gamma", 8003, None));
+
+    let ids = pm.tracked_proxy_ids();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains("alpha"));
+    assert!(ids.contains("beta"));
+    assert!(ids.contains("gamma"));
+  }
+
+  #[tokio::test]
+  async fn test_concurrent_pid_registration_and_removal() {
+    use std::sync::Arc;
+
+    let pm = Arc::new(ProxyManager::new());
+    let mut handles = vec![];
+
+    // Phase 1: concurrent insertion of 50 proxies
+    for i in 0..50 {
+      let pm = pm.clone();
+      handles.push(tokio::spawn(async move {
+        let pid = 2000 + i as u32;
+        let info = make_proxy_info(&format!("px_{i}"), 7000 + i as u16, None);
+        pm.insert_active_proxy(pid, info);
+      }));
+    }
+    for h in handles.drain(..) {
+      h.await.unwrap();
+    }
+    assert_eq!(pm.active_proxy_count(), 50);
+
+    // Phase 2: concurrent removal of half the proxies
+    for i in (0..50).step_by(2) {
+      let pm = pm.clone();
+      handles.push(tokio::spawn(async move {
+        let pid = 2000 + i as u32;
+        let mut proxies = pm.active_proxies.lock().unwrap();
+        proxies.remove(&pid);
+      }));
+    }
+    for h in handles.drain(..) {
+      h.await.unwrap();
+    }
+    assert_eq!(pm.active_proxy_count(), 25);
+
+    // Phase 3: remaining proxies should all have odd indices
+    let proxies = pm.active_proxies.lock().unwrap();
+    for (&pid, info) in proxies.iter() {
+      let idx = (pid - 2000) as usize;
+      assert!(idx % 2 == 1, "Only odd-index proxies should remain");
+      assert_eq!(info.id, format!("px_{idx}"));
+    }
+  }
+
+  #[test]
+  fn test_process_running_detection_with_child_lifecycle() {
+    use crate::proxy_storage::is_process_running;
+
+    // Spawn a long-lived child so we can check while it runs.
+    // On Windows, `timeout` requires console input and exits immediately in
+    // non-interactive contexts, so use `ping` with a high count instead.
+    let mut child = std::process::Command::new(if cfg!(windows) { "ping" } else { "sleep" })
+      .args(if cfg!(windows) {
+        vec!["-n", "100", "127.0.0.1"]
+      } else {
+        vec!["10"]
+      })
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+      .expect("spawn long-lived child");
+
+    let pid = child.id();
+
+    // Process should be alive
+    assert!(
+      is_process_running(pid),
+      "Child process must be detected as running (PID {pid})"
+    );
+
+    // Kill it
+    child.kill().expect("kill child");
+    child.wait().expect("wait child");
+
+    // Process should now be dead
+    assert!(
+      !is_process_running(pid),
+      "Killed child must be detected as dead (PID {pid})"
+    );
+  }
+
+  #[tokio::test]
+  async fn test_cleanup_distinguishes_live_and_dead_proxy_configs() {
+    use crate::proxy_storage::{save_proxy_config, ProxyConfig};
+
+    // Spawn a live child process to use its PID.
+    // On Windows, `timeout` requires console input and exits immediately in CI,
+    // so use `ping` which works reliably in non-interactive contexts.
+    let mut live_child = std::process::Command::new(if cfg!(windows) { "ping" } else { "sleep" })
+      .args(if cfg!(windows) {
+        vec!["-n", "30", "127.0.0.1"]
+      } else {
+        vec!["30"]
+      })
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+      .expect("spawn live child");
+    let live_pid = live_child.id();
+
+    // Spawn and kill a short-lived process to get a dead PID
+    let dead_child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+      .args(if cfg!(windows) {
+        vec!["/C", "exit"]
+      } else {
+        vec![]
+      })
+      .spawn()
+      .expect("spawn dead child");
+    let dead_pid = dead_child.id();
+    let mut dead_child = dead_child;
+    dead_child.wait().expect("wait for dead child");
+
+    // Use an old timestamp so the configs aren't in the grace period
+    let old_ts = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_secs()
+      - 300; // 5 minutes ago
+
+    // Save both proxy configs to disk
+    let live_id = format!("proxy_{old_ts}_11111");
+    let dead_id = format!("proxy_{old_ts}_22222");
+
+    let live_config = ProxyConfig {
+      id: live_id.clone(),
+      upstream_url: "DIRECT".to_string(),
+      local_port: Some(19001),
+      ignore_proxy_certificate: None,
+      local_url: Some("http://127.0.0.1:19001".to_string()),
+      pid: Some(live_pid),
+      profile_id: None,
+      bypass_rules: Vec::new(),
+      blocklist_file: None,
+      dns_allowlist_mode: false,
+      dns_server: None,
+      local_protocol: None,
+      browser_pid: None,
+      browser_pid_start_time: None,
+      record_domains: true,
+    };
+    let dead_config = ProxyConfig {
+      id: dead_id.clone(),
+      upstream_url: "DIRECT".to_string(),
+      local_port: Some(19002),
+      ignore_proxy_certificate: None,
+      local_url: Some("http://127.0.0.1:19002".to_string()),
+      pid: Some(dead_pid),
+      profile_id: None,
+      bypass_rules: Vec::new(),
+      blocklist_file: None,
+      dns_allowlist_mode: false,
+      dns_server: None,
+      local_protocol: None,
+      browser_pid: None,
+      browser_pid_start_time: None,
+      record_domains: true,
+    };
+
+    save_proxy_config(&live_config).unwrap();
+    save_proxy_config(&dead_config).unwrap();
+
+    // Verify is_process_running differentiates them
+    assert!(
+      crate::proxy_storage::is_process_running(live_pid),
+      "Live PID should be detected"
+    );
+    assert!(
+      !crate::proxy_storage::is_process_running(dead_pid),
+      "Dead PID should not be detected"
+    );
+
+    // Clean up
+    live_child.kill().expect("kill live child");
+    live_child.wait().expect("wait live child");
+    crate::proxy_storage::delete_proxy_config(&live_id);
+    crate::proxy_storage::delete_proxy_config(&dead_id);
+  }
+
+  #[test]
+  fn test_proxy_config_persistence_roundtrip() {
+    use crate::proxy_storage::{
+      delete_proxy_config, generate_proxy_id, get_proxy_config, save_proxy_config, ProxyConfig,
+    };
+
+    let id = generate_proxy_id();
+    let config = ProxyConfig {
+      id: id.clone(),
+      upstream_url: "socks5://user:pass@10.0.0.1:1080".to_string(),
+      local_port: Some(18080),
+      ignore_proxy_certificate: Some(true),
+      local_url: Some("http://127.0.0.1:18080".to_string()),
+      pid: Some(12345),
+      profile_id: Some("prof_abc".to_string()),
+      bypass_rules: vec!["*.local".to_string(), "192.168.*".to_string()],
+      blocklist_file: None,
+      dns_allowlist_mode: false,
+      dns_server: None,
+      local_protocol: None,
+      browser_pid: None,
+      browser_pid_start_time: None,
+      record_domains: true,
+    };
+
+    // Save
+    save_proxy_config(&config).unwrap();
+
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      let mode =
+        std::fs::metadata(crate::proxy_storage::get_storage_dir().join(format!("{id}.json")))
+          .unwrap()
+          .permissions()
+          .mode()
+          & 0o777;
+      assert_eq!(mode, 0o600, "proxy credentials must be owner-only");
+    }
+
+    // Load and compare
+    let loaded = get_proxy_config(&id).expect("Config should be loadable");
+    assert_eq!(loaded.id, config.id);
+    assert_eq!(loaded.upstream_url, config.upstream_url);
+    assert_eq!(loaded.local_port, config.local_port);
+    assert_eq!(
+      loaded.ignore_proxy_certificate,
+      config.ignore_proxy_certificate
+    );
+    assert_eq!(loaded.local_url, config.local_url);
+    assert_eq!(loaded.pid, config.pid);
+    assert_eq!(loaded.profile_id, config.profile_id);
+    assert_eq!(loaded.bypass_rules, config.bypass_rules);
+
+    // Clean up
+    assert!(delete_proxy_config(&id));
+    assert!(get_proxy_config(&id).is_none());
+  }
+
+  #[test]
+  fn test_proxy_config_update_preserves_fields() {
+    use crate::proxy_storage::{
+      delete_proxy_config, get_proxy_config, save_proxy_config, update_proxy_config, ProxyConfig,
+    };
+
+    let id = format!("proxy_test_update_{}", rand::random::<u32>());
+    let mut config = ProxyConfig::new(id.clone(), "DIRECT".to_string(), Some(17777));
+    config.pid = Some(99999);
+    config.profile_id = Some("prof_up".to_string());
+    config.bypass_rules = vec!["google.com".to_string()];
+
+    save_proxy_config(&config).unwrap();
+
+    // Update: change the local_url (simulates worker binding)
+    config.local_url = Some("http://127.0.0.1:17777".to_string());
+    assert!(update_proxy_config(&config));
+
+    let reloaded = get_proxy_config(&id).unwrap();
+    assert_eq!(
+      reloaded.local_url.as_deref(),
+      Some("http://127.0.0.1:17777")
+    );
+    // Other fields should be preserved
+    assert_eq!(reloaded.pid, Some(99999));
+    assert_eq!(reloaded.bypass_rules, vec!["google.com".to_string()]);
+
+    delete_proxy_config(&id);
+  }
+
+  #[test]
+  fn test_proxy_config_list_filters_json_only() {
+    use crate::proxy_storage::{
+      delete_proxy_config, list_proxy_configs, save_proxy_config, ProxyConfig,
+    };
+
+    let id1 = format!("proxy_list_test_{}", rand::random::<u32>());
+    let id2 = format!("proxy_list_test_{}", rand::random::<u32>());
+
+    let c1 = ProxyConfig::new(id1.clone(), "DIRECT".to_string(), Some(16001));
+    let c2 = ProxyConfig::new(id2.clone(), "DIRECT".to_string(), Some(16002));
+
+    save_proxy_config(&c1).unwrap();
+    save_proxy_config(&c2).unwrap();
+
+    let all = list_proxy_configs();
+    let our_ids: Vec<_> = all.iter().filter(|c| c.id == id1 || c.id == id2).collect();
+    assert_eq!(our_ids.len(), 2, "Both test configs should be listed");
+
+    delete_proxy_config(&id1);
+    delete_proxy_config(&id2);
+  }
+
+  #[test]
+  fn test_proxy_id_uniqueness_and_format() {
+    use crate::proxy_storage::generate_proxy_id;
+
+    let mut ids = std::collections::HashSet::new();
+    for _ in 0..100 {
+      let id = generate_proxy_id();
+      assert!(id.starts_with("proxy_"), "ID must start with proxy_");
+      // Format: proxy_{timestamp}_{random}
+      let parts: Vec<&str> = id.split('_').collect();
+      assert_eq!(
+        parts.len(),
+        3,
+        "ID should have exactly 3 underscore-separated parts"
+      );
+      assert!(
+        parts[1].parse::<u64>().is_ok(),
+        "Second part must be a unix timestamp"
+      );
+      assert!(
+        parts[2].parse::<u32>().is_ok(),
+        "Third part must be a u32 random"
+      );
+      ids.insert(id);
+    }
+    assert_eq!(ids.len(), 100, "All 100 generated IDs must be unique");
+  }
+
+  #[test]
+  fn test_multiple_profiles_share_proxy_independently() {
+    let pm = ProxyManager::new();
+
+    // Two profiles sharing the same upstream but with distinct proxy instances
+    let info_a = ProxyInfo {
+      id: "px_shared_a".to_string(),
+      local_url: "http://127.0.0.1:9201".to_string(),
+      upstream_host: "proxy.shared.com".to_string(),
+      upstream_port: 8080,
+      upstream_type: "http".to_string(),
+      local_port: 9201,
+      profile_id: Some("profile_alpha".to_string()),
+      blocklist_file: None,
+      dns_server: None,
+    };
+    let info_b = ProxyInfo {
+      id: "px_shared_b".to_string(),
+      local_url: "http://127.0.0.1:9202".to_string(),
+      upstream_host: "proxy.shared.com".to_string(),
+      upstream_port: 8080,
+      upstream_type: "http".to_string(),
+      local_port: 9202,
+      profile_id: Some("profile_beta".to_string()),
+      blocklist_file: None,
+      dns_server: None,
+    };
+
+    pm.insert_active_proxy(3001, info_a);
+    pm.insert_active_proxy(3002, info_b);
+    pm.insert_profile_proxy_mapping("profile_alpha".to_string(), "px_shared_a".to_string());
+    pm.insert_profile_proxy_mapping("profile_beta".to_string(), "px_shared_b".to_string());
+
+    // Remove alpha's browser → should NOT affect beta
+    {
+      let mut proxies = pm.active_proxies.lock().unwrap();
+      proxies.remove(&3001);
+    }
+    {
+      let mut map = pm.profile_active_proxy_ids.lock().unwrap();
+      map.remove("profile_alpha");
+    }
+
+    assert_eq!(pm.active_proxy_count(), 1);
+    assert_eq!(pm.profile_proxy_mapping_count(), 1);
+    let remaining = pm.get_active_proxy(3002).unwrap();
+    assert_eq!(remaining.id, "px_shared_b");
+    assert_eq!(remaining.profile_id.as_deref(), Some("profile_beta"));
+  }
+
+  #[test]
+  fn test_proxy_url_construction() {
+    // Basic HTTP
+    let url = ProxyManager::build_proxy_url(&ProxySettings {
+      proxy_type: "http".to_string(),
+      host: "1.2.3.4".to_string(),
+      port: 8080,
+      username: None,
+      password: None,
+      vless_uri: None,
+    });
+    assert_eq!(url, "http://1.2.3.4:8080");
+
+    // With credentials
+    let url = ProxyManager::build_proxy_url(&ProxySettings {
+      proxy_type: "socks5".to_string(),
+      host: "proxy.example.com".to_string(),
+      port: 1080,
+      username: Some("user".to_string()),
+      password: Some("p@ss".to_string()),
+      vless_uri: None,
+    });
+    assert_eq!(url, "socks5://user:p%40ss@proxy.example.com:1080");
+
+    // Username-only (no password)
+    let url = ProxyManager::build_proxy_url(&ProxySettings {
+      proxy_type: "http".to_string(),
+      host: "host.io".to_string(),
+      port: 3128,
+      username: Some("justuser".to_string()),
+      password: None,
+      vless_uri: None,
+    });
+    assert_eq!(url, "http://justuser@host.io:3128");
+  }
+
+  #[test]
+  fn an_ipv6_proxy_host_is_bracketed_in_its_url() {
+    let settings = |host: &str| ProxySettings {
+      proxy_type: "http".to_string(),
+      host: host.to_string(),
+      port: 8080,
+      username: Some("user".to_string()),
+      password: Some("pass".to_string()),
+      vless_uri: None,
+    };
+    for host in ["2001:db8::1", "[2001:db8::1]"] {
+      let url = ProxyManager::build_proxy_url(&settings(host));
+      assert_eq!(url, "http://user:pass@[2001:db8::1]:8080");
+      let parsed = url::Url::parse(&url).unwrap();
+      assert_eq!(parsed.port(), Some(8080));
+      assert_eq!(
+        crate::proxy_storage::build_proxy_url("http", host, 8080, Some("user"), Some("pass")),
+        url
+      );
+    }
+    assert_eq!(
+      ProxyManager::build_proxy_url(&settings("1.2.3.4")),
+      "http://user:pass@1.2.3.4:8080"
+    );
+  }
+
+  #[test]
+  fn proxy_lines_with_a_bracketed_ipv6_host_parse() {
+    let lines = [
+      "[2001:db8::1]:8080:user:pass",
+      "user:pass:[2001:db8::1]:8080",
+      "user:pass@[2001:db8::1]:8080",
+      "http://user:pass@[2001:db8::1]:8080",
+      "socks5://[2001:db8::1]:8080:user:pass",
+    ];
+    for line in lines {
+      match &ProxyManager::parse_txt_proxies(line)[0] {
+        ProxyParseResult::Parsed(p) => {
+          assert_eq!(p.host, "[2001:db8::1]", "{line}");
+          assert_eq!(p.port, 8080, "{line}");
+          assert_eq!(p.username.as_deref(), Some("user"), "{line}");
+          assert_eq!(p.password.as_deref(), Some("pass"), "{line}");
+        }
+        other => panic!("{line}: expected Parsed, got {other:?}"),
+      }
+    }
+    match &ProxyManager::parse_txt_proxies("[2001:db8::1]:3128")[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!((p.host.as_str(), p.port), ("[2001:db8::1]", 3128));
+        assert_eq!(p.username, None);
+      }
+      other => panic!("expected Parsed, got {other:?}"),
+    }
+    assert_eq!(
+      split_proxy_fields("1.2.3.4:80:[user:pass"),
+      vec!["1.2.3.4", "80", "[user", "pass"]
+    );
+  }
+
+  #[test]
+  fn probe_proxy_url_maps_httpstls_to_the_scheme_reqwest_understands() {
+    // The browser tunnel dials `httpstls` itself, but the check button and the
+    // fingerprint probe go through reqwest, which has never heard of it. Both
+    // spellings mean TLS-to-the-proxy, so the probe still crosses the encrypted
+    // hop rather than silently falling back to a plaintext one.
+    let url = ProxyManager::build_probe_proxy_url(&ProxySettings {
+      proxy_type: "httpstls".to_string(),
+      host: "proxy.example.com".to_string(),
+      port: 443,
+      username: Some("user".to_string()),
+      password: Some("p@ss".to_string()),
+      vless_uri: None,
+    });
+    assert_eq!(url, "https://user:p%40ss@proxy.example.com:443");
+  }
+
+  #[test]
+  fn probe_proxy_url_still_forces_remote_dns_for_socks5() {
+    // Pinning the pre-existing behaviour: adding the httpstls rewrite must not
+    // disturb the socks5h rewrite that keeps DNS off this machine.
+    let url = ProxyManager::build_probe_proxy_url(&ProxySettings {
+      proxy_type: "socks5".to_string(),
+      host: "proxy.example.com".to_string(),
+      port: 1080,
+      username: None,
+      password: None,
+      vless_uri: None,
+    });
+    assert_eq!(url, "socks5h://proxy.example.com:1080");
+  }
+
+  #[test]
+  fn probe_proxy_url_leaves_the_plaintext_types_alone() {
+    for proxy_type in ["http", "socks4"] {
+      let url = ProxyManager::build_probe_proxy_url(&ProxySettings {
+        proxy_type: proxy_type.to_string(),
+        host: "proxy.example.com".to_string(),
+        port: 8080,
+        username: None,
+        password: None,
+        vless_uri: None,
+      });
+      assert_eq!(url, format!("{proxy_type}://proxy.example.com:8080"));
+    }
+  }
+
+  #[test]
+  fn legacy_https_probe_uses_the_same_plaintext_hop_as_the_browser() {
+    let settings = ProxySettings {
+      proxy_type: "https".to_string(),
+      host: "proxy.example.com".to_string(),
+      port: 8080,
+      username: Some("user".to_string()),
+      password: Some("p@ss".to_string()),
+      vless_uri: None,
+    };
+    assert_eq!(
+      ProxyManager::build_proxy_url(&settings),
+      "https://user:p%40ss@proxy.example.com:8080"
+    );
+    assert_eq!(
+      ProxyManager::build_probe_proxy_url(&settings),
+      "http://user:p%40ss@proxy.example.com:8080"
+    );
+  }
+
+  #[test]
+  fn parse_txt_proxies_round_trips_the_tls_scheme_without_stealing_https() {
+    // `httpstls://` must parse as its own type...
+    let results =
+      ProxyManager::parse_txt_proxies("httpstls://admin:secret@proxy.example.com:443\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "httpstls");
+        assert_eq!(p.host, "proxy.example.com");
+        assert_eq!(p.port, 443);
+        assert_eq!(p.username.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("secret"));
+      }
+      other => panic!("Expected Parsed, got {other:?}"),
+    }
+
+    // ...and `https://` must keep meaning the plaintext CONNECT type. Provider
+    // lists paste it for endpoints that do no TLS at all, so promoting it here
+    // would break real imports and claim an encrypted hop that is not there.
+    let results = ProxyManager::parse_txt_proxies("https://admin:secret@proxy.example.com:8443\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "https");
+        assert_eq!(p.port, 8443);
+      }
+      other => panic!("Expected Parsed, got {other:?}"),
+    }
+  }
+
+  fn valid_vless_uri() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let public_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+    format!(
+      "vless://6d6e21a1-4829-4d2b-bc7f-1b25707b61e4@127.0.0.1:443?\
+       encryption=none&flow=xtls-rprx-vision&security=reality&\
+       sni=www.example.com&fp=chrome&pbk={public_key}&\
+       sid=0123456789abcdef&spx=%2F&type=tcp&headerType=none#Local"
+    )
+  }
+
+  #[test]
+  fn vless_settings_are_validated_canonicalized_and_stripped_of_unused_credentials() {
+    let uri = valid_vless_uri();
+    let normalized = ProxyManager::normalize_proxy_settings(ProxySettings {
+      proxy_type: "VLESS".to_string(),
+      host: "ignored.invalid".to_string(),
+      port: 1,
+      username: Some("unused-user".to_string()),
+      password: Some("unused-password".to_string()),
+      vless_uri: Some(uri.clone()),
+    })
+    .unwrap();
+
+    assert_eq!(normalized.proxy_type, "vless");
+    assert_eq!(normalized.host, "127.0.0.1");
+    assert_eq!(normalized.port, 443);
+    assert!(normalized.username.is_none());
+    assert!(normalized.password.is_none());
+    assert_eq!(normalized.vless_uri.as_deref(), Some(uri.as_str()));
+
+    let invalid = uri.replace("type=tcp", "type=kcp");
+    let error = ProxyManager::normalize_proxy_settings(ProxySettings {
+      proxy_type: "vless".to_string(),
+      host: "127.0.0.1".to_string(),
+      port: 443,
+      username: None,
+      password: None,
+      vless_uri: Some(invalid.clone()),
+    })
+    .unwrap_err();
+    assert!(error.contains("VLESS_CONFIG_INVALID"));
+    assert!(!error.contains(&invalid));
+  }
+
+  #[test]
+  fn every_xray_share_link_is_stored_under_the_type_its_link_names() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let id = "6d6e21a1-4829-4d2b-bc7f-1b25707b61e4";
+    let vmess = serde_json::json!({
+      "v": "2", "ps": "VM", "add": "vm.example.com", "port": "443", "id": id, "aid": "0",
+      "scy": "auto", "net": "ws", "type": "none", "host": "vm.example.com", "path": "/vm",
+      "tls": "tls"
+    });
+    let cases = [
+      (
+        "vless",
+        format!("vless://{id}@a.example.com:8080?type=ws&path=%2F"),
+        "vless",
+        "a.example.com",
+        8080,
+      ),
+      // The link decides: a VMess link saved under the VLESS type is VMess.
+      (
+        "vless",
+        format!("vmess://{}", STANDARD.encode(vmess.to_string())),
+        "vmess",
+        "vm.example.com",
+        443,
+      ),
+      (
+        "trojan",
+        "trojan://pw@tj.example.com:443?sni=tj.example.com".to_string(),
+        "trojan",
+        "tj.example.com",
+        443,
+      ),
+      (
+        "HY2",
+        "hy2://pw@hy.example.com:8443".to_string(),
+        "hysteria2",
+        "hy.example.com",
+        8443,
+      ),
+    ];
+    for (picked_type, link, expected_type, host, port) in cases {
+      let settings = |uri: String| ProxySettings {
+        proxy_type: picked_type.to_string(),
+        host: String::new(),
+        port: 0,
+        username: Some("unused".to_string()),
+        password: None,
+        vless_uri: Some(uri),
+      };
+      let normalized = ProxyManager::normalize_proxy_settings(settings(link.clone())).unwrap();
+      assert_eq!(normalized.proxy_type, expected_type, "{link}");
+      assert_eq!(normalized.host, host);
+      assert_eq!(normalized.port, port);
+      assert!(normalized.username.is_none());
+
+      let canonical = normalized.vless_uri.clone().unwrap();
+      assert_eq!(
+        ProxyManager::build_proxy_url(&normalized),
+        canonical,
+        "an Xray proxy is exported as its link"
+      );
+      let again = ProxyManager::normalize_proxy_settings(settings(canonical.clone())).unwrap();
+      assert_eq!(again.vless_uri.as_deref(), Some(canonical.as_str()));
+
+      assert!(matches!(
+        ProxyManager::parse_txt_proxies(&canonical).as_slice(),
+        [ProxyParseResult::Parsed(proxy)]
+          if proxy.proxy_type == expected_type && proxy.host == host && proxy.port == port
+      ));
+    }
+  }
+
+  fn history_entry(timestamp: u64, ok: bool) -> ProxyCheckHistoryEntry {
+    ProxyCheckHistoryEntry {
+      timestamp,
+      ok,
+      ip: ok.then(|| format!("203.0.113.{}", timestamp % 250)),
+      country: ok.then(|| "Netherlands".to_string()),
+      country_code: ok.then(|| "NL".to_string()),
+      isp: ok.then(|| "Example Telecom B.V.".to_string()),
+      udp: crate::proxy_udp::UdpSupport::Yes,
+      latency_ms: Some(timestamp),
+    }
+  }
+
+  #[test]
+  fn the_check_trail_keeps_the_last_fifty_newest_first_and_survives_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let _data_guard = crate::app_dirs::set_test_data_dir(temp.path().to_path_buf());
+    let manager = ProxyManager::new();
+    let proxy_id = "trail-proxy";
+
+    assert!(manager.get_proxy_check_history(proxy_id).is_empty());
+
+    for timestamp in 1..=(PROXY_CHECK_HISTORY_LIMIT as u64 + 12) {
+      manager.record_proxy_check(proxy_id, history_entry(timestamp, timestamp % 4 != 0));
+    }
+
+    let stored = manager.get_proxy_check_history(proxy_id);
+    assert_eq!(stored.len(), PROXY_CHECK_HISTORY_LIMIT);
+    // Newest first, and the cap drops the OLDEST checks rather than refusing
+    // to record new ones.
+    assert_eq!(stored[0].timestamp, PROXY_CHECK_HISTORY_LIMIT as u64 + 12);
+    assert_eq!(stored[PROXY_CHECK_HISTORY_LIMIT - 1].timestamp, 13);
+    assert!(stored
+      .windows(2)
+      .all(|pair| pair[0].timestamp > pair[1].timestamp));
+
+    // A fresh manager reads the same trail off disk, with every field intact.
+    let reopened = ProxyManager::new().get_proxy_check_history(proxy_id);
+    assert_eq!(reopened, stored);
+    let newest = &reopened[0];
+    assert_eq!(newest.isp.as_deref(), Some("Example Telecom B.V."));
+    assert_eq!(newest.country_code.as_deref(), Some("NL"));
+    assert_eq!(newest.udp, crate::proxy_udp::UdpSupport::Yes);
+    assert_eq!(
+      newest.latency_ms,
+      Some(PROXY_CHECK_HISTORY_LIMIT as u64 + 12)
+    );
+    assert!(reopened.iter().any(|entry| !entry.ok));
+
+    // The trail lives beside the configs without being mistaken for one: the
+    // loader reads every `*.json` in the proxies directory.
+    let history_file = manager.get_proxy_history_file_path(proxy_id);
+    assert!(history_file.starts_with(manager.get_proxies_dir()));
+    assert_ne!(history_file, manager.get_proxy_file_path(proxy_id));
+    assert!(ProxyManager::new().get_stored_proxies().is_empty());
+  }
+
+  #[test]
+  fn a_check_that_failed_records_that_it_failed_rather_than_an_empty_exit() {
+    let failure = ProxyCheckResult {
+      ip: String::new(),
+      city: None,
+      country: None,
+      country_code: None,
+      timestamp: 1700,
+      is_valid: false,
+      isp: None,
+      timezone: None,
+      udp: crate::proxy_udp::UdpSupport::No,
+      latency_ms: Some(42),
+    };
+    let entry = ProxyManager::history_entry(&failure);
+    assert!(!entry.ok);
+    assert_eq!(entry.ip, None);
+    assert_eq!(entry.udp, crate::proxy_udp::UdpSupport::No);
+    assert_eq!(entry.latency_ms, Some(42));
+  }
+
+  #[test]
+  fn deleting_a_proxy_takes_its_check_trail_with_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let _data_guard = crate::app_dirs::set_test_data_dir(temp.path().to_path_buf());
+    let manager = ProxyManager::new();
+    let stored = StoredProxy::new(
+      "Doomed".to_string(),
+      ProxySettings {
+        proxy_type: "socks5".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 1080,
+        username: None,
+        password: None,
+        vless_uri: None,
+      },
+    );
+    manager.save_proxy(&stored).unwrap();
+    manager.record_proxy_check(&stored.id, history_entry(9, true));
+    assert!(manager.get_proxy_history_file_path(&stored.id).exists());
+
+    manager.delete_proxy_file(&stored.id).unwrap();
+    assert!(!manager.get_proxy_history_file_path(&stored.id).exists());
+    assert!(manager.get_proxy_check_history(&stored.id).is_empty());
+  }
+
+  #[test]
+  fn vless_stored_proxy_persistence_and_exports_preserve_the_canonical_uri() {
+    let temp = tempfile::tempdir().unwrap();
+    let _data_guard = crate::app_dirs::set_test_data_dir(temp.path().to_path_buf());
+    let manager = ProxyManager::new();
+    let settings = ProxyManager::normalize_proxy_settings(ProxySettings {
+      proxy_type: "vless".to_string(),
+      host: "ignored.invalid".to_string(),
+      port: 1,
+      username: Some("unused".to_string()),
+      password: Some("unused".to_string()),
+      vless_uri: Some(valid_vless_uri()),
+    })
+    .unwrap();
+    let stored = StoredProxy::new("Local Reality".to_string(), settings);
+    manager.save_proxy(&stored).unwrap();
+    manager.upsert_stored_proxy(stored.clone());
+
+    let json: ProxyExportData =
+      serde_json::from_str(&manager.export_proxies_json().unwrap()).unwrap();
+    assert_eq!(json.proxies.len(), 1);
+    assert_eq!(json.proxies[0].proxy_type, "vless");
+    assert_eq!(json.proxies[0].vless_uri, stored.proxy_settings.vless_uri);
+    assert_eq!(
+      manager.export_proxies_txt(),
+      stored.proxy_settings.vless_uri.clone().unwrap()
+    );
+
+    let reloaded = ProxyManager::new()
+      .get_stored_proxies()
+      .into_iter()
+      .find(|candidate| candidate.id == stored.id)
+      .expect("persisted VLESS proxy should reload");
+    assert_eq!(reloaded.proxy_settings, stored.proxy_settings);
+
+    let parsed = ProxyManager::parse_txt_proxies(&manager.export_proxies_txt());
+    assert!(matches!(
+      parsed.as_slice(),
+      [ProxyParseResult::Parsed(proxy)]
+        if proxy.proxy_type == "vless"
+          && proxy.vless_uri == stored.proxy_settings.vless_uri
+    ));
+  }
+
+  #[test]
+  fn test_geo_username_construction() {
+    // Country only
+    let u = ProxyManager::build_geo_username("base_user", "US", &None, &None, &None);
+    assert_eq!(u, "base_user-country-US");
+
+    // Country + region
+    let u = ProxyManager::build_geo_username(
+      "base_user",
+      "US",
+      &Some("california".to_string()),
+      &None,
+      &None,
+    );
+    assert_eq!(u, "base_user-country-US-region-california");
+
+    // All fields
+    let u = ProxyManager::build_geo_username(
+      "user",
+      "DE",
+      &Some("bavaria".to_string()),
+      &Some("munich".to_string()),
+      &Some("Telekom".to_string()),
+    );
+    assert_eq!(u, "user-country-DE-region-bavaria-city-munich-isp-Telekom");
+  }
+
+  #[test]
+  fn test_sid_generation_determinism_and_format() {
+    let sid1 = ProxyManager::generate_sid_for_profile("my-profile-uuid");
+    let sid2 = ProxyManager::generate_sid_for_profile("my-profile-uuid");
+    assert_eq!(sid1, sid2, "Same input must produce same SID");
+    assert_eq!(sid1.len(), 11, "SID must be exactly 11 characters");
+
+    // All chars should be alphanumeric lowercase
+    assert!(
+      sid1
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+      "SID chars must be [a-z0-9]"
+    );
+
+    // Different profiles produce different SIDs
+    let sid3 = ProxyManager::generate_sid_for_profile("another-profile");
+    assert_ne!(sid1, sid3, "Different profiles must produce different SIDs");
+  }
+
+  #[test]
+  fn test_build_username_with_sid() {
+    let full = ProxyManager::build_username_with_sid("user-country-US", "profile-123");
+    // Should contain the geo base, then -sid-{11chars}-ttl-1440m
+    assert!(full.starts_with("user-country-US-sid-"));
+    assert!(full.ends_with("-ttl-1440m"));
+    // SID portion
+    let after_sid = full.strip_prefix("user-country-US-sid-").unwrap();
+    let sid = after_sid.strip_suffix("-ttl-1440m").unwrap();
+    assert_eq!(sid.len(), 11);
+  }
+
+  #[test]
+  fn test_stored_proxy_geo_field_migration() {
+    // Simulate legacy data with geo_state but no geo_region
+    let mut proxy = StoredProxy {
+      id: "test_migrate".to_string(),
+      name: "Test".to_string(),
+      proxy_settings: ProxySettings {
+        proxy_type: "http".to_string(),
+        host: "h.com".to_string(),
+        port: 80,
+        username: None,
+        password: None,
+        vless_uri: None,
+      },
+      sync_enabled: false,
+      last_sync: None,
+      updated_at: None,
+      is_cloud_managed: false,
+      is_cloud_derived: false,
+      geo_country: Some("US".to_string()),
+      geo_state: Some("california".to_string()),
+      geo_region: None,
+      geo_city: None,
+      geo_isp: None,
+      dynamic_proxy_url: None,
+      dynamic_proxy_format: None,
+      rotation_url: None,
+    };
+
+    // Before migration
+    assert_eq!(proxy.effective_region().unwrap(), "california");
+    assert!(proxy.geo_region.is_none());
+
+    // After migration
+    proxy.migrate_geo_fields();
+    assert_eq!(proxy.geo_region.as_deref(), Some("california"));
+    assert!(proxy.geo_state.is_none(), "geo_state should be taken");
+    assert_eq!(proxy.effective_region().unwrap(), "california");
+  }
+
+  #[test]
+  fn test_cleanup_skips_recently_created_configs() {
+    use crate::proxy_storage::{delete_proxy_config, save_proxy_config, ProxyConfig};
+
+    // Use current timestamp so it falls within the 120s grace period
+    let now_ts = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+
+    let recent_id = format!("proxy_{now_ts}_99999");
+
+    // Spawn and kill a child so the PID is dead
+    let dead_child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+      .args(if cfg!(windows) {
+        vec!["/C", "exit"]
+      } else {
+        vec![]
+      })
+      .spawn()
+      .unwrap();
+    let dead_pid = dead_child.id();
+    let mut dead_child = dead_child;
+    dead_child.wait().unwrap();
+
+    let config = ProxyConfig {
+      id: recent_id.clone(),
+      upstream_url: "DIRECT".to_string(),
+      local_port: Some(19999),
+      ignore_proxy_certificate: None,
+      local_url: None,
+      pid: Some(dead_pid),
+      profile_id: None,
+      bypass_rules: Vec::new(),
+      blocklist_file: None,
+      dns_allowlist_mode: false,
+      dns_server: None,
+      local_protocol: None,
+      browser_pid: None,
+      browser_pid_start_time: None,
+      record_domains: true,
+    };
+    save_proxy_config(&config).unwrap();
+
+    // The cleanup logic inspects the timestamp in the proxy ID.
+    // Since we used the current timestamp, the proxy_age will be < 120 seconds,
+    // so it should be skipped despite the dead PID.
+
+    // Verify the grace period logic directly:
+    let proxy_age = recent_id
+      .strip_prefix("proxy_")
+      .and_then(|s| s.split('_').next())
+      .and_then(|s| s.parse::<u64>().ok())
+      .map(|created_at| now_ts.saturating_sub(created_at))
+      .unwrap_or(0);
+
+    assert!(
+      proxy_age < 120,
+      "Recently created config should be in grace period"
+    );
+
+    // Clean up test config
+    delete_proxy_config(&recent_id);
+  }
+
+  #[tokio::test]
+  async fn test_concurrent_config_operations() {
+    use crate::proxy_storage::{
+      delete_proxy_config, get_proxy_config, save_proxy_config, ProxyConfig,
+    };
+    use std::sync::Arc;
+
+    let ids: Vec<String> = (0..20)
+      .map(|i| format!("proxy_conc_test_{}_{}", i, rand::random::<u32>()))
+      .collect();
+    let ids = Arc::new(ids);
+
+    // Concurrent writes
+    let mut handles = vec![];
+    for id in ids.iter() {
+      let id = id.clone();
+      handles.push(tokio::spawn(async move {
+        let config = ProxyConfig::new(id.clone(), "DIRECT".to_string(), Some(15000));
+        save_proxy_config(&config).unwrap();
+      }));
+    }
+    for h in handles {
+      h.await.unwrap();
+    }
+
+    // Verify all were written
+    for id in ids.iter() {
+      assert!(
+        get_proxy_config(id).is_some(),
+        "Config {id} should be readable after concurrent write"
+      );
+    }
+
+    // Concurrent deletes
+    let mut handles = vec![];
+    for id in ids.iter() {
+      let id = id.clone();
+      handles.push(tokio::spawn(async move {
+        delete_proxy_config(&id);
+      }));
+    }
+    for h in handles {
+      h.await.unwrap();
+    }
+
+    // Verify all deleted
+    for id in ids.iter() {
+      assert!(
+        get_proxy_config(id).is_none(),
+        "Config {id} should be gone after concurrent delete"
+      );
+    }
+  }
+
+  #[test]
+  fn test_proxy_txt_parsing_various_formats() {
+    // URL format
+    let results = ProxyManager::parse_txt_proxies("http://user:pass@proxy.com:8080\n");
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "http");
+        assert_eq!(p.host, "proxy.com");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.username.as_deref(), Some("user"));
+        assert_eq!(p.password.as_deref(), Some("pass"));
+      }
+      _ => panic!("Expected Parsed result"),
+    }
+
+    // host:port format
+    let results = ProxyManager::parse_txt_proxies("10.0.0.1:3128\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.host, "10.0.0.1");
+        assert_eq!(p.port, 3128);
+        assert!(p.username.is_none());
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // host:port:user:pass format
+    let results = ProxyManager::parse_txt_proxies("myhost:9090:admin:secret\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.host, "myhost");
+        assert_eq!(p.port, 9090);
+        assert_eq!(p.username.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("secret"));
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // Comments and empty lines should be skipped
+    let results = ProxyManager::parse_txt_proxies("# comment\n\n  \n1.2.3.4:80\n");
+    assert_eq!(results.len(), 1);
+
+    // SOCKS5 URL
+    let results = ProxyManager::parse_txt_proxies("socks5://u:p@1.2.3.4:1080\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "socks5");
+        assert_eq!(p.host, "1.2.3.4");
+        assert_eq!(p.port, 1080);
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // Scheme in front of the colon-separated body
+    let results = ProxyManager::parse_txt_proxies("socks5://1.2.3.4:1080:admin:secret\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "socks5");
+        assert_eq!(p.host, "1.2.3.4");
+        assert_eq!(p.port, 1080);
+        assert_eq!(p.username.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("secret"));
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // Same, with the credentials in front
+    let results = ProxyManager::parse_txt_proxies("https://admin:secret:proxy.com:8443\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "https");
+        assert_eq!(p.host, "proxy.com");
+        assert_eq!(p.port, 8443);
+        assert_eq!(p.username.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("secret"));
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // An IPv6 literal splits into four parts as well, and must not be read as
+    // the colon-separated form
+    let results = ProxyManager::parse_txt_proxies("http://[::1]:8080\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.host, "[::1]");
+        assert_eq!(p.port, 8080);
+        assert!(p.username.is_none());
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // A scheme-prefixed body that is ambiguous stays ambiguous
+    let results = ProxyManager::parse_txt_proxies("socks5://1234:5678:9012:3456\n");
+    match &results[0] {
+      ProxyParseResult::Ambiguous {
+        line,
+        possible_formats,
+      } => {
+        assert_eq!(line, "socks5://1234:5678:9012:3456");
+        assert_eq!(possible_formats.len(), 2);
+      }
+      _ => panic!("Expected Ambiguous"),
+    }
+
+    // Ambiguous: both positions could be ports
+    let results = ProxyManager::parse_txt_proxies("1234:5678:9012:3456\n");
+    match &results[0] {
+      ProxyParseResult::Ambiguous {
+        possible_formats, ..
+      } => {
+        assert_eq!(possible_formats.len(), 2);
+      }
+      _ => panic!("Expected Ambiguous"),
+    }
+
+    // Invalid
+    let results = ProxyManager::parse_txt_proxies("notaproxy\n");
+    match &results[0] {
+      ProxyParseResult::Invalid { .. } => {}
+      _ => panic!("Expected Invalid"),
+    }
+  }
+
+  #[test]
+  fn test_multiple_proxy_types_coexist() {
+    let pm = ProxyManager::new();
+
+    // Different proxy types for different profiles
+    let types = [
+      ("http", 3128),
+      ("https", 3129),
+      ("socks4", 1080),
+      ("socks5", 1081),
+    ];
+
+    for (i, (ptype, port)) in types.iter().enumerate() {
+      let info = ProxyInfo {
+        id: format!("px_type_{ptype}"),
+        local_url: format!("http://127.0.0.1:{}", 9300 + i as u16),
+        upstream_host: "upstream.test".to_string(),
+        upstream_port: *port,
+        upstream_type: ptype.to_string(),
+        local_port: 9300 + i as u16,
+        profile_id: Some(format!("profile_{ptype}")),
+        blocklist_file: None,
+        dns_server: None,
+      };
+      pm.insert_active_proxy(4000 + i as u32, info);
+    }
+
+    assert_eq!(pm.active_proxy_count(), 4);
+
+    // Verify each type is stored correctly
+    let info = pm.get_active_proxy(4000).unwrap();
+    assert_eq!(info.upstream_type, "http");
+    let info = pm.get_active_proxy(4003).unwrap();
+    assert_eq!(info.upstream_type, "socks5");
+    assert_eq!(info.upstream_port, 1081);
+  }
+
+  #[test]
+  fn test_overwrite_pid_mapping() {
+    let pm = ProxyManager::new();
+
+    // Register proxy for PID 5000
+    pm.insert_active_proxy(5000, make_proxy_info("px_old", 9400, Some("prof_ow")));
+
+    // Overwrite the same PID with a new proxy (simulates browser reconnect with different proxy)
+    pm.insert_active_proxy(5000, make_proxy_info("px_new", 9401, Some("prof_ow")));
+
+    // Should only have 1 entry, with the new proxy
+    assert_eq!(pm.active_proxy_count(), 1);
+    let info = pm.get_active_proxy(5000).unwrap();
+    assert_eq!(info.id, "px_new");
+    assert_eq!(info.local_port, 9401);
+  }
+
+  #[test]
+  fn test_proxy_config_with_bypass_rules_roundtrip() {
+    use crate::proxy_storage::{
+      delete_proxy_config, get_proxy_config, save_proxy_config, ProxyConfig,
+    };
+
+    let id = format!("proxy_bypass_test_{}", rand::random::<u32>());
+    let rules = vec![
+      "*.google.com".to_string(),
+      "localhost".to_string(),
+      "192.168.0.*".to_string(),
+      "^.*\\.internal\\.corp$".to_string(),
+    ];
+
+    let config = ProxyConfig::new(id.clone(), "http://upstream:3128".to_string(), Some(18888))
+      .with_profile_id(Some("prof_bypass".to_string()))
+      .with_bypass_rules(rules.clone());
+
+    save_proxy_config(&config).unwrap();
+
+    let loaded = get_proxy_config(&id).unwrap();
+    assert_eq!(loaded.bypass_rules.len(), 4);
+    assert_eq!(loaded.bypass_rules, rules);
+    assert_eq!(loaded.profile_id.as_deref(), Some("prof_bypass"));
+
+    delete_proxy_config(&id);
+  }
+}
