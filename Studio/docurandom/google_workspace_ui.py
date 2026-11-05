@@ -15,6 +15,7 @@ def status_text(state):
             'account_required':'Chờ chọn tài khoản','permission_required':'Chờ cấp quyền truy cập',
             'verification_required':'Chờ người dùng xác minh','yielded':'Đã nhường profile'}
     labels.update(waiting_window='Chờ khung giờ đã chọn',daily_limit='Đã đủ lượt mới hôm nay')
+    labels['cached']='Đã có kết quả được lưu'
     text=labels.get(state.get('status'),'Chưa có lượt chạy')+' · '+str(state.get('detail',''))
     if state.get('current_app') in APPS:
         text+='\nỨng dụng: '+APPS[state['current_app']][0]

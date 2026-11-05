@@ -29,7 +29,8 @@ def test_round_robin_creation_is_once_per_app_day(workspace):
     c=g.config(workspace);c.update(apps=['docs','sheets','maps'],apps_per_cycle=2,create_files=True)
     day=datetime(2026,10,28,16,tzinfo=g.VN)
     steps,cursor=g.steps_for(workspace,c,{},clock=day)
-    assert [s['app']for s in steps]==['docs','docs','sheets','sheets']
+    assert [s['app']for s in steps]==['docs','sheets']
+    assert all(s['action']=='create'for s in steps)
     assert cursor==2
     again,_=g.steps_for(workspace,c,{'cycle':4},clock=day)
     assert steps[1]['once_key']==again[1]['once_key']

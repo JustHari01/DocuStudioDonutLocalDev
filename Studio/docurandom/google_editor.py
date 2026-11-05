@@ -12,6 +12,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from .google_task_policy import GoogleBlocked,GoogleTaskPending,raise_for_reply
+from .browser_input import BrowserInput
 
 
 def document_key(url):
@@ -80,6 +81,12 @@ class GoogleEditor:
     def __init__(self,runner,opened,owner):
         self.runner=runner;self.opened=opened;self.owner=owner;self.key=document_key(opened['url'])
         self.cdp=None;self.client=runner.client
+        self._controls=None
+
+    def controls(self):
+        if self._controls is None or self._controls.cdp is not self.cdp:
+            self._controls=BrowserInput(self.cdp,self.check_frame)
+        return self._controls
 
     def check_frame(self):
         self.runner.check()
@@ -152,18 +159,15 @@ class GoogleEditor:
         return any(re.search(pattern,n,re.I)for n in names)
 
     def input(self,method,params):
+        if method=='Input.insertText':
+            return self.controls().insert_text(params['text'])
         self.check_frame();return self.cdp.command(method,params)
 
     def press(self,key,code,number,modifiers=0):
-        for kind in ['keyDown','keyUp']:
-            self.input('Input.dispatchKeyEvent',{'type':kind,'key':key,'code':code,
-                'windowsVirtualKeyCode':number,'nativeVirtualKeyCode':number,'modifiers':modifiers})
+        self.controls().press(key,code,number,modifiers)
 
     def focus_input(self,selector):
-        self.check_frame();root=self.cdp.command('DOM.getDocument',{'depth':0})['root']['nodeId']
-        nodes=self.cdp.command('DOM.querySelectorAll',{'nodeId':root,'selector':selector})['nodeIds']
-        if len(nodes)!=1:raise GoogleTaskPending('Không có duy nhất ô nhập của tài liệu')
-        self.cdp.command('DOM.focus',{'nodeId':nodes[0]})
+        self.controls().click_input(selector)
 
     def prepare(self):
         self.check_frame()

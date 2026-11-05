@@ -7,7 +7,7 @@ Monorepo phát triển **Donut Local + DocuRandom Studio**, nhập từ source h
 | Thành phần | Phiên bản |
 |---|---|
 | Donut Local | 0.36.0 |
-| Studio | 2.4.338 |
+| Studio | 2.4.339 |
 | Chat Bridge | 1.0.158 |
 | Donut Bridge extension | 1.1.43 |
 | Flow extension | 1.3.52 |

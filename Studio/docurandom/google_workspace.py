@@ -127,8 +127,12 @@ def steps_for(workspace, c, state, *, clock=None):
     day = clock.astimezone(VN).date().isoformat()
     result=[]
     for app in chosen:
-        result.append({'app':app,'action':'browse','url':browse_url(app,query if app in {'search','maps','youtube','translate','news'} else '')})
-        if c['create_files'] and app in CREATES:
+        creating=c['create_files'] and app in CREATES
+        # A requested artifact opens its editor directly. Loading its home page
+        # first has no work to perform and costs another window and page load.
+        if not creating:
+            result.append({'app':app,'action':'browse','url':browse_url(app,query if app in {'search','maps','youtube','translate','news'} else '')})
+        if creating:
             title=f'DocuRandom · {workspace.name} · {day} · {APPS[app][0]}'
             result.append({'app':app,'action':'create','url':f'https://docs.google.com/{CREATES[app]}/create',
                            'title':title,'text':f'Ghi chú nghiên cứu · {workspace.name}\nNgày: {day}\nChủ đề: {query}',
@@ -200,6 +204,7 @@ def record_activity(workspace, state):
         'recovery_attempts','issue_status','profile_launches','profile_releases',
         'profile_retained_reason','server_not_before','next_run_at',
         'activity_cycle_id','last_cycle_elapsed_seconds',
+        'profile_cache_hits',
     ) if k in state}
     event['at']=now().isoformat()
     events=(history+[event])[-100:]
@@ -540,6 +545,29 @@ class GoogleService:
             atomic_write_json(root(w)/'state.json',s);return
         c={**c,'profile_id':profile};s['profile_id']=profile
         wait_key='google:'+w.workspace_id
+        # A fresh request containing only already-verified daily artifacts has
+        # no browser work. Keep pending plans on their original recovery path.
+        if not(s.get('cycle_id')and s.get('plan')):
+            planned,next_cursor=steps_for(w,c,s)
+            cached=[]
+            for step in planned:
+                receipt=read(root(w)/'jobs'/(step['once_key']+'.json'))if step.get('once_key')else{}
+                if receipt.get('status')!='complete'or receipt.get('profile_id')!=profile:
+                    break
+                result=receipt.get('result')
+                if not isinstance(result,dict)or result.get('status')not in{'complete','created'}or result.get('app')!=step['app']or result.get('action')!=step['action']:
+                    break
+                cached.append({k:result[k]for k in ['app','action','url','artifact_url','title','title_saved']if k in result})
+            if planned and len(cached)==len(planned):
+                self.coordinator.cancel_idle_waiter(wait_key);self.waiter_keys.discard(wait_key)
+                with self.lock:self.requested.discard(w.workspace_id)
+                s.update(status='cached',detail='Các file của lượt này đã có kết quả hoàn tất được lưu; không mở profile hoặc kiểm lại máy chủ',
+                         manual_requested=False,results=cached,cursor=next_cursor,
+                         profile_cache_hits=int(s.get('profile_cache_hits',0))+1,
+                         updated_at=now().isoformat(),next_run_at=(now()+timedelta(minutes=c['interval_minutes'])).isoformat())
+                s.pop('waiting_since',None)
+                atomic_write_json(root(w)/'state.json',s);record_activity(w,s)
+                return
         self.waiter_keys.add(wait_key)
         cancel=threading.Event();lease=self.coordinator.try_acquire(profile,cancel,job_kind='google-workspace',priority=-50,wait_key=wait_key)
         if lease is None:
@@ -569,16 +597,24 @@ class GoogleService:
                 from .youtube_upload import _ensure_youtube_browser_bridge, YouTubeStudioUploader
                 with DonutMcpClient(resolve_donut_mcp_endpoint(),timeout=30)as client:
                     client.require_docurandom_local();p=client.get_profile(profile)
+                    prior_pid=s.get('owned_profile_pid')
+                    candidate_owned=type(prior_pid)is int and prior_pid>0 and p.process_id==prior_pid
                     if not p.running:
                         client.run_profile(profile,'about:blank');opened=True
                         p=client.get_profile(profile);s['owned_profile_pid']=p.process_id
                         s['profile_launches']=int(s.get('profile_launches',0))+1
                         s.pop('profile_baseline',None)
                         atomic_write_json(root(w)/'state.json',s)
-                    elif s.get('owned_profile_pid')==p.process_id:opened=True
                     bridge=_ensure_youtube_browser_bridge(client,profile,required_capabilities={'google-workspace-v3'})
                     runner=GoogleRunner(w,bridge,profile,cancel,client)
                     runner.deadline=began+c['max_cycle_minutes']*60
+                    if not opened and candidate_owned:
+                        inventory=runner.command('google_inventory',{},timeout=15)
+                        if (s.get('profile_baseline')or{}).get('session_id')==inventory.get('session_id')and inventory.get('session_id'):
+                            opened=True
+                        else:
+                            s.pop('owned_profile_pid',None);s.pop('profile_baseline',None)
+                            s['profile_retained_reason']='Phiên trình duyệt đã đổi; không nhận quyền đóng profile từ PID cũ'
                     if opened and not s.get('profile_baseline'):
                         s['profile_baseline']=runner.command('google_inventory',{},timeout=15)
                     steps=s['plan'];cursor=s['next_cursor'];cycle=s['cycle_id']
@@ -660,9 +696,11 @@ class GoogleService:
                             with DonutMcpClient(resolve_donut_mcp_endpoint(),timeout=20)as client:
                                 live=client.get_profile(profile)
                                 inventory=bridge.command(profile,'google_inventory',{},timeout=15)
-                                if live.process_id==s.get('owned_profile_pid') and can_release_profile(s.get('profile_baseline'),inventory):
+                                owned_pid=s.get('owned_profile_pid')
+                                if type(owned_pid)is int and owned_pid>0 and live.process_id==owned_pid and can_release_profile(s.get('profile_baseline'),inventory):
                                     YouTubeStudioUploader._close_profile_started_by_workflow(client,profile)
                                     s['profile_releases']=int(s.get('profile_releases',0))+1
+                                    s.pop('owned_profile_pid',None);s.pop('profile_baseline',None);s.pop('profile_release_pending',None)
                                 else:s['profile_retained_reason']='Giữ profile vì có thay đổi/tab ngoài lượt Google'
                                 atomic_write_json(root(w)/'state.json',s)
                         except Exception:

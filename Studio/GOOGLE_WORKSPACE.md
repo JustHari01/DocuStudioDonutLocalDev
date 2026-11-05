@@ -79,3 +79,27 @@ tắt chức năng hoặc đóng Studio sẽ hủy vị trí ngay.
 
 Lệnh chạy thủ công đã lưu được nối sau khi khởi động lại, không bị mốc chu kỳ
 cũ trì hoãn đến hôm sau. Nó vẫn tuân theo Retry-After, khung giờ và quota ngày.
+
+## Input và thời gian mở profile (Studio 2.4.339)
+
+Docs/Sheets nhấp ô tiêu đề hoặc địa chỉ ô bằng sự kiện chuột của trình duyệt.
+Trước khi gõ, tool kiểm tra đúng tài liệu, ô nhập duy nhất, vị trí ổn định,
+không bị che và đang nhận bàn phím. Input Unicode và phím tắt dùng kết nối CDP
+đang có; đây là input của tab, không điều khiển con trỏ chuột Windows.
+Phím/nút chuột được nhả trên cùng target kể cả khi phản hồi nhấn bị mất.
+Sau thao tác vẫn phải đọc bản xuất để xác nhận nội dung đã lưu.
+
+Khi chọn tạo file, kế hoạch mới mở trực tiếp trình soạn thảo thay vì mở trang
+danh sách rồi mới tạo. Kế hoạch cũ đang dở giữ nguyên. Nếu toàn bộ tác vụ tạo
+file trong lượt mới đã có biên nhận hoàn tất đúng profile trong ngày, tool hiển
+thị **Đã có kết quả được lưu** và dùng các URL cũ mà không mở profile. Đây không
+phải lần xác minh máy chủ mới, không thay timestamp thành công trước đó và không
+tính thêm lượt trình duyệt. Bộ đếm `profile_cache_hits` thể hiện số lần tránh mở.
+
+Google vẫn dùng một phiên profile cho các bước cần chạy trong lượt. Profile
+đã mở thủ công được tận dụng nhưng không nhận quyền đóng. Metadata PID cũ hoặc
+PID không xác định không đủ để nhận lại quyền sở hữu: phải khớp phiên trình duyệt
+và không có tab người dùng thay đổi trước khi giải phóng.
+
+Các thay đổi này tối ưu công việc đã cấu hình; không tự đổi từ khóa, giờ chạy,
+thêm thao tác đọc mail/xem video ngẫu nhiên hoặc thay đổi dữ liệu tài khoản.

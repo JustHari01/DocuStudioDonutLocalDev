@@ -1,3 +1,10 @@
+## 2.4.339
+
+- Google Docs/Sheets nhấp ô tiêu đề/địa chỉ ô bằng input của trình duyệt sau khi kiểm tra phần tử duy nhất, hiển thị, không bị che, ổn định và nhận focus. Nhập Unicode và phím tắt tiếp tục kiểm tra đúng tài liệu; nhả phím/nút chuột khi mất phản hồi để tránh giữ trạng thái nhấn.
+- Lượt mới có yêu cầu tạo file mở thẳng trình soạn thảo, bỏ lượt mở trang danh sách dư. Các file cùng ngày đã có biên nhận hoàn tất được dùng lại trước khi xin profile; trạng thái ghi rõ dùng kết quả cũ, không giả định vừa kiểm tra lại máy chủ hoặc tính thành lượt làm mới.
+- Chỉ nhận lại quyền đóng profile khi PID hợp lệ và khớp cả phiên trình duyệt đã lưu. Giải phóng xong xóa metadata quyền sở hữu cũ; profile đang mở thủ công hoặc đổi phiên được giữ.
+- Giữ nguyên kế hoạch đang dở, biên nhận, giới hạn và cách nhường profile cho upload/Public. Kiểm thử input thực hiện trên Chromium riêng với trang thử nghiệm cục bộ; không tạo hoạt động Gmail/YouTube ngẫu nhiên.
+
 ## 2.4.324
 
 - Hoàn thành 20 Master độc lập theo bản đồ nghiên cứu: giữ nguyên sáu file 11.1.0-r1 đã có, bổ sung 14 charter ngành với 10 family đề tài, nguồn/vật chứng, thuật ngữ Nhật, điều kiện so sánh, thumbnail và biên ngách riêng.
