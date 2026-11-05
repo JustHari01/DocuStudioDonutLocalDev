@@ -12177,13 +12177,22 @@ class DocuRandomApp:
         if self._effective_youtube_thumbnail() is not None:
             return False
         package = getattr(self, "last_content_package", None)
-        if package is not None and package.is_file():
-            return True
         # Startup draft recovery can run before the UI restores this variable.
         # Resolve the same durable package used by the uploader instead of
         # treating an uninitialized UI pointer as permission to omit the image.
         workspace = getattr(self, "workspace", None)
-        return bool(workspace is not None and find_workspace_content_package(workspace) is not None)
+        if package is None or not package.is_file():
+            package = find_workspace_content_package(workspace) if workspace is not None else None
+        if package is None:return False
+        if workspace is not None:
+            from .thumbnail_contract import completed_thumbnail_selection
+            restored = completed_thumbnail_selection(workspace, package)
+            if restored is not None:
+                self.youtube_thumbnail_var.set(str(restored))
+                self._save_config()
+                self._refresh_thumbnail_status()
+                return False
+        return True
 
     def _repair_missing_upload_materials(self) -> None:
         """Wake real material workers while keeping the browser upload gate closed."""

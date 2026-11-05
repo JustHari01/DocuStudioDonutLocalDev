@@ -194,3 +194,28 @@ def accepted(workspace, package: Path, image: Path) -> bool:
                 and row["prompt_sha256"] == hashlib.sha256(extract_complete_thumbnail_prompt(package).encode()).hexdigest()
                 and row["contract"] == contract(workspace.state_dir))
     except (OSError, ValueError, KeyError): return False
+
+
+def completed_thumbnail_selection(workspace, package: Path) -> Path | None:
+    """Restore only a completed, source-bound, fully audited managed image.
+
+    Reconciliation does not send AI requests, reserve probes, publish, or
+    replace a user's selection. Old failure budgets remain unchanged.
+    """
+    try:
+        state = json.loads((workspace.state_dir/'thumbnail-ai.json').read_text(encoding='utf-8'))
+        if (state.get('status') != 'complete' or state.get('workspace_id') != workspace.workspace_id
+            or Path(state.get('package_path', '')).resolve() != package.resolve()
+            or state.get('package_sha256') != hashlib.sha256(package.read_bytes()).hexdigest()
+            or not state.get('thumbnail_path') or not contract(workspace.state_dir)):
+            return None
+        image = Path(state['thumbnail_path']).resolve()
+        from .thumbnail_manager import managed_thumbnail_dir, inspect_thumbnail_bytes
+        if image.parent != managed_thumbnail_dir(workspace).resolve():return None
+        inspect_thumbnail_bytes(image.read_bytes())
+        if not accepted(workspace, package, image):return None
+        from .thumbnail_ai import extract_complete_thumbnail_prompt
+        if state.get('prompt_sha256') != hashlib.sha256(extract_complete_thumbnail_prompt(package).encode()).hexdigest():return None
+        return image
+    except (OSError, ValueError, KeyError, TypeError):
+        return None

@@ -1,3 +1,12 @@
+## 2.4.340
+
+- Tự khôi phục lựa chọn thumbnail đã hoàn tất kiểm tra sau khi phục hồi biên nhận,
+  kể cả khi phiên giao diện đang giữ ô ảnh rỗng. Chỉ nhận ảnh quản lý của đúng
+  workspace, file Tổng hợp, prompt và biên nhận kiểm ảnh đạt; không tạo ảnh hoặc
+  gửi yêu cầu AI mới. Giữ nguyên ngân sách retry và lịch Public.
+- Kiểm thử hồi quy cổng nguyên liệu/thumbnail/Public: 59 PASS, gồm ảnh sai video,
+  ảnh bị thay đổi, phản hồi chưa hoàn tất và kiểm ảnh không đạt.
+
 ## 2.4.339
 
 - Google Docs/Sheets nhấp ô tiêu đề/địa chỉ ô bằng input của trình duyệt sau khi kiểm tra phần tử duy nhất, hiển thị, không bị che, ổn định và nhận focus. Nhập Unicode và phím tắt tiếp tục kiểm tra đúng tài liệu; nhả phím/nút chuột khi mất phản hồi để tránh giữ trạng thái nhấn.
