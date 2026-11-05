@@ -8070,6 +8070,22 @@ class DocuRandomApp:
             self.pipeline_auto_retry_count = 0
             self._start_content_pipeline(resume=True)
 
+    def resume_unlisted_after_preflight_repair(self) -> str:
+        """Retry only an unsent scheduled Unlisted after local setup repair."""
+        if self.workspace is None or self.closed or self.closing_after_cancel:
+            return 'Workspace không sẵn sàng.'
+        if self.youtube_upload_busy:return 'Đã có lượt upload; không tạo lượt khác.'
+        if not self._schedules_armed() or not getattr(self,'schedule_stage_upload_deferred',False):
+            return 'Chỉ nối lượt Unlisted đã được lịch chuẩn bị; không thay lịch hoặc Public.'
+        try:
+            record=json.loads((self.workspace.state_dir/'youtube_upload.json').read_text(encoding='utf-8'))
+        except (OSError,ValueError):return 'Chưa có biên nhận lỗi preflight để nối.'
+        if (record.get('status')!='error' or record.get('attempt_id') or record.get('youtube_url')
+            or record.get('submitted') or record.get('transfer_complete')):
+            return 'Lượt có thể đã gửi; giữ biên nhận, không tạo upload mới.'
+        self._start_youtube_upload(automatic=True)
+        return 'Đã yêu cầu nối Unlisted qua cổng nguyên liệu và khóa chống trùng hiện có.'
+
     def continue_from_launcher(self) -> tuple[bool, str]:
         """Resume this workspace without opening one confirmation dialog.
 
@@ -26514,6 +26530,7 @@ def run() -> None:
         # selector. Schedule-setting arguments are handled separately after
         # the active workspace has been resolved.
         selector_commands = {
+            "resume_unlisted",
             "status",
             "run",
             "continue",
@@ -26551,6 +26568,9 @@ def run() -> None:
                 return f"[{workspace_name}] chưa có lượt lỗi đang rảnh để Skip; không Skip video mới hoặc video đã hoàn tất."
             accepted, detail = app.reset_workspace_checkpoint()
             return f"[{workspace_name}] {'Đã nhận Skip' if accepted else 'Chưa thể Skip'}: {detail}"
+        if name == 'resume_unlisted':
+            if command.chat_id != 0:return 'Lệnh này chỉ dùng cho bảo trì local đã xác thực.'
+            return app.resume_unlisted_after_preflight_repair()
         if name == "status":
             activity = app.workspace_activity()
             return (

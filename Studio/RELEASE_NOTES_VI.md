@@ -1,3 +1,14 @@
+## 2.4.341
+
+- Sheets chốt ô bằng Tab; trước khi đọc bản xuất, chỉ chốt bộ đệm đang sửa khi
+  đúng địa chỉ và nội dung dự kiến. Bộ đệm khác dữ liệu yêu cầu được giữ nguyên,
+  tránh nối chữ và tránh đóng tab khi đang sửa. Đã thử thực tế với ô C2 tiếng Nhật.
+- Các lượt Drive mới dùng ô file native trên đúng tab thuộc biên nhận. Ghi dấu
+  trước khi gắn file; lượt đã gắn chỉ đối soát, không tự phát lại file.
+  Lượt legacy chưa rõ vẫn được giữ; thay thế chỉ theo phê duyệt riêng.
+- Bảo trì local có thể nối lượt Unlisted đã bị lỗi trước khi gửi file, qua
+  cổng kiểm nguyên liệu/khóa chống trùng hiện có; không bật lịch hay ép Public.
+
 ## 2.4.340
 
 - Tự khôi phục lựa chọn thumbnail đã hoàn tất kiểm tra sau khi phục hồi biên nhận,

@@ -66,6 +66,10 @@ def setup_editor(tmp_path,monkeypatch):
         def session(self):yield self
         def export(self):return cloud.export
         def saved(self):return cloud.saved
+        def settle_sheet_edit(self,step):
+            if getattr(cloud,'pending_exact_cell',False):
+                cloud.export=Export('spreadsheets','A,B\n','same.csv')
+                cloud.pending_exact_cell=False
         def write_body(self,step,before_input,cells=None):
             if cloud.focus_fail:raise g.GoogleTaskPending('focus not verified')
             before_input();cloud.writes+=1;cloud.cells=cells
@@ -74,6 +78,30 @@ def setup_editor(tmp_path,monkeypatch):
     opened={'url':'https://docs.google.com/document/d/same/edit','tab_id':1}
     path=g.root(w)/'jobs'/(g.key(['operation','content'])+'.json')
     return runner,cloud,step,opened,path
+
+
+def test_pending_exact_sheet_cell_is_committed_before_deciding_to_retype(setup_editor):
+    runner,cloud,step,opened,path=setup_editor
+    step.update(app='sheets',cells=[['A','B']]);cloud.pending_exact_cell=True
+    cloud.export=Export('spreadsheets','A,\n','same.csv')
+    g.atomic_write_json(path,{'status':'submitted','artifact_url':opened['url'],'empty_repair_attempts':1})
+    runner.write_editor(step,opened,'owner','operation')
+    assert cloud.writes==0
+    assert g.read(path)['status']=='complete' and g.read(path)['empty_repair_attempts']==1
+
+
+@pytest.mark.parametrize('value,accepted',[("'東京都 科学博物館\n",True),("'東京都 科学博物館'東京都 科学博物館\n",False)])
+def test_sheet_pending_buffer_must_match_exact_cell_before_commit(value,accepted):
+    editor=GoogleEditor(Mock(),{'url':'https://docs.google.com/spreadsheets/d/same/edit'},'owner')
+    editor.check_frame=Mock();editor.press=Mock();editor.cdp=Mock()
+    editor.cdp.command.return_value={'nodes':[{'role':{'value':'combobox'},'name':{'value':'C2'},
+        'value':{'value':value},'properties':[{'name':'focused','value':{'value':True}}]}]}
+    step={'cells':[['日付','名前','主題'],['2026-10-28','DaiTa4','東京都 科学博物館']]}
+    if accepted:
+        editor.settle_sheet_edit(step);editor.press.assert_called_once_with('Tab','Tab',9)
+    else:
+        with pytest.raises(g.GoogleBlocked):editor.settle_sheet_edit(step)
+        editor.press.assert_not_called()
 
 
 def test_legacy_uncertain_empty_saved_doc_gets_one_bounded_repair(setup_editor):

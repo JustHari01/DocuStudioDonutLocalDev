@@ -42,7 +42,7 @@ class LocalWorkspaceControl:
                         raise ValueError('Invalid request size')
                     body = json.loads(self.rfile.read(size))
                     command = body['command']; workspace = body['workspace_id']; request_id = body['request_id']
-                    if command not in {'status', 'errors', 'continue', 'skip', 'google_status', 'google_run', 'google_preview', 'google_diagnostics'} or not re.fullmatch(r'[a-f0-9]{32}', workspace) or not re.fullmatch(r'[a-f0-9]{32}', request_id):
+                    if command not in {'status', 'errors', 'continue', 'skip', 'resume_unlisted', 'google_status', 'google_run', 'google_preview', 'google_diagnostics'} or not re.fullmatch(r'[a-f0-9]{32}', workspace) or not re.fullmatch(r'[a-f0-9]{32}', request_id):
                         raise ValueError('Exact workspace and supported command required')
                     expected_thread = body.get('expected_thread_id', '')
                     if not isinstance(expected_thread, str) or (expected_thread and (command != 'skip'

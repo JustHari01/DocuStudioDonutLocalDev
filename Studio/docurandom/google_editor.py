@@ -207,4 +207,34 @@ class GoogleEditor:
                     self.focus_input('#t-name-box');self.press('a','KeyA',65,2)
                     self.input('Input.insertText',{'text':chr(65+x)+str(y+1)});self.press('Enter','Enter',13)
                     self.press('F2','F2',113);before_input()
-                    self.input('Input.insertText',{'text':"'"+text});self.press('Enter','Enter',13)
+                    self.input('Input.insertText',{'text':"'"+text});self.press('Tab','Tab',9)
+
+    def settle_sheet_edit(self,step):
+        """Commit a known exact pending cell before trusting server exports.
+
+        A CJK cell can remain in editing mode after Enter. Exporting then sees
+        the old server value; blindly filling that apparent blank appends text
+        to the unsaved buffer. Unknown/different buffers must never be changed.
+        """
+        if self.key[0]!='spreadsheets':return
+        self.check_frame()
+        nodes=self.cdp.command('Accessibility.getFullAXTree').get('nodes',[])
+        for node in nodes:
+            if node.get('role',{}).get('value')!='combobox':continue
+            if not any(p.get('name')=='focused' and p.get('value',{}).get('value') is True
+                       for p in node.get('properties',[])):continue
+            value=str(node.get('value',{}).get('value','')).rstrip('\r\n')
+            if not value.strip():continue
+            address=str(node.get('name',{}).get('value',''))
+            match=re.fullmatch(r'([A-Z])(\d+)',address)
+            if not match:raise GoogleBlocked('attention','Ô Sheets chưa xác minh được địa chỉ; giữ nội dung đang sửa')
+            y=int(match[2])-1;x=ord(match[1])-ord('A');cells=step['cells']
+            if y<0 or y>=len(cells) or x>=len(cells[y]):
+                raise GoogleBlocked('attention','Ô Sheets đang sửa nằm ngoài phạm vi tác vụ; giữ nguyên')
+            expected=cells[y][x]
+            if value not in {expected,"'"+expected}:
+                raise GoogleBlocked('attention','Ô Sheets có nội dung đang sửa khác yêu cầu; không nối thêm chữ hoặc đóng tab')
+            self.press('Tab','Tab',9)
+            # Readiness, not a random typing delay. The following export is
+            # still authoritative; no text is inserted by this reconciliation.
+            return

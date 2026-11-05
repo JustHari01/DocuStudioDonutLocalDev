@@ -310,6 +310,7 @@ class GoogleRunner:
         journal={**prior,'artifact_url':opened['url'],'text_sha256':content_digest}
         try:
             with GoogleEditor(self,opened,owner).session()as editor:
+                if step['app']=='sheets':editor.settle_sheet_edit(step)
                 exported=editor.export()
                 if exported.matches(step):
                     journal.update(status='complete',verified_at=now().isoformat(),server_sha256=exported.sha256)
@@ -400,6 +401,29 @@ class GoogleRunner:
             path=root(self.workspace)/'jobs'/(operation_id+'.json')
             old=read(path)
             preserve=True  # Any lost reply can mean the bytes are already transferring.
+            if self.client is not None and (not old or old.get('native_file_input')):
+                from .google_drive import GoogleDriveInput,exact_file
+                native=old or {'status':'prepared','profile_id':self.profile_id,'file_sha256':step['sha256'],
+                    'request_id':operation_id,'native_file_input':True,'tab_id':tab,'created_at':now().isoformat()}
+                atomic_write_json(path,native)
+                if native['status']=='prepared':
+                    def before_input():
+                        native.update(status='submitted',submitted_at=now().isoformat())
+                        atomic_write_json(path,native)
+                    with GoogleDriveInput(self,opened,owner).session()as drive:
+                        drive.submit(image,step['filename'],before_input)
+                found=None
+                for _ in range(30):
+                    self.check();snapshot=self.snapshot('drive',tab,owner)
+                    url=exact_file(snapshot,step['filename'])
+                    if url and found==url:
+                        result={'status':'complete','app':'drive','action':'upload','artifact_url':url,'filename':step['filename'],
+                            'verified_at':now().isoformat(),'source_sha256':step['sha256'],'verification':'two-live-owned-tab-observations'}
+                        native.update(status='complete',result=result);atomic_write_json(path,native)
+                        preserve=False;return result
+                    found=url
+                    if self.cancel.wait(2):self.check()
+                raise GoogleTaskPending('GOOGLE_UPLOAD_PENDING: file đã gắn một lần; giữ biên nhận native, không tải lại')
             if not old:
                 atomic_write_json(path,{'status':'submitted','profile_id':self.profile_id,'file_sha256':step['sha256'],
                     'request_id':operation_id,'command':'google_upload','tab_id':tab,'created_at':now().isoformat()})
