@@ -48,3 +48,14 @@ build is not evidence that the running installation has already been upgraded.
 This update changes no scheduled browsing topics and adds no random Gmail,
 YouTube-viewing or account-warming activity. Search/Maps retain their existing
 explicit query tasks and the shared profile lane.
+
+## Thumbnail review recovery
+
+The same release also re-reads the exact original review before resuming its
+single persisted JSON-format correction. This releases a completed original
+turn even when its first read raced a busy Bridge controller. A Bridge HTTP 409
+that explicitly refuses dispatch is kept as an unsent reservation; it does not
+become an uncertain submitted request. Transport failures remain uncertain.
+No recovery creates another image, changes the chosen model, or replenishes
+the correction budget. An additional 117 focused ChatGPT/review tests and 19
+subtests passed, including a real loopback HTTP rejection and restart cases.

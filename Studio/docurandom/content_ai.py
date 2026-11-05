@@ -277,6 +277,10 @@ class ContentAIError(RuntimeError):
     pass
 
 
+class ChatGPTPreSubmitRejected(ContentAIError):
+    """Bridge refused this request before staging attachments or dispatching."""
+
+
 class ContentAISubmissionUncertain(ContentAIError):
     """The prompt may have reached ChatGPT, but no recoverable thread exists."""
 
@@ -4363,6 +4367,16 @@ class ChatGPTWebChat:
             raise_if_cancelled()
             if response.status >= 400:
                 raw = response.read(CHATGPT_WEB_MAX_RESPONSE_BYTES + 1)
+                try:
+                    bridge_message = json.loads(raw).get('error', {}).get('message')
+                except (ValueError, AttributeError):
+                    bridge_message = None
+                if response.status == 409 and bridge_message in {
+                    'This ChatGPT conversation is already running',
+                    'This workspace has an interrupted ChatGPT turn; recover its DOM before sending another prompt',
+                    'Previous ChatGPT attachment is unresolved in its exact conversation; no new file or prompt was sent',
+                }:
+                    raise ChatGPTPreSubmitRejected(bridge_message)
                 raise ContentAIError(self._error_message(response.status, raw))
             if not streaming:
                 content_length = int(response.getheader("Content-Length", "0") or 0)
@@ -4422,6 +4436,8 @@ class ChatGPTWebChat:
                     raise ContentAIError("ChatGPT Web Bridge kết thúc luồng trước khi hoàn tất.")
         except ContentAIError as exc:
             raise_if_cancelled()
+            if isinstance(exc, ChatGPTPreSubmitRejected):
+                raise
             # ChatGPT can accept a prompt and then lose the streaming socket
             # while moving from the home shell to the newly-created /c/<id>
             # conversation. The bridge keeps that exact turn checkpointed;

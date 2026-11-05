@@ -15,6 +15,7 @@ from docurandom.content_ai import (
     ChatGPTWebChat,
     ContentAICancelled,
     ContentAIError,
+    ChatGPTPreSubmitRejected,
 )
 
 
@@ -43,6 +44,13 @@ def local_bridge(
         def do_POST(self) -> None:
             body = self.rfile.read(int(self.headers["Content-Length"]))
             state.requests.append(json.loads(body))
+            if mode == 'pre-submit-rejected':
+                raw=json.dumps({'error':{'message':'This workspace has an interrupted ChatGPT turn; recover its DOM before sending another prompt'}}).encode()
+                self.send_response(409)
+                self.send_header('Content-Length',str(len(raw)))
+                self.end_headers();self.wfile.write(raw);self.wfile.flush()
+                self.close_connection=True
+                return
             if mode == "headers":
                 state.ready.set()
                 state.release.wait(5)
@@ -99,6 +107,13 @@ def local_bridge(
 
 
 class ChatGPTWebTransportTests(unittest.TestCase):
+    def test_pre_submit_409_does_not_recover_or_resend_another_turn(self):
+        with local_bridge(mode='pre-submit-rejected') as (chat,state):
+            with patch.object(chat,'recover_pending') as recover:
+                with self.assertRaises(ChatGPTPreSubmitRejected):chat.send('JSON repair',output_mode='verified_json')
+                recover.assert_not_called()
+            self.assertEqual(len(state.requests),1)
+
     @staticmethod
     def start_reader(chat, cancel_event=None, *, streaming=True, on_status=None):
         results = []

@@ -80,3 +80,34 @@ def test_known_preflight_rejection_resumes_same_reserved_repair(monkeypatch,tmp_
     assert len(sends)==before+1
     assert json.loads(child.read_text())['pre_submit_rejected'] is True
     assert json.loads(path.read_text())['format_repair']['count']==1
+
+
+def test_busy_preflight_keeps_repair_reserved_then_rechecks_parent(monkeypatch,tmp_path):
+    thread,prompt,path,sends=setup(monkeypatch,tmp_path)
+    original_chat=q.ChatGPTWebChat
+    class Busy(original_chat):
+        def send(self,*args,**kwargs):raise q.ChatGPTPreSubmitRejected('This ChatGPT conversation is already running')
+    monkeypatch.setattr(q,'ChatGPTWebChat',Busy)
+    with pytest.raises(RuntimeError,match='already running'):
+        q.ask_json(tmp_path,prompt,thread_id=thread)
+    parent=json.loads(path.read_text());repair=parent['format_repair']
+    child=tmp_path/(digest([repair['request'],'verified_json',thread,[]])+'.json')
+    assert json.loads(child.read_text())['status']=='reserved'
+    reads=[];original_read=q.exact_text_response
+    def read(*args):reads.append(args[2]);return original_read(*args)
+    monkeypatch.setattr(q,'exact_text_response',read)
+    monkeypatch.setattr(q,'ChatGPTWebChat',original_chat)
+    assert q.ask_json(tmp_path,prompt,thread_id=thread)=={'passed':False}
+    assert reads[0]==prompt and len(sends)==1
+    assert json.loads(path.read_text())['format_repair']['count']==1
+
+
+def test_parent_pending_blocks_even_reserved_repair(monkeypatch,tmp_path):
+    thread,prompt,path,sends=setup(monkeypatch,tmp_path)
+    q.ask_json(tmp_path,prompt,thread_id=thread)
+    parent=json.loads(path.read_text());parent.update(status='repairing_json');parent.pop('result')
+    path.write_text(json.dumps(parent));before=len(sends)
+    def pending(*args):raise RuntimeError('Exact review response pending; do not resubmit')
+    monkeypatch.setattr(q,'exact_text_response',pending)
+    with pytest.raises(RuntimeError,match='pending'):q.ask_json(tmp_path,prompt,thread_id=thread)
+    assert len(sends)==before

@@ -9,7 +9,7 @@ import urllib.request
 from urllib.parse import urlsplit
 
 from .channel_learning import digest, now_iso
-from .content_ai import ChatGPTWebChat, check_chatgpt_web_bridge, resolve_chatgpt_web_model, CHATGPT_WEB_DEFAULT_MODEL_LABEL
+from .content_ai import ChatGPTWebChat, ChatGPTPreSubmitRejected, check_chatgpt_web_bridge, resolve_chatgpt_web_model, CHATGPT_WEB_DEFAULT_MODEL_LABEL
 from .conversation_links import saved_conversation_url
 from .storage import app_data_dir, atomic_write_json
 
@@ -19,6 +19,13 @@ class CompletedReviewInvalid(ValueError):
     def __init__(self, proof):
         super().__init__('Exact review ended without a JSON text response')
         self.source_proof = proof
+
+
+def _pre_submit_rejection(detail):
+    # These exact Bridge responses precede attachment staging and dispatch.
+    # Network errors and timeouts are deliberately excluded.
+    return (isinstance(detail, ChatGPTPreSubmitRejected) or
+            'Previous ChatGPT attachment is unresolved in its exact conversation; no new file or prompt was sent' in str(detail))
 
 
 def review_retry_delay(detail, *, now=None):
@@ -70,8 +77,7 @@ def ask_json(root: Path, prompt: str, *, attachments=(), cancel=None, timeout=24
                          root, status.access_token, thread_id=thread)
     record = old or {"request": prompt, "request_sha256": key, "thread_id": thread,
                      "created_at": now_iso(), "status": "reserved"}
-    rejection = 'Previous ChatGPT attachment is unresolved in its exact conversation; no new file or prompt was sent'
-    if rejection in str(record.get('detail', '')) and record.get('status') == 'uncertain':
+    if (record.get('pre_submit_rejected') is True or _pre_submit_rejection(record.get('detail', ''))) and record.get('status') == 'uncertain':
         # This exact Bridge 409 is emitted before staging or sending a prompt.
         # Keep the same reserved repair request, not a fresh retry budget.
         record.update(status='reserved', pre_submit_rejected=True)
@@ -114,6 +120,17 @@ def ask_json(root: Path, prompt: str, *, attachments=(), cancel=None, timeout=24
             if not acquired: raise InterruptedError("Quality review cancelled in queue")
         timer = threading.Timer(timeout, chat.cancel); timer.daemon = True; timer.start()
         if record.get('format_repair'):
+            # The original read may have raced the still-running controller.
+            # Re-read that exact parent to retire its completed submission lease
+            # before resuming the one reserved child. Never substitute a later
+            # response or send another parent request.
+            try:
+                _, proof = exact_text_response(status, thread, prompt)
+            except CompletedReviewInvalid as ended:
+                proof = ended.source_proof
+            if proof.get('complete') is not True:
+                raise RuntimeError('Exact original review is not complete; retain reserved JSON repair')
+            record['source_proof'] = proof
             return repair_json()
         def exact_text():
             text,record['source_proof']=exact_text_response(status,record['thread_id'],prompt)
@@ -161,7 +178,7 @@ def ask_json(root: Path, prompt: str, *, attachments=(), cancel=None, timeout=24
             record['detail'] = f'{type(repair_error).__name__}: {repair_error}'
             raise
     except Exception as exc:
-        if rejection in str(exc):
+        if _pre_submit_rejection(exc):
             record.update(status='reserved', pre_submit_rejected=True)
         elif record["status"] != "reserved": record["status"] = "uncertain"
         record["detail"] = f"{type(exc).__name__}: {exc}"
