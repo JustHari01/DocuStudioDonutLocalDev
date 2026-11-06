@@ -2,6 +2,24 @@ from pathlib import Path
 from unittest.mock import Mock
 from docurandom.youtube_upload import _SemanticCdpController
 
+def test_pointer_scrolls_offscreen_control_before_reading_geometry():
+    class ScrolledEditor:
+        def __init__(self):self.scrolled=False;self.clicks=[]
+        def command(self,method,params):
+            if method=='DOM.scrollIntoViewIfNeeded':
+                assert params=={'backendNodeId':10};self.scrolled=True
+                return {}
+            if method=='DOM.getBoxModel':
+                y=100 if self.scrolled else -1500
+                return {'model':{'content':[200,y,300,y,300,y+40,200,y+40]}}
+            if method=='Input.dispatchMouseEvent':
+                assert self.scrolled and params['x']==250 and params['y']==120
+                self.clicks.append(params['type']);return {}
+            raise AssertionError(method)
+    page=ScrolledEditor();controller=_SemanticCdpController(page)
+    controller.click_dom({'backendNodeId':10})
+    assert page.clicks==['mouseMoved','mousePressed','mouseReleased']
+
 def test_image_arms_only_visible_custom_thumbnail_picker_then_attaches_once(tmp_path):
     c=_SemanticCdpController(Mock());button={'backendNodeId':10};file={'backendNodeId':20}
     c.dom_nodes=Mock(return_value=[]);c.find_dom=Mock(return_value=button)

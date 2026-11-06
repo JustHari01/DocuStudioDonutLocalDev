@@ -3447,8 +3447,9 @@ class YouTubeIdempotencyTests(unittest.TestCase):
         controller = _SemanticCdpController(cdp)
         with mock.patch.object(controller, 'prepare_trusted_input'):
             controller.click_dom({'backendDOMNodeId': 17})
-        self.assertEqual(cdp.command.call_args_list[0], mock.call('DOM.getBoxModel', {'backendNodeId': 17}))
-        events = [call.args[1] for call in cdp.command.call_args_list[1:]]
+        self.assertEqual(cdp.command.call_args_list[0], mock.call('DOM.scrollIntoViewIfNeeded', {'backendNodeId': 17}))
+        self.assertEqual(cdp.command.call_args_list[1], mock.call('DOM.getBoxModel', {'backendNodeId': 17}))
+        events = [call.args[1] for call in cdp.command.call_args_list[2:]]
         self.assertEqual([event['type'] for event in events], ['mouseMoved', 'mousePressed', 'mouseReleased'])
         self.assertEqual([event['buttons'] for event in events], [0, 1, 0])
         self.assertTrue(all((event['x'], event['y']) == (20, 30) for event in events))

@@ -3014,6 +3014,10 @@ class _SemanticCdpController:
         """Activate the exact laid-out control with trusted pointer input."""
         self.prepare_trusted_input()
         backend_id = int(node.get("backendDOMNodeId") or node.get("backendNodeId") or 0)
+        # Metadata controls above a scrolled editor still have layout boxes,
+        # but their negative viewport coordinates cannot receive pointer input.
+        # Scroll the exact control into view before reading its click geometry.
+        self.cdp.command("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
         model = self.cdp.command("DOM.getBoxModel", {"backendNodeId": backend_id}).get("model", {})
         quad = model.get("content") or model.get("border")
         if not isinstance(quad, list) or len(quad) != 8:
