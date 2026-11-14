@@ -76,7 +76,7 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 tar = "0"
 bzip2 = "0"
 flate2 = "1"
-lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "optimization", "xz"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "optimization", "xz"] }
 msi-extract = "0"
 
 uuid = { version = "1.29", features = ["v4", "serde"] }
@@ -112,7 +112,7 @@ async-socks5 = "0.6"
 
 # Wayfern CDP integration
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 yaml-rust2 = { version = "0.13", default-features = false }
 thiserror = "2.0"
 regex-lite = "0.1"
@@ -206,7 +206,7 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 futures-util = "0.3"
 serial_test = "4"
-lzma-rust2 = { version = "0.24", features = ["encoder"] }
+lzma-rust2 = { version = "0.25", features = ["encoder"] }
 
 # Integration test configuration
 [[test]]
