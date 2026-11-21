@@ -26,12 +26,12 @@ path = "src/bin/proxy_server.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-resvg = "0.49"
+resvg = "0.50"
 
 [dependencies]
 serde_json = "1"
 # Runtime as well as build time: the per-profile window badge is rendered at launch.
-resvg = "0.49"
+resvg = "0.50"
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
@@ -76,7 +76,7 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 tar = "0"
 bzip2 = "0"
 flate2 = "1"
-lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "optimization", "xz"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "optimization", "xz"] }
 msi-extract = "0"
 
 uuid = { version = "1.29", features = ["v4", "serde"] }
@@ -112,13 +112,13 @@ async-socks5 = "0.6"
 
 # Wayfern CDP integration
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 yaml-rust2 = { version = "0.13", default-features = false }
 thiserror = "2.0"
 regex-lite = "0.1"
 tempfile = "3"
 dunce = "1"
-maxminddb = "0.32"
+maxminddb = "0.33"
 quick-xml = { version = "0.42", features = ["serialize"] }
 
 # VPN support
@@ -135,7 +135,7 @@ toml_edit = "0.25"
 rusty-leveldb = "4.0.2"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.32", features = ["signal", "process"] }
 
 # Reading the desktop's titlebar button layout for the in-app window controls.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -206,7 +206,7 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 futures-util = "0.3"
 serial_test = "4"
-lzma-rust2 = { version = "0.24", features = ["encoder"] }
+lzma-rust2 = { version = "0.25", features = ["encoder"] }
 
 # Integration test configuration
 [[test]]
